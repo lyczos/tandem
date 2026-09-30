@@ -1,0 +1,26 @@
+{
+  "type": "object",
+  "properties": {
+    "finished": {
+      "type": "boolean"
+    },
+    "name": {
+      "type": "string"
+    },
+    "goal": {
+      "type": "string"
+    },
+    "check": {
+      "type": "string"
+    },
+    "first": {
+      "type": "string",
+      "enum": ["claude", "codex"]
+    },
+    "reason": {
+      "type": "string"
+    }
+  },
+  "required": ["finished", "name", "goal", "check", "first", "reason"],
+  "additionalProperties": false
+}

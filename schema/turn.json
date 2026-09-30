@@ -1,0 +1,23 @@
+{
+  "type": "object",
+  "properties": {
+    "status": {
+      "type": "string",
+      "enum": ["continue", "done", "blocked"]
+    },
+    "summary": {
+      "type": "string"
+    },
+    "handoff": {
+      "type": "string"
+    },
+    "could_not_do": {
+      "type": "string"
+    },
+    "checks": {
+      "type": "string"
+    }
+  },
+  "required": ["status", "summary", "handoff", "could_not_do", "checks"],
+  "additionalProperties": false
+}
