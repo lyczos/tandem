@@ -15,16 +15,32 @@ import pathlib
 import re
 import subprocess
 import sys
+import tempfile
 import time
+
+__version__ = "0.1.0"  # single source of truth; package.json must match (a test checks)
 
 ROOT = pathlib.Path(__file__).resolve().parent
 TURN_SCHEMA = ROOT / "schema" / "turn.json"
 PLAN_SCHEMA = ROOT / "schema" / "plan.json"
 TURN_PROMPT = ROOT / "prompts" / "turn.md"
 PLAN_PROMPT = ROOT / "prompts" / "plan.md"
-# Runs live next to the repo, not inside it: Claude is not sandboxed, and an agent that writes
-# outside its worktree must not land in this checkout. TANDEM_RUNS overrides the location.
-RUNS = pathlib.Path(os.environ.get("TANDEM_RUNS") or ROOT.parent / f"{ROOT.name}-runs").expanduser()
+
+
+def resolve_runs():
+    # Run directories must stay outside the target repository and tandem's own files because
+    # Claude Code is not sandboxed. Only a source checkout keeps runs next to tandem.
+    override = os.environ.get("TANDEM_RUNS")
+    if override:
+        path = pathlib.Path(override)
+    elif (ROOT / ".git").exists():  # A worktree has a .git file instead of a directory.
+        path = ROOT.parent / "tandem-runs"
+    else:
+        path = pathlib.Path.home() / ".tandem" / "runs"
+    return path.expanduser().resolve()
+
+
+RUNS = resolve_runs()
 
 NAMES = {"claude": "Claude Code", "codex": "Codex"}
 EFFORTS = ["low", "medium", "high", "xhigh", "max", "ultra"]
@@ -133,6 +149,8 @@ def parse_reset(err):
 
 
 def unavailable_until(agent):
+    # fromisoformat is narrow before 3.11: it only reads what mark_unavailable wrote with
+    # isoformat(timespec="seconds"). Do not feed it foreign ISO strings.
     try:
         until = datetime.datetime.fromisoformat(json.loads(AVAILABILITY.read_text())[agent])
     except (FileNotFoundError, KeyError, ValueError, json.JSONDecodeError):
@@ -863,6 +881,18 @@ def cmd_status(args):
               f"{(h.get('summary') or h.get('error') or '')[:100]}")
 
 
+def check_runs_directory():
+    try:
+        RUNS.mkdir(parents=True, exist_ok=True)
+        # Probe an actual write: permission bits alone miss ACLs and read-only mounts.
+        with tempfile.TemporaryFile(dir=RUNS) as probe:
+            probe.write(b"tandem\n")
+            probe.flush()
+    except OSError as exc:
+        return False, f"{RUNS}: {exc}; set TANDEM_RUNS to a writable directory"
+    return True, str(RUNS)
+
+
 def cmd_doctor(args):
     """Check that this machine can run tandem: tools on PATH and both agents logged in."""
     def probe(cmd):
@@ -872,7 +902,9 @@ def cmd_doctor(args):
         except (OSError, subprocess.TimeoutExpired) as exc:
             return 1, str(exc)
 
-    checks = [("python 3.10+", sys.version_info >= (3, 10), sys.version.split()[0])]
+    checks = [("python 3.9+", sys.version_info >= (3, 9), sys.version.split()[0])]
+    runs_ok, runs_detail = check_runs_directory()
+    checks.append(("runs directory", runs_ok, runs_detail))
     code, out = probe(["git", "--version"])
     checks.append(("git", code == 0, out))
     if code == 0:
@@ -917,6 +949,7 @@ def add_agent_options(p, max_turns):
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("-V", "--version", action="version", version=f"tandem {__version__}")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     s = sub.add_parser("start", help="start a single-goal run")

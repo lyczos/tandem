@@ -5,9 +5,15 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## What this is
 
 An orchestrator that makes two external coding-agent CLIs (`claude` and `codex`) take turns on a
-third-party repository. Everything lives in one file, `tandem.py`, Python 3.10+, standard library
-only — no dependencies, no package, no build step. Keep it that way: a new import from PyPI is a
+third-party repository. Everything lives in one file, `tandem.py`, Python 3.9+ (stock macOS ships 3.9.6; CI enforces the floor, so no `match`, no `X | Y` annotations, no 3.10-only stdlib), standard library
+only — no Python dependencies, no Python package, no build step. Keep it that way: a new import from PyPI is a
 design change, not a detail.
+
+The npm package is `@lyczos/tandem` and installs the `tandem` command through `bin/tandem.js`.
+That launcher finds Python 3.9+, forwards arguments and signals, and runs the same `tandem.py`
+used from a source checkout. The npm package must have no runtime dependencies and no install
+scripts; users install and log in to Claude Code and Codex themselves. Keep `package.json`'s
+version equal to `__version__` in `tandem.py`, and ship `prompts/` and `schema/` alongside it.
 
 ## Commands
 
@@ -20,8 +26,11 @@ python3 -m unittest tests.test_tandem.ParseResult.test_bare_json   # one test
 
 Run tests from the repo root: `tests/test_tandem.py` loads `tandem.py` by path with
 `importlib.util.spec_from_file_location`, so there is no importable package. CI (`.github/workflows/ci.yml`)
-runs the same discover command on Python 3.10 and 3.13, ubuntu and macos. There is no linter or
+runs the same discover command on Python 3.9, 3.10 and 3.13, ubuntu and macos. There is no linter or
 formatter configured.
+The npm CI job uses Node 20, tests the launcher, and installs an `npm pack` tarball into a
+temporary prefix to check `tandem --version` and `tandem --help`. Launcher tests skip when Node
+is absent, so the Python suite still runs without Node.
 
 Exercising the real loop costs money and needs both CLIs logged in. To try out a change to the loop
 itself, use a throwaway git repo as `--repo` (see README "First run on a throwaway repo"). Running
@@ -44,9 +53,11 @@ Nothing is held in memory between turns. A run is `state.json` in its directory;
 availability is shared across all runs on the machine in `RUNS/.availability.json`, because the
 accounts are shared.
 
-`RUNS` defaults to `../tandem-runs`, a sibling of this checkout, not a subdirectory — Claude Code
-is not sandboxed, so an agent that writes outside its worktree must not be able to land in tandem's
-own source. `TANDEM_RUNS` overrides it. Do not move run directories inside the repo.
+`RUNS` uses `TANDEM_RUNS` when set, otherwise `ROOT.parent / "tandem-runs"` when `ROOT` has its
+own `.git` directory or worktree file, otherwise `~/.tandem/runs` for an installed copy. Resolve
+the path without creating it at import time; run creation and `doctor` create it on demand.
+`doctor` reports the resolved path and probes an actual write. Run directories must stay outside
+the target repository and tandem's own files because Claude Code is not sandboxed.
 
 ### Invariants worth protecting
 

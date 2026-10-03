@@ -17,7 +17,7 @@ One Python file, standard library only. macOS and Linux; Windows is untested.
 Everything runs on your machine with your own accounts: your Claude subscription or API key
 pays for the Claude turns, your ChatGPT plan or OpenAI API key for the Codex turns.
 
-1. **Python 3.10+ and git**, with `git config --global user.name` and `user.email` set (every
+1. **Python 3.9+ (the one that ships with macOS is enough) and git**, with `git config --global user.name` and `user.email` set (every
    turn is committed).
 
 2. **Claude Code**, then log in:
@@ -66,7 +66,7 @@ pays for the Claude turns, your ChatGPT plan or OpenAI API key for the Codex tur
 ## Requirements
 
 - `claude` (Claude Code, logged in) and `codex` (Codex CLI, `codex login`) on `PATH`
-- Python 3.10+, standard library only
+- Python 3.9+, standard library only
 - the target repository is a git repo with at least one commit; its `CLAUDE.md` is the rulebook
   for both agents (create one if it has none: stack, how to run tests, what not to touch)
 
@@ -85,10 +85,15 @@ pays for the Claude turns, your ChatGPT plan or OpenAI API key for the Codex tur
 means in checkable terms; `examples/todo-cli.md` shows the shape. A goal file may start
 with a header: `---`, then `name:`, `first: codex|claude`, `check:`, then `---`.
 
-Each run gets a directory in `../tandem-runs/<id>/`, next to this repo and not inside it, so an
-agent that writes outside its worktree cannot change tandem itself (Claude is not sandboxed).
-Set `TANDEM_RUNS` to put it elsewhere. Commands accept the directory as a path, as `runs/<id>`
-or as the bare `<id>`:
+Run storage uses `TANDEM_RUNS` when set, otherwise `../tandem-runs` beside a git checkout of
+tandem, otherwise `~/.tandem/runs` for an installed copy. The directory is created when needed;
+`doctor` prints its resolved path and checks that it is writable. Run directories must stay
+outside the target repository and tandem's own files because Claude Code is not sandboxed.
+If you already have runs under `../tandem-runs`, set `TANDEM_RUNS` to that directory's absolute
+path to keep those run ids reachable after installing tandem elsewhere.
+
+Each run lives in `<runs directory>/<id>/`. Commands accept the directory as a path, as
+`runs/<id>` or as the bare `<id>`:
 
 - `work/` - a git worktree on branch `tandem/<id>`; your own checkout is never touched
 - `transcript.md` - the conversation, readable while it runs (`tail -f`)

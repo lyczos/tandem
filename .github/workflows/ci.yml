@@ -10,10 +10,32 @@ jobs:
     strategy:
       matrix:
         os: [ubuntu-latest, macos-latest]
-        python: ["3.10", "3.13"]
+        python: ["3.9", "3.10", "3.13"]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python }}
       - run: python -m unittest discover -s tests -v
+
+  npm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: python -m unittest discover -s tests -v
+      - name: Pack and install the published files
+        shell: bash
+        run: |
+          package_dir="$(mktemp -d)"
+          install_prefix="$(mktemp -d)"
+          trap 'rm -rf "$package_dir" "$install_prefix"' EXIT
+          npm pack --pack-destination "$package_dir"
+          npm install --global --prefix "$install_prefix" "$package_dir"/*.tgz
+          "$install_prefix/bin/tandem" --version
+          "$install_prefix/bin/tandem" --help

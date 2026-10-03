@@ -1,0 +1,39 @@
+{
+  "name": "@lyczos/tandem",
+  "version": "0.1.0",
+  "description": "Make Claude Code and Codex take turns on your repository until they agree the goal is done.",
+  "license": "MIT",
+  "bin": {
+    "tandem": "bin/tandem.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "files": [
+    "bin/",
+    "tandem.py",
+    "prompts/",
+    "schema/",
+    "README.md",
+    "LICENSE"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/lyczos/tandem.git"
+  },
+  "homepage": "https://github.com/lyczos/tandem#readme",
+  "bugs": {
+    "url": "https://github.com/lyczos/tandem/issues"
+  },
+  "keywords": [
+    "claude",
+    "codex",
+    "ai",
+    "agents",
+    "cli",
+    "orchestrator"
+  ]
+}
