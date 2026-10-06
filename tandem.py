@@ -8,14 +8,19 @@ The orchestrator owns git: after every turn it commits what the agent changed.
 """
 
 import argparse
+import contextlib
 import datetime
+import io
 import json
 import os
 import pathlib
 import re
+import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 
 __version__ = "0.1.0"  # single source of truth; package.json must match (a test checks)
@@ -111,8 +116,38 @@ def git(cwd, *args, check=True):
     return proc.stdout.strip()
 
 
+OUT_LOCK = threading.RLock()  # every line the orchestrator prints goes through here
+CONSOLE = None                # the interactive session's Console, when one is running
+
+
 def log(msg):
-    print(f"[{now()}] {msg}", flush=True)
+    emit(f"[{now()}] {msg}")
+
+
+def emit(text):
+    """Print one line; in an interactive session redraw the prompt so log and input do not interleave."""
+    with OUT_LOCK:
+        if CONSOLE:
+            CONSOLE.write(text)
+        else:
+            print(text, flush=True)
+
+
+def prog_name():
+    """How the user invoked tandem, for advice we print: `tandem` via the npm wrapper, else the script path."""
+    return os.environ.get("TANDEM_PROG") or "./tandem.py"
+
+
+def require_repo(path):
+    """Resolve --repo and fail early, with the fix, unless it is a git repo with a commit."""
+    repo = pathlib.Path(path).expanduser().resolve()
+    if not repo.is_dir():
+        sys.exit(f"{repo} is not a directory; pass --repo with a git repository")
+    if git(repo, "rev-parse", "--is-inside-work-tree", check=False) != "true":
+        sys.exit(f"{repo} is not a git repository; run `git init` there or pass --repo")
+    if not git(repo, "rev-parse", "--verify", "-q", "HEAD", check=False):
+        sys.exit(f"{repo} has no commits yet; make one (git add -A && git commit -m init) so tandem can branch from it")
+    return repo
 
 
 def slug(text):
@@ -348,7 +383,7 @@ def run_claude(cfg, worktree, prompt, out_base, schema, key, readonly):
     if cfg.get("claude_budget"):
         cmd += ["--max-budget-usd", str(cfg["claude_budget"])]
     proc = subprocess.run(cmd, input=prompt, cwd=worktree, capture_output=True, text=True,
-                          timeout=cfg["timeout"])
+                          timeout=cfg["timeout"], **AGENT_POPEN)
     out_base.with_suffix(".json").write_text(proc.stdout)
     out_base.with_suffix(".stderr").write_text(proc.stderr)
     try:
@@ -374,7 +409,7 @@ def run_codex(cfg, worktree, prompt, out_base, schema, key, readonly):
         cmd += ["-c", f'model_reasoning_effort="{cfg["codex_effort"]}"']
     cmd.append("-")
     proc = subprocess.run(cmd, input=prompt, cwd=worktree, capture_output=True, text=True,
-                          timeout=cfg["timeout"])
+                          timeout=cfg["timeout"], **AGENT_POPEN)
     out_base.with_suffix(".log").write_text(proc.stdout + "\n--- stderr ---\n" + proc.stderr)
     if proc.returncode != 0:
         errors = [l for l in (proc.stderr + "\n" + proc.stdout).splitlines() if l.startswith("ERROR")]
@@ -382,6 +417,8 @@ def run_codex(cfg, worktree, prompt, out_base, schema, key, readonly):
     return parse_result(last.read_text() if last.exists() else proc.stdout, key), 0.0
 
 
+# The interactive session sets start_new_session so Ctrl+C at the prompt does not kill a turn in flight.
+AGENT_POPEN = {}
 RUNNERS = {"claude": run_claude, "codex": run_codex}
 
 
@@ -410,12 +447,18 @@ def run_check(state):
 
 # ---------- one run: the loop ----------
 
+# /say and the worker share this lock so a message cannot arrive between reading and clearing.
+INBOX_LOCK = threading.Lock()
+
+
 def take_inbox(paths):
     msgs = []
-    for p in map(pathlib.Path, paths):
-        if p.exists() and p.read_text().strip():
-            msgs.append(p.read_text().strip())
-            p.write_text("")
+    with INBOX_LOCK:
+        for p in map(pathlib.Path, paths):
+            text = p.read_text().strip() if p.exists() else ""
+            if text:
+                msgs.append(text)
+                p.write_text("")
     return "\n\n".join(msgs)
 
 
@@ -430,6 +473,10 @@ def finish(run_dir, state, outcome, message):
     append_transcript(run_dir, f"\n## Finished: {outcome}\n\n{message}\n")
     log(f"FINISHED {state.get('name') or run_dir.name}: {outcome} - {message}")
     log(f"transcript {run_dir / 'transcript.md'}")
+
+
+PROGRESS = {}  # turn, agent, since: what the interactive status line shows
+CURRENT = {}   # target: the run or campaign directory the session's /say, /stop and /status act on
 
 
 def loop(run_dir):
@@ -478,6 +525,8 @@ def loop(run_dir):
 
         log(f"turn {turn}: {NAMES[agent]} working...")
         started = time.time()
+        with OUT_LOCK:
+            PROGRESS.update(turn=turn, agent=agent, since=started)
         entry = {"turn": turn, "agent": agent, "started": now()}
         try:
             result, cost = call_agent(agent, cfg, state["worktree"], prompt, out_base, TURN_SCHEMA, "status",
@@ -757,7 +806,7 @@ def _campaign_loop(camp_dir):
         write_json(path, camp)
 
 
-def cmd_campaign_start(args):
+def prepare_campaign_start(args):
     camp_id = datetime.datetime.now().strftime("%Y%m%d-%H%M%S") + (f"-{slug(args.name)}" if args.name else "")
     camp_dir = RUNS / f"campaign-{camp_id}"
     camp_dir.mkdir(parents=True)
@@ -778,19 +827,24 @@ def cmd_campaign_start(args):
         save(run_dir, state)
         camp["current"] = str(run_dir)
     else:
-        repo = pathlib.Path(args.repo).expanduser().resolve()
+        repo = require_repo(args.repo)
         branch = f"tandem/campaign-{camp_id}"
         worktree = str(camp_dir / "work")
         git(repo, "worktree", "add", "-q", "-b", branch, worktree, git(repo, "rev-parse", args.base))
         camp.update(repo=str(repo), worktree=worktree, branch=branch)
     camp["queue"] = [read_goal_file(p) for p in args.goal_file or []]
     write_json(camp_dir / "campaign.json", camp)
+    CURRENT["target"] = camp_dir
     log(f"campaign {camp_dir.name} on {camp['branch']} ({camp['worktree']})")
-    log(f"talk: {sys.argv[0]} campaign say {camp_dir} \"...\"   stop: {sys.argv[0]} campaign stop {camp_dir}")
-    campaign_loop(camp_dir)
+    log(f"talk: {prog_name()} campaign say {camp_dir} \"...\"   stop: {prog_name()} campaign stop {camp_dir}")
+    return camp_dir
 
 
-def cmd_campaign_resume(args):
+def cmd_campaign_start(args):
+    campaign_loop(prepare_campaign_start(args))
+
+
+def prepare_campaign_resume(args):
     camp_dir = run_path(args.dir)
     refuse_if_running(camp_dir)
     (camp_dir / "STOP").unlink(missing_ok=True)
@@ -813,30 +867,36 @@ def cmd_campaign_resume(args):
         state["failures"] = {"claude": 0, "codex": 0}
         save(pathlib.Path(camp["current"]), state)
     write_json(path, camp)
-    campaign_loop(camp_dir)
+    CURRENT["target"] = camp_dir
+    return camp_dir
+
+
+def cmd_campaign_resume(args):
+    campaign_loop(prepare_campaign_resume(args))
 
 
 def cmd_campaign_stop(args):
     (run_path(args.dir) / "STOP").write_text(now())
-    print("the campaign stops after the current turn")
+    emit("the campaign stops after the current turn")
 
 
 def cmd_campaign_status(args):
     camp_dir = run_path(args.dir)
     camp = json.loads((camp_dir / "campaign.json").read_text())
-    print(f"branch {camp['branch']}  goals {len(camp['runs'])}  queued {len(camp['queue'])}  "
+    emit(f"branch {camp['branch']}  goals {len(camp['runs'])}  queued {len(camp['queue'])}  "
           f"claude cost ${camp['cost_usd']:.2f} (without the current goal)")
     for r in camp["runs"]:
-        print(f"  {r['outcome']:<9} {r['name']} ({r['turns']} turns)")
+        emit(f"  {r['outcome']:<9} {r['name']} ({r['turns']} turns)")
     if camp.get("current"):
-        print(f"  current: {camp['current']}")
+        emit(f"  current: {camp['current']}")
         cmd_status(argparse.Namespace(run=camp["current"]))
 
 
 # ---------- single-run commands ----------
 
-def cmd_start(args):
-    repo = pathlib.Path(args.repo).expanduser().resolve()
+def prepare_run(args):
+    """Create a single run shared by the start command and the session entry points."""
+    repo = require_repo(args.repo)
     item = read_goal_file(args.goal_file) if args.goal_file else {"goal": args.goal, "name": args.name}
     if not item["goal"]:
         sys.exit("give a goal: --goal TEXT or --goal-file PATH")
@@ -846,8 +906,87 @@ def cmd_start(args):
     cfg["check"] = args.check or item.get("check") or None
     run_dir = create_run(RUNS / run_id, repo, item["goal"], name or run_id,
                          cfg, args.max_turns, args.first or item.get("first") or "claude")
-    log(f"talk to the agents: {sys.argv[0]} say {run_dir} \"...\"")
+    CURRENT["target"] = run_dir
+    log(f"talk to the agents: {prog_name()} say {run_dir} \"...\"")
+    return run_dir
+
+
+def cmd_start(args):
+    run_dir = prepare_run(args)
     loop(run_dir)
+
+
+def outcome_exit_code(outcome):
+    return {"done": 0, "max_turns": 2, "blocked": 3, "stopped": 4, "failed": 5}.get(outcome, 1)
+
+
+def headless_result(run_dir, state):
+    history = state.get("history", [])
+    return {
+        "run_id": run_dir.name if run_dir else None,
+        "name": state.get("name"), "repo": state.get("repo"), "branch": state.get("branch"),
+        "base": state.get("base"), "outcome": state.get("outcome"),
+        "outcome_message": state.get("outcome_message", ""), "turn_count": len(history),
+        "cost_usd": state.get("cost_usd", 0.0),
+        "transcript": str(run_dir / "transcript.md") if run_dir else None,
+        "turns": [{k: h.get(k) for k in ("turn", "agent", "status", "commit", "seconds", "summary")}
+                  for h in history],
+    }
+
+
+def cmd_headless(args):
+    run_dir, state = None, {}
+    # Keep stdout machine-readable even when setup fails. Only this synchronous entry point
+    # redirects stdout; the interactive session must be able to keep reading and writing.
+    with contextlib.ExitStack() as stack:
+        if args.quiet:
+            stream = stack.enter_context(open(os.devnull, "w"))
+            stack.enter_context(contextlib.redirect_stdout(stream))
+        elif args.output_format == "json":
+            stack.enter_context(contextlib.redirect_stdout(sys.stderr))
+        try:
+            args.repo = require_repo(args.repo)
+            if args.goal is not None:
+                sys.exit("with -p, give GOAL directly, pipe it on stdin, or use --goal-file instead of --goal")
+            if args.goal_file:
+                if args.prompt != "-":
+                    sys.exit("give one goal source: -p GOAL or -p --goal-file PATH")
+            else:
+                if args.prompt == "-":
+                    if sys.stdin.isatty():
+                        sys.exit("give a goal: -p GOAL, -p --goal-file PATH, or pipe the goal to -p")
+                    args.goal = sys.stdin.read().strip()
+                else:
+                    args.goal = args.prompt.strip()
+                if not args.goal:
+                    sys.exit("goal is empty; give -p GOAL, --goal-file PATH, or a non-empty goal on stdin")
+            run_dir = prepare_run(args)
+            try:
+                loop(run_dir)
+            finally:
+                # The saved state includes every completed turn, including after Ctrl+C.
+                state = load(run_dir)
+        except KeyboardInterrupt:
+            message = "Interrupted by the owner."
+            if run_dir:
+                message += f" Continue with `{prog_name()} resume {run_dir}`."
+                finish(run_dir, state, "stopped", message)
+            else:
+                state.update(outcome="stopped", outcome_message=message)
+        except (GitError, OSError, ValueError, SystemExit) as exc:
+            if isinstance(exc, SystemExit) and not isinstance(exc.code, str):
+                raise
+            state.update(outcome="error", outcome_message=str(exc))
+            print(str(exc), file=sys.stderr)
+
+    result = headless_result(run_dir, state)
+    if args.output_format == "json":
+        print(json.dumps(result, ensure_ascii=False))
+    else:
+        print(f"outcome: {result['outcome']} - {result['outcome_message']}")
+        if run_dir:
+            print(f"branch: {result['branch']}\ntranscript: {result['transcript']}")
+    sys.exit(outcome_exit_code(result["outcome"]))
 
 
 def cmd_resume(args):
@@ -857,28 +996,76 @@ def cmd_resume(args):
         state["max_turns"] = state["turn"] - 1 + args.more_turns
     state["failures"] = {"claude": 0, "codex": 0}
     save(run_dir, state)
+    # A STOP left by the interactive /stop would end the resumed run at once. Only clear the run's own
+    # file; a run inside a campaign points at the campaign's STOP, which the owner controls.
+    stop = state.get("stop_file")
+    if stop and pathlib.Path(stop).resolve().parent == run_dir.resolve():
+        pathlib.Path(stop).unlink(missing_ok=True)
     loop(run_dir)
 
 
 def cmd_say(args):
     target = run_path(args.run)
-    with open(target / "inbox.md", "a") as f:
-        f.write(args.message.strip() + "\n\n")
-    if (target / "campaign.json").exists():
-        # The next turn consumes the inbox; the planner keeps reading notes.md for every later goal.
-        with open(target / "notes.md", "a") as f:
-            f.write(f"- ({now()}) {args.message.strip()}\n")
-    print("queued for the next turn")
+    with INBOX_LOCK:
+        with open(target / "inbox.md", "a") as f:
+            f.write(args.message.strip() + "\n\n")
+        if (target / "campaign.json").exists():
+            # The next turn consumes the inbox; the planner keeps reading notes.md for every later goal.
+            with open(target / "notes.md", "a") as f:
+                f.write(f"- ({now()}) {args.message.strip()}\n")
+    emit("queued for the next turn")
 
 
 def cmd_status(args):
     run_dir = run_path(args.run)
     state = load(run_dir)
-    print(f"{state.get('name') or run_dir.name}: branch {state['branch']}  turn {state['turn'] - 1}/{state['max_turns']}  "
+    emit(f"{state.get('name') or run_dir.name}: branch {state['branch']}  turn {state['turn'] - 1}/{state['max_turns']}  "
           f"outcome {state.get('outcome', 'running or interrupted')}  claude cost ${state['cost_usd']:.2f}")
     for h in state["history"]:
-        print(f"  {h['turn']:>2} {h['agent']:<6} {h['status']:<8} {h.get('commit') or '-':<8} "
+        emit(f"  {h['turn']:>2} {h['agent']:<6} {h['status']:<8} {h.get('commit') or '-':<8} "
               f"{(h.get('summary') or h.get('error') or '')[:100]}")
+
+
+def list_runs(limit=None):
+    """Runs and campaigns under RUNS, newest first. Run directories nested in a campaign are not listed."""
+    found = []
+    if RUNS.is_dir():
+        for d in RUNS.iterdir():
+            for fname, kind in (("state.json", "run"), ("campaign.json", "campaign")):
+                f = d / fname
+                if f.is_file():
+                    try:
+                        data = json.loads(f.read_text())
+                        mtime = f.stat().st_mtime
+                    except (OSError, ValueError):
+                        continue
+                    found.append((mtime, kind, d, data))
+                    break
+    found.sort(key=lambda x: x[0], reverse=True)
+    rows = []
+    for _, kind, d, data in found[:limit]:
+        if kind == "run":
+            outcome = data.get("outcome") or "running or interrupted"
+            turns = max(data.get("turn", 1) - 1, 0)
+            name = data.get("name") or d.name
+        else:
+            # A campaign has no outcome of its own; show how far it got and how the last goal ended.
+            done = data.get("runs", [])
+            outcome = f"campaign, {len(done)} goals" + (", last " + done[-1]["outcome"] if done and done[-1].get("outcome") else "")
+            turns = sum(r.get("turns", 0) for r in data.get("runs", []))
+            name = d.name
+        rows.append({"id": d.name, "name": name, "branch": data.get("branch", "-"), "outcome": outcome,
+                     "turns": turns, "path": str(d)})
+    return rows
+
+
+def cmd_runs(args):
+    rows = list_runs(args.limit)
+    if not rows:
+        emit(f"no runs yet in {RUNS}")
+        return
+    for r in rows:
+        emit(f"{r['id']}  {r['name']}  {r['branch']}  {r['outcome']}  {r['turns']} turns  {r['path']}")
 
 
 def check_runs_directory():
@@ -893,6 +1080,20 @@ def check_runs_directory():
     return True, str(RUNS)
 
 
+def cwd_repo_status(path):
+    """(ok, detail) for doctor: is `path` a git repo with a commit? Same test as require_repo, without exiting."""
+    try:
+        if git(path, "rev-parse", "--is-inside-work-tree", check=False) != "true":
+            return False, f"{path} is not a git repository; cd into one or run `git init`"
+        if not git(path, "rev-parse", "--verify", "-q", "HEAD", check=False):
+            return False, f"{path} has no commits yet; run git add -A && git commit -m init"
+        branch = git(path, "rev-parse", "--abbrev-ref", "HEAD", check=False) or "detached HEAD"
+    except OSError as exc:
+        # Doctor must still print all check results when Git cannot even start.
+        return False, f"cannot check {path}: {exc}; install git and ensure it is on PATH"
+    return True, f"{path} on {branch}"
+
+
 def cmd_doctor(args):
     """Check that this machine can run tandem: tools on PATH and both agents logged in."""
     def probe(cmd):
@@ -902,7 +1103,10 @@ def cmd_doctor(args):
         except (OSError, subprocess.TimeoutExpired) as exc:
             return 1, str(exc)
 
-    checks = [("python 3.9+", sys.version_info >= (3, 9), sys.version.split()[0])]
+    checks = [("tandem", True, __version__)]
+    checks.append(("python 3.9+", sys.version_info >= (3, 9), f"{sys.version.split()[0]} {sys.executable}"))
+    if os.environ.get("TANDEM_NODE"):  # set by bin/tandem.js, absent from a source checkout
+        checks.append(("node", True, os.environ["TANDEM_NODE"]))
     runs_ok, runs_detail = check_runs_directory()
     checks.append(("runs directory", runs_ok, runs_detail))
     code, out = probe(["git", "--version"])
@@ -927,11 +1131,12 @@ def cmd_doctor(args):
     if code == 0:
         code, out = probe(["codex", "login", "status"])
         checks.append(("codex logged in", code == 0, out if code == 0 else "run `codex login`"))
+    checks.append(("current repo",) + cwd_repo_status(os.getcwd()))
     for name, ok, detail in checks:
-        print(f"  {'ok  ' if ok else 'FAIL'}  {name:<18} {detail}")
+        emit(f"  {'ok  ' if ok else 'FAIL'}  {name:<18} {detail}")
     if not all(ok for _, ok, _ in checks):
         sys.exit(1)
-    print("ready")
+    emit("ready")
 
 
 def add_agent_options(p, max_turns):
@@ -947,20 +1152,68 @@ def add_agent_options(p, max_turns):
     p.add_argument("--codex-network", action="store_true", help="let Codex's sandbox reach the network")
 
 
-def main():
-    p = argparse.ArgumentParser(description=__doc__)
+def add_start_options(p):
+    p.add_argument("--repo", default=os.getcwd(), help="git repository to work on (default: current directory)")
+    p.add_argument("--goal")
+    p.add_argument("--goal-file")
+    p.add_argument("--name", help="short label added to the run id and branch")
+    p.add_argument("--base", default="HEAD", help="commit or branch to start from")
+    p.add_argument("--first", choices=["claude", "codex"], help="who starts (default: the goal file's first:, else claude)")
+    p.add_argument("--check", help="shell command that must pass before the run counts as done")
+    add_agent_options(p, 12)
+
+
+HELP_DESCRIPTION = """\
+Claude Code and Codex take turns on your git repository until they agree the goal is done.
+
+usage shapes:
+  %(prog)s                 interactive session in the current repo (needs a terminal)
+  %(prog)s -p "GOAL"       one run, then exit; the exit code says how it ended
+  %(prog)s COMMAND ...     one of the commands below
+"""
+
+HELP_EPILOG = """\
+-p takes the options of `start`: --repo --check --max-turns --first --name --base,
+--claude-model --codex-model --codex-effort --codex-role --codex-network --claude-budget --timeout.
+"""
+
+
+class TandemParser(argparse.ArgumentParser):
+    def _print_message(self, message, file=None):
+        if CONSOLE and message:
+            emit(message.rstrip())
+        else:
+            super()._print_message(message, file)
+
+    def error(self, message):
+        # Exit 2 belongs to a completed headless run that exhausted its turn budget.
+        self.print_usage(sys.stderr)
+        self.exit(1, f"{self.prog}: error: {message}\n")
+
+    def parse_args(self, args=None, namespace=None):
+        parsed = super().parse_args(args, namespace)
+        if getattr(parsed, "cmd", None) and parsed.prompt is not None:
+            self.error("-p cannot be combined with a command")
+        return parsed
+
+
+def build_parser():
+    p = TandemParser(prog=prog_name(), formatter_class=argparse.RawDescriptionHelpFormatter,
+                     description=HELP_DESCRIPTION, epilog=HELP_EPILOG)
     p.add_argument("-V", "--version", action="version", version=f"tandem {__version__}")
-    sub = p.add_subparsers(dest="cmd", required=True)
+    p.add_argument("-p", "--print", dest="prompt", nargs="?", const="-", metavar="GOAL",
+                   help="headless: run GOAL (or the goal on stdin, or --goal-file) and exit")
+    p.add_argument("--output-format", choices=["text", "json"], default="text", help="with -p")
+    p.add_argument("--quiet", action="store_true", help="with -p: no turn stream")
+    # Options for -p sit at the top level; `start` repeats them after the command.
+    shown = len(p._actions)
+    add_start_options(p)
+    for action in p._actions[shown:]:  # keep the front-door help short; the epilog names them
+        action.help = argparse.SUPPRESS
+    sub = p.add_subparsers(dest="cmd", metavar="COMMAND")
 
     s = sub.add_parser("start", help="start a single-goal run")
-    s.add_argument("--repo", required=True)
-    s.add_argument("--goal")
-    s.add_argument("--goal-file")
-    s.add_argument("--name", help="short label added to the run id and branch")
-    s.add_argument("--base", default="HEAD", help="commit or branch to start from")
-    s.add_argument("--first", choices=["claude", "codex"], help="who starts (default: the goal file's first:, else claude)")
-    s.add_argument("--check", help="shell command that must pass before the run counts as done")
-    add_agent_options(s, 12)
+    add_start_options(s)
     s.set_defaults(fn=cmd_start)
 
     r = sub.add_parser("resume", help="continue an interrupted or finished run")
@@ -980,10 +1233,14 @@ def main():
     d = sub.add_parser("doctor", help="check tools and logins before the first run")
     d.set_defaults(fn=cmd_doctor)
 
+    u = sub.add_parser("runs", help="recent runs and campaigns, newest first")
+    u.add_argument("--limit", type=int, default=10)
+    u.set_defaults(fn=cmd_runs)
+
     c = sub.add_parser("campaign", help="chain goals on one branch until the plan is done")
     csub = c.add_subparsers(dest="ccmd", required=True)
     cs = csub.add_parser("start")
-    cs.add_argument("--repo", help="required unless --adopt")
+    cs.add_argument("--repo", default=os.getcwd(), help="default: current directory; ignored with --adopt")
     cs.add_argument("--adopt", help="continue an existing run directory as the first goal")
     cs.add_argument("--goal-file", action="append", help="queue a goal before planning (repeatable)")
     cs.add_argument("--name")
@@ -1006,11 +1263,455 @@ def main():
     x.add_argument("message")
     x.set_defaults(fn=cmd_say)
 
-    args = p.parse_args()
-    if getattr(args, "ccmd", None) == "start" and not (args.repo or args.adopt):
-        p.error("campaign start needs --repo or --adopt")
+    return p
+
+
+# ---------- interactive session ----------
+#
+# Implemented: the background-thread design. loop() runs in a worker thread while the main thread
+# reads input, so `/say` reaches the next turn while the agents work. All output goes through
+# emit() and OUT_LOCK; on a real terminal the Console clears the prompt line, prints, and redraws
+# the prompt (plus a one-line "turn N: Agent working... 2m14s" status above it). I chose it over
+# the Ctrl+C-interrupts-the-run fallback because the redraw is a few escape codes, and agents run
+# in their own session (AGENT_POPEN) so a Ctrl+C at the prompt cannot kill a turn in flight.
+
+SLASH_COMMANDS = ["help", "status", "say", "stop", "resume", "goal", "campaign", "runs", "transcript",
+                  "doctor", "quit"]
+
+SLASH_HELP = """\
+type a goal to start a run in this repo; while it runs, type /say to talk to the agents
+  /help                show this list
+  /status              one line per turn of the current run
+  /say TEXT            leave a message the next turn reads
+  /stop                stop after the current turn
+  /resume [TURNS]      continue the last run, optionally allowing TURNS more
+  /goal FILE           start a run from a goal file
+  /campaign ARGS...    same as `tandem campaign ARGS...` (start, resume, stop, status, say)
+  /runs                recent runs and campaigns
+  /transcript          print the transcript path
+  /doctor              check tools and logins
+  /quit                leave (also Ctrl+D)"""
+
+
+def parse_input(line):
+    """Classify a typed line: ("empty", "", ""), ("goal", text, ""), ("command", name, rest) or ("unknown", name, "")."""
+    text = line.strip()
+    if not text:
+        return "empty", "", ""
+    if not text.startswith("/"):
+        return "goal", text, ""
+    parts = text[1:].split(None, 1)
+    name = parts[0].lower() if parts else ""
+    rest = parts[1] if len(parts) > 1 else ""
+    if name in SLASH_COMMANDS:
+        return "command", name, rest.strip()
+    return "unknown", name, ""
+
+
+def config_path():
+    return pathlib.Path.home() / ".tandem" / "config.json"
+
+
+def consent_recorded():
     try:
-        args.fn(args)
+        return bool(json.loads(config_path().read_text()).get("consent"))
+    except (OSError, ValueError, AttributeError):
+        return False
+
+
+def record_consent():
+    path = config_path()
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, ValueError):
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    data["consent"] = {"version": __version__, "date": datetime.date.today().isoformat()}
+    path.parent.mkdir(parents=True, exist_ok=True)
+    write_json(path, data)
+
+
+CONSENT_TEXT = """\
+Before the first run, one thing to know. The agents work on your machine as you:
+  - Claude Code's allow-list is a guard rail, not a sandbox. `python3` and `npm` are on it and can
+    run anything as this user.
+  - Only Codex runs in a sandbox.
+  - Each run works in its own git worktree and branch, but nothing stops an agent from touching
+    files outside it.
+Use a repository you can afford to have changed, and review the branch before merging."""
+
+
+def ask_consent(read=input):
+    """First interactive run on this machine: require 'yes' and remember it. Returns False on refusal."""
+    if consent_recorded():
+        return True
+    print(CONSENT_TEXT)
+    try:
+        answer = read("Type yes to continue: ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        answer = ""
+    if answer != "yes":
+        return False
+    record_consent()
+    return True
+
+
+def agent_login_status(name):
+    """Cheap banner probe: PATH presence plus the login command, each with a short timeout."""
+    if not shutil.which(name):
+        return "not found"
+    cmd = ["claude", "auth", "status"] if name == "claude" else ["codex", "login", "status"]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        return "login unknown"
+    if name == "claude":
+        try:
+            return "logged in" if json.loads(proc.stdout).get("loggedIn") else "not logged in"
+        except ValueError:
+            return "login unknown"
+    return "logged in" if proc.returncode == 0 else "not logged in"
+
+
+def banner(repo):
+    branch = git(repo, "rev-parse", "--abbrev-ref", "HEAD", check=False) or "?"
+    py = f"{sys.executable} {sys.version.split()[0]}"
+    lines = [f"tandem {__version__}", f"repo    {repo} ({branch})", f"python  {py}"]
+    for name in ("claude", "codex"):
+        lines.append(f"{name:<7} {agent_login_status(name)}")
+    lines.append("type a goal, or /help")
+    return "\n".join(lines)
+
+
+def fancy_terminal():
+    """Escape codes and the status line only on a real terminal, and never with NO_COLOR."""
+    return (sys.stdout.isatty() and "NO_COLOR" not in os.environ and os.environ.get("TERM") != "dumb")
+
+
+class Console:
+    """Prompt-aware output for the interactive session. write() is only called holding OUT_LOCK."""
+
+    def __init__(self, fancy):
+        self.fancy = fancy
+        self.prompt = ""
+        self.prompt_active = False
+        self.status_shown = False
+        self.running = False
+
+    def status_text(self):
+        if not PROGRESS:
+            return "working..."
+        secs = int(time.time() - PROGRESS["since"])
+        return f"turn {PROGRESS['turn']}: {NAMES[PROGRESS['agent']]} working... {secs // 60}m{secs % 60:02d}s"
+
+    def _buffer(self):
+        try:
+            import readline
+            return readline.get_line_buffer()
+        except ImportError:
+            return ""
+
+    def write(self, text):
+        if not self.prompt_active:
+            print(text, flush=True)
+        elif not self.fancy:
+            print("\n" + text, flush=True)
+        else:
+            out = "\r\x1b[K" + ("\x1b[1A\r\x1b[K" if self.status_shown else "") + text + "\n"
+            self.status_shown = self.running
+            if self.running:
+                out += self.status_text() + "\n"
+            sys.stdout.write(out + self.prompt + self._buffer())
+            sys.stdout.flush()
+
+    def tick(self):
+        """Redraw the status line in place, without moving the cursor the user is typing at."""
+        with OUT_LOCK:
+            if self.fancy and self.running and self.prompt_active and self.status_shown:
+                sys.stdout.write("\x1b7\x1b[1A\r\x1b[K" + self.status_text() + "\x1b8")
+                sys.stdout.flush()
+
+    def ask(self, prompt):
+        # Print the prompt under the same lock as logs. input(prompt) prints outside Python's
+        # lock, and macOS libedit does not call readline's pre-input hook to release it safely.
+        # input() still provides line editing; history redraws may omit the prefix until a log.
+        with OUT_LOCK:
+            self.prompt = prompt
+            self.status_shown = self.fancy and self.running
+            if self.status_shown:
+                print(self.status_text(), flush=True)
+            sys.stdout.write(prompt)
+            sys.stdout.flush()
+            self.prompt_active = True
+        try:
+            return input()
+        finally:
+            with OUT_LOCK:
+                self.prompt_active = False
+
+
+class Session:
+    def __init__(self, args, console):
+        self.args = args
+        self.console = console
+        self.thread = None
+
+    def busy(self):
+        return self.thread is not None and self.thread.is_alive()
+
+    def refuse_if_busy(self):
+        if self.busy():
+            emit("a run is already going; /say talks to it, /stop ends it")
+            return True
+        return False
+
+    def launch(self, label, fn):
+        if self.refuse_if_busy():
+            return
+        with OUT_LOCK:
+            PROGRESS.clear()
+
+        def work():
+            try:
+                fn()
+            except KeyboardInterrupt:
+                pass
+            except SystemExit as exc:
+                if exc.code not in (None, 0):
+                    emit(f"{label}: {exc.code}")
+            except Exception as exc:  # the session must survive a failing run
+                emit(f"{label} failed: {exc}")
+            finally:
+                with OUT_LOCK:
+                    self.console.running = False
+                emit(f"{label} ended; type a goal, /resume or /quit")
+
+        with OUT_LOCK:
+            self.console.running = True
+        self.thread = threading.Thread(target=work)
+        self.thread.start()
+
+    def start_goal(self, text=None, goal_file=None):
+        # Refuse before creating files or changing CURRENT: /say and /stop must keep targeting
+        # the live run even when the user accidentally types another goal.
+        if self.refuse_if_busy():
+            return
+        args = argparse.Namespace(**vars(self.args))
+        args.goal, args.goal_file = text, goal_file
+        try:
+            run_dir = prepare_run(args)
+        except (SystemExit, GitError, OSError, ValueError) as exc:
+            emit(f"cannot start: {exc}")
+            return
+        state = load(run_dir)
+        state["stop_file"] = str(run_dir / "STOP")
+        save(run_dir, state)
+        self.launch("run", lambda: loop(run_dir))
+
+    def target(self):
+        target = CURRENT.get("target")
+        if not target:
+            emit("no run yet; type a goal first")
+        return target
+
+    def request_stop(self):
+        target = self.target()
+        if not target:
+            return
+        # A campaign watches <dir>/STOP; a run watches the stop_file in its state (set in start_goal).
+        stop = target / "STOP"
+        stop.write_text(now())
+        emit("stopping after the current turn")
+
+    def handle(self, name, rest):
+        """Run one slash command. Returns False to leave the session."""
+        if name == "quit":
+            return False
+        if name == "help":
+            emit(SLASH_HELP)
+        elif name == "doctor":
+            self.guarded(cmd_doctor, argparse.Namespace())
+        elif name == "runs":
+            cmd_runs(argparse.Namespace(limit=10))
+        elif name == "goal":
+            if not rest:
+                emit("usage: /goal FILE")
+            else:
+                self.start_goal(goal_file=rest)
+        elif name == "campaign":
+            self.campaign(rest)
+        elif name == "stop":
+            self.guarded(lambda _: self.request_stop(), None)
+        else:
+            target = self.target()
+            if not target:
+                return True
+            if name == "say":
+                if not rest:
+                    emit("usage: /say TEXT")
+                else:
+                    self.guarded(cmd_say, argparse.Namespace(run=str(target), message=rest))
+            elif name == "status":
+                fn = cmd_campaign_status if (target / "campaign.json").exists() else cmd_status
+                self.guarded(fn, argparse.Namespace(run=str(target), dir=str(target)))
+            elif name == "transcript":
+                emit(str(self.transcript_path(target)))
+            elif name == "resume":
+                self.resume(target, rest)
+        return True
+
+    @staticmethod
+    def transcript_path(target):
+        """A run has its own transcript; a campaign has one per goal, so point at the running (or last) one."""
+        if (target / "state.json").exists():
+            return target / "transcript.md"
+        try:
+            camp = json.loads((target / "campaign.json").read_text())
+        except (OSError, ValueError):
+            return target
+        run = camp.get("current") or (camp["runs"][-1]["dir"] if camp.get("runs") else None)
+        return pathlib.Path(run) / "transcript.md" if run else target
+
+    def guarded(self, fn, args):
+        try:
+            fn(args)
+        except SystemExit as exc:
+            if exc.code not in (None, 0):
+                emit(str(exc.code))
+        except (GitError, OSError, ValueError) as exc:
+            emit(str(exc))
+
+    def resume(self, target, rest):
+        if self.refuse_if_busy():
+            return
+        try:
+            more = int(rest) if rest else None
+            if more is not None and more <= 0:
+                raise ValueError
+        except ValueError:
+            emit("usage: /resume [TURNS] (TURNS must be positive)")
+            return
+        if (target / "campaign.json").exists():
+            if more is not None:
+                emit("/resume TURNS applies to a single run; use /resume for a campaign")
+                return
+            self.campaign("resume " + shlex.quote(str(target)))
+        else:
+            try:
+                (target / "STOP").unlink(missing_ok=True)
+            except OSError as exc:
+                emit(f"cannot resume: {exc}")
+                return
+            self.launch("run", lambda: cmd_resume(argparse.Namespace(run=str(target), more_turns=more)))
+
+    def campaign(self, rest):
+        try:
+            argv = shlex.split(rest)
+        except ValueError as exc:
+            emit(f"cannot parse arguments: {exc}")
+            return
+        if not argv or argv[0] not in ("start", "resume", "stop", "status", "say"):
+            emit("usage: /campaign start|resume|stop|status|say ...")
+            return
+        if argv[0] in ("start", "resume") and self.refuse_if_busy():
+            return
+        if argv[0] == "start":
+            argv[1:1] = ["--repo", str(self.args.repo)]
+        try:
+            parsed = build_parser().parse_args(["campaign", *argv])
+        except SystemExit:
+            return
+        if argv[0] in ("start", "resume"):
+            # Establish the target before reading the next command, so an immediate /stop or
+            # /quit cannot miss a campaign that is still being created in the worker.
+            prepare = prepare_campaign_start if argv[0] == "start" else prepare_campaign_resume
+            try:
+                target = prepare(parsed)
+            except (SystemExit, GitError, OSError, ValueError) as exc:
+                emit(f"cannot {argv[0]} campaign: {exc}")
+                return
+            self.launch("campaign", lambda: campaign_loop(target))
+        else:
+            self.guarded(parsed.fn, parsed)
+
+
+def cmd_interactive(args):
+    global CONSOLE
+    args.repo = require_repo(args.repo)
+    if not ask_consent():
+        sys.exit("not confirmed; nothing started")
+    try:
+        import readline  # noqa: F401  # line editing and history for input(); absent on some builds
+    except ImportError:
+        pass
+    print(banner(args.repo))
+    console = Console(fancy_terminal())
+    session = Session(args, console)
+    AGENT_POPEN["start_new_session"] = True
+    CONSOLE = console
+
+    ticker_stop = threading.Event()
+
+    def ticker():
+        while not ticker_stop.wait(1):
+            console.tick()
+
+    if console.fancy:
+        threading.Thread(target=ticker, daemon=True).start()
+    try:
+        while True:
+            try:
+                line = console.ask("tandem> ")
+            except EOFError:
+                emit("")
+                break
+            except KeyboardInterrupt:
+                emit("")  # Ctrl+C at the prompt clears the line; /quit or Ctrl+D leaves
+                continue
+            kind, name, rest = parse_input(line)
+            if kind == "empty":
+                continue
+            if kind == "goal":
+                session.start_goal(name)
+            elif kind == "unknown":
+                emit(f"unknown command /{name}; valid: " + " ".join("/" + c for c in SLASH_COMMANDS))
+            elif not session.handle(name, rest):
+                break
+    finally:
+        if session.busy():
+            if CURRENT.get("target"):
+                (CURRENT["target"] / "STOP").write_text(now())
+            emit("waiting for the current turn to end")
+            # Detached agents must finish before exit, or a later resume could start a second
+            # agent in their worktree. Event waits also avoid interrupting Thread.join on 3.9.
+            while session.busy():
+                try:
+                    ticker_stop.wait(0.1)
+                except KeyboardInterrupt:
+                    emit("still waiting for the current turn; /stop takes effect after it ends")
+        ticker_stop.set()
+        CONSOLE = None
+        AGENT_POPEN.clear()
+
+
+def pick_command(p, args):
+    """Choose what to run: a subcommand, headless -p, or the interactive session."""
+    if args.cmd:
+        return args.fn
+    if args.prompt is not None:
+        return cmd_headless
+    if not sys.stdin.isatty():
+        sys.exit(f'no command and no terminal: use `{prog_name()} -p "GOAL"` for a one-shot run')
+    return cmd_interactive
+
+
+def main(argv=None):
+    p = build_parser()
+    args = p.parse_args(argv)
+    fn = pick_command(p, args)
+    try:
+        fn(args)
     except KeyboardInterrupt:
         print("\ninterrupted; continue with resume")
     except GitError as e:

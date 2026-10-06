@@ -10,10 +10,12 @@ only — no Python dependencies, no Python package, no build step. Keep it that 
 design change, not a detail.
 
 The npm package is `@lyczos/tandem` and installs the `tandem` command through `bin/tandem.js`.
-That launcher finds Python 3.9+, forwards arguments and signals, and runs the same `tandem.py`
+That launcher tries `TANDEM_PYTHON`, `python3`, `python3.13` through `python3.9`, `python`, then
+`py -3` on Windows. It requires Python 3.9+, forwards arguments and signals, and runs the same `tandem.py`
 used from a source checkout. The npm package must have no runtime dependencies and no install
 scripts; users install and log in to Claude Code and Codex themselves. Keep `package.json`'s
 version equal to `__version__` in `tandem.py`, and ship `prompts/` and `schema/` alongside it.
+The launcher sets `TANDEM_PROG=tandem` for command hints and `TANDEM_NODE` for `doctor`.
 
 ## Commands
 
@@ -21,8 +23,16 @@ version equal to `__version__` in `tandem.py`, and ship `prompts/` and `schema/`
 python3 -m unittest discover -s tests            # the whole suite
 python3 -m unittest tests.test_tandem.Git        # one class
 python3 -m unittest tests.test_tandem.ParseResult.test_bare_json   # one test
-./tandem.py doctor                               # tools on PATH and both agents logged in
+./tandem.py --repo ~/code/my-project              # interactive session (stdin must be a terminal)
+./tandem.py doctor                               # tools, logins, storage, and cwd repo with a commit
+./tandem.py -p "GOAL" --output-format json        # one run; progress on stderr, result on stdout
+./tandem.py -p --goal-file goals/my-goal.md        # also accepts a piped goal with bare -p
+./tandem.py runs --limit 10                       # recent runs and campaigns in RUNS
 ```
+
+An npm install exposes these same entry points as `tandem`. With no subcommand, a terminal
+on stdin starts the session, `-p` starts a headless run, and non-terminal stdin without `-p`
+fails with a hint. Keep every explicit subcommand working from the source checkout too.
 
 Run tests from the repo root: `tests/test_tandem.py` loads `tandem.py` by path with
 `importlib.util.spec_from_file_location`, so there is no importable package. CI (`.github/workflows/ci.yml`)
@@ -31,6 +41,22 @@ formatter configured.
 The npm CI job uses Node 20, tests the launcher, and installs an `npm pack` tarball into a
 temporary prefix to check `tandem --version` and `tandem --help`. Launcher tests skip when Node
 is absent, so the Python suite still runs without Node.
+
+The interactive session (`cmd_interactive`, `Session`, `Console`) runs `loop()` in a worker thread
+while the main thread reads input. All output must go through `emit()`/`log()` (one `OUT_LOCK`),
+never bare `print` from code that can run during a run, or the prompt redraw breaks. Agents are
+started in their own session while it runs (`AGENT_POPEN`) so Ctrl+C at the prompt cannot kill a
+turn. First-run consent lives in `~/.tandem/config.json`.
+Check `Session.refuse_if_busy()` before creating a run or changing a stop file. Campaign setup
+finishes before launching the worker so `/say` and `/stop` always have the right target.
+`INBOX_LOCK` protects messages sent within the session from a simultaneous inbox read and clear.
+Quitting waits for the worker; leaving an agent running could race with a later resume.
+
+`build_parser()` builds the CLI without dispatching it. `prepare_run()` shares run creation
+between `start` and the session entry points. Headless `-p` uses the same `loop()` and done rule;
+`outcome_exit_code()` maps done/error/max_turns/blocked/stopped/failed to 0/1/2/3/4/5. Usage
+errors exit 1 so they cannot be confused with the turn limit. `--output-format json` emits one
+result object on stdout and sends logs to stderr; `--quiet` hides progress, not the result.
 
 Exercising the real loop costs money and needs both CLIs logged in. To try out a change to the loop
 itself, use a throwaway git repo as `--repo` (see README "First run on a throwaway repo"). Running
@@ -58,6 +84,9 @@ own `.git` directory or worktree file, otherwise `~/.tandem/runs` for an install
 the path without creating it at import time; run creation and `doctor` create it on demand.
 `doctor` reports the resolved path and probes an actual write. Run directories must stay outside
 the target repository and tandem's own files because Claude Code is not sandboxed.
+Users moving existing runs from `../tandem-runs` to an npm install can set `TANDEM_RUNS` to
+the old directory's absolute path to keep their run ids reachable. Interactive consent stays
+in `~/.tandem/config.json`, independently of run storage.
 
 ### Invariants worth protecting
 
