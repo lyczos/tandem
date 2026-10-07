@@ -11,6 +11,13 @@
 - Add headless `-p` goals from arguments, stdin, or a file, with text or JSON output,
   `--quiet`, and outcome exit codes 0 through 5.
 - Store installed runs in `~/.tandem/runs`. `TANDEM_RUNS` takes precedence; source checkouts
-  retain `../tandem-runs`. Set `TANDEM_RUNS` to an existing directory to keep old run ids.
+  use `../tandem-runs`. Set `TANDEM_RUNS` to an existing directory to keep old run ids.
+- A source checkout in a directory not named `tandem` used to keep runs in `../<name>-runs`;
+  it now uses `../tandem-runs`. Set `TANDEM_RUNS` to the old directory to keep those runs.
+- Usage limits are remembered in `~/.tandem/availability.json` instead of the runs directory,
+  so every copy of tandem on a machine shares them.
+- Refuse to start a run when the runs directory is inside the target repository.
+- Closing the terminal or sending SIGTERM stops the agents along with tandem, in the interactive
+  session and in `start`/`-p`. A `TANDEM_PYTHON` that is not Python 3.9+ is now an error.
 - Add `tandem runs`, `--version`, current-directory repo defaults, and doctor checks for
   the interpreter, Node launcher, writable runs directory, and repository readiness.

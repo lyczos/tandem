@@ -1,10 +1,12 @@
 import argparse
+import contextlib
 import datetime
 import importlib.util
 import io
 import json
 import os
 import pathlib
+import shlex
 import shutil
 import signal
 import subprocess
@@ -213,21 +215,32 @@ class NpmLauncher(unittest.TestCase):
         self.assertTrue(node.startswith("v"))
 
     def test_unsupported_versions_fall_back_in_order(self):
-        self.env["TANDEM_PYTHON"] = str(self.interpreter("old-python", "3.8"))
         self.interpreter("python3", "2.7")
-        self.interpreter("python3.13", "3.13", "print('python3.13')")
+        self.interpreter("python3.15", "3.8")
+        self.interpreter("python3.14", "3.14", "print('python3.14')")
         self.interpreter("python3.9", "3.9", "print('python3.9')")
         result = self.launch("--version")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout.strip(), "python3.13")
+        self.assertEqual(result.stdout.strip(), "python3.14")
+
+    def test_unusable_override_fails_instead_of_falling_through(self):
+        self.interpreter("python3", "3.13", "print('python3')")
+        for override, message in ((self.interpreter("old-python", "3.8"), "is Python 3.8"),
+                                  (self.temp / "missing-python", "could not be run")):
+            with self.subTest(override=override.name):
+                self.env["TANDEM_PYTHON"] = str(override)
+                result = self.launch("--version")
+                self.assertEqual(result.returncode, 1)
+                self.assertEqual(result.stdout, "")
+                self.assertIn(f"TANDEM_PYTHON={override} {message}", result.stderr)
+                self.assertNotIn("Error:", result.stderr)
 
     def test_no_python_gives_actionable_error(self):
-        self.env["TANDEM_PYTHON"] = str(self.temp / "missing-python")
         result = self.launch("--version")
         self.assertEqual(result.returncode, 1)
         self.assertEqual(result.stdout, "")
         self.assertIn("tandem needs Python 3.9", result.stderr)
-        self.assertIn("missing-python, python3, python3.13", result.stderr)
+        self.assertIn("Tried: python3, python3.15, python3.14", result.stderr)
         self.assertIn("python3.9, python.", result.stderr)
         self.assertIn("Install Python", result.stderr)
         self.assertNotIn("Error:", result.stderr)
@@ -261,7 +274,7 @@ class NpmLauncher(unittest.TestCase):
                 proc.wait(timeout=5)
                 output.seek(0)
                 text = output.read()
-                self.assertEqual(proc.returncode, -signal.SIGTERM if sig == signal.SIGTERM else 4, text)
+                self.assertEqual(proc.returncode, 4 if sig == signal.SIGINT else -sig, text)
                 if sig == signal.SIGINT:
                     self.assertIn("interrupted", text)
             finally:
@@ -274,6 +287,9 @@ class NpmLauncher(unittest.TestCase):
 
     def test_sigterm_reaches_child_and_preserves_signal_exit(self):
         self.check_signal(signal.SIGTERM)
+
+    def test_sighup_reaches_child(self):
+        self.check_signal(signal.SIGHUP)
 
     def test_sigint_reaches_child_and_preserves_handled_exit(self):
         self.check_signal(signal.SIGINT)
@@ -353,7 +369,10 @@ class Cli(unittest.TestCase):
         with mock.patch.dict(os.environ, {"TANDEM_PROG": "tandem"}):
             self.assertEqual(tandem.prog_name(), "tandem")
         with mock.patch.dict(os.environ, {}, clear=True):
-            self.assertEqual(tandem.prog_name(), "./tandem.py")
+            with mock.patch.object(sys, "argv", ["tools/tandem.py"]):
+                self.assertEqual(tandem.prog_name(), "tools/tandem.py")
+            with mock.patch.object(sys, "argv", [""]):
+                self.assertEqual(tandem.prog_name(), "./tandem.py")
 
 
 class RequireRepo(unittest.TestCase):
@@ -374,6 +393,19 @@ class RequireRepo(unittest.TestCase):
     def test_missing_directory(self):
         with self.assertRaises(SystemExit):
             tandem.require_repo(self.dir / "nope")
+
+    def test_runs_directory_inside_the_repo_is_refused(self):
+        subprocess.run(["git", "init", "-q"], cwd=self.dir, check=True)
+        subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty",
+                        "-m", "init"], cwd=self.dir, check=True)
+        repo = self.dir.resolve()
+        for runs in (repo, repo / ".tandem" / "runs"):
+            with self.subTest(runs=runs), mock.patch.object(tandem, "RUNS", runs), \
+                    self.assertRaises(SystemExit) as cm:
+                tandem.require_repo(self.dir)
+            self.assertIn("set TANDEM_RUNS", str(cm.exception.code))
+        with mock.patch.object(tandem, "RUNS", repo.parent / "elsewhere"):
+            self.assertEqual(tandem.require_repo(self.dir), repo)
 
 
 class DoctorRepoAndVersions(unittest.TestCase):
@@ -589,6 +621,15 @@ class Headless(unittest.TestCase):
                 self.assertIn(message, result["outcome_message"])
                 self.assertIsNone(result["run_id"])
                 self.assertEqual(result["turn_count"], 0)
+
+    def test_unexpected_error_still_prints_one_json_object(self):
+        with mock.patch.object(tandem, "call_agent", side_effect=TypeError("a bug")):
+            code, out, err = self.invoke("-p", "Work", "--output-format", "json")
+        self.assertEqual(code, 1)
+        self.assertIn("Traceback", err)
+        result = json.loads(out)
+        self.assertEqual((result["outcome"], result["outcome_message"]), ("error", "TypeError: a bug"))
+        self.assertIsNotNone(result["run_id"])
 
     def test_start_still_uses_the_same_loop(self):
         with mock.patch.object(tandem, "call_agent", return_value=({"status": "continue"}, 0)):
@@ -813,6 +854,276 @@ class Interactive(unittest.TestCase):
                 session.handle("stop", "")
             self.assertTrue((pathlib.Path(d) / "STOP").exists())
             self.assertFalse(session.handle("quit", ""))
+
+    def test_new_session_resumes_the_latest_run_in_its_repo(self):
+        rows = [{"id": "other", "path": "/runs/other", "repo": "/elsewhere"},
+                {"id": "mine", "path": "/runs/mine", "repo": "/repo"}]
+        session = tandem.Session(argparse.Namespace(repo=pathlib.Path("/repo")), tandem.Console(fancy=False))
+        with mock.patch.dict(tandem.CURRENT, {}, clear=True), mock.patch.object(tandem, "list_runs", return_value=rows), \
+                mock.patch.object(tandem, "emit"), mock.patch.object(session, "resume") as resume:
+            session.handle("resume", "4")
+            self.assertEqual(tandem.CURRENT["target"], pathlib.Path("/runs/mine"))
+        resume.assert_called_once_with(pathlib.Path("/runs/mine"), "4")
+        with mock.patch.dict(tandem.CURRENT, {}, clear=True), mock.patch.object(tandem, "list_runs", return_value=rows), \
+                mock.patch.object(tandem, "emit"):
+            self.assertIsNone(session.target())  # /say does not guess
+
+    def test_no_resume_hint_after_quit(self):
+        session = tandem.Session(argparse.Namespace(), tandem.Console(fancy=False))
+        session.quitting = True
+        with mock.patch.object(tandem, "emit") as emit:
+            session.launch("run", lambda: None)
+            session.thread.join(3)
+        self.assertFalse(any("type a goal" in c.args[0] for c in emit.call_args_list))
+
+    def test_libedit_buffer_is_not_redrawn(self):
+        console = tandem.Console(fancy=True)
+        for backend, doc, expected in (("editline", "", ""), ("", "Importing this module enables libedit", ""),
+                                       ("readline", "GNU readline", "typed")):
+            fake = mock.Mock(backend=backend, __doc__=doc, get_line_buffer=lambda: "typed")
+            with self.subTest(backend=backend), mock.patch.dict(sys.modules, {"readline": fake}):
+                self.assertEqual(console._buffer(), expected)
+
+
+class Children(unittest.TestCase):
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory(dir=ROOT)
+        self.addCleanup(temp.cleanup)
+        self.dir = pathlib.Path(temp.name)
+
+    def wait_gone(self, pid):
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                return True
+            time.sleep(.05)
+        return False
+
+    @unittest.skipUnless(hasattr(os, "killpg"), "process groups are POSIX")
+    def test_timeout_kills_a_detached_agent_with_its_tools(self):
+        pid_file = self.dir / "grandchild"
+        script = (f"import pathlib, subprocess, time\n"
+                  f"p = subprocess.Popen(['sleep', '30'])\n"
+                  f"pathlib.Path({str(pid_file)!r}).write_text(str(p.pid))\ntime.sleep(30)")
+        with mock.patch.dict(tandem.CHILD_POPEN, {"start_new_session": True}), \
+                self.assertRaises(subprocess.TimeoutExpired):
+            tandem.run_child([sys.executable, "-c", script], timeout=1)
+        self.assertTrue(self.wait_gone(int(pid_file.read_text())))
+        self.assertFalse(tandem.CHILDREN)
+
+    def test_signal_children_stops_what_the_worker_waits_on(self):
+        results = []
+        worker = threading.Thread(target=lambda: results.append(
+            tandem.run_child([sys.executable, "-c", "import time; time.sleep(30)"], input="")))
+        with mock.patch.dict(tandem.CHILD_POPEN, {"start_new_session": hasattr(os, "killpg")}):
+            worker.start()
+            deadline = time.monotonic() + 5
+            while not tandem.CHILDREN and time.monotonic() < deadline:
+                time.sleep(.01)
+            self.assertEqual(tandem.signal_children(), 1)
+            worker.join(5)
+        self.assertFalse(worker.is_alive())
+        self.assertNotEqual(results[0].returncode, 0)
+        self.assertFalse(tandem.CHILDREN)
+
+    @unittest.skipUnless(hasattr(os, "getpgrp"), "process groups are POSIX")
+    def test_check_and_git_leave_the_terminal_group_in_a_session(self):
+        state = {"worktree": str(self.dir), "config": {"timeout": 30,
+                 "check": f"{shlex.quote(sys.executable)} -c 'import os; print(os.getpgrp())'"}}
+        with mock.patch.dict(tandem.CHILD_POPEN, {"start_new_session": True}):
+            ok, output = tandem.run_check(state)
+            with mock.patch.object(subprocess, "run", wraps=subprocess.run) as run:
+                tandem.git(self.dir, "--version")
+        self.assertTrue(ok, output)
+        self.assertNotEqual(int(output), os.getpgrp())
+        self.assertTrue(run.call_args.kwargs.get("start_new_session"))
+
+
+STUB_AGENT = """\
+import json, os, pathlib, sys, time
+name, args = pathlib.Path(sys.argv[0]).name, sys.argv[1:]
+if args[:2] in (["auth", "status"], ["login", "status"]):
+    print(json.dumps({"loggedIn": True}))
+    sys.exit()
+if args == ["--version"]:
+    time.sleep(float(os.environ.get("STUB_VERSION_SLEEP", "0")))
+    print(name, "stub")
+    sys.exit()
+sys.stdin.read()
+with open(os.environ["STUB_LOG"], "a") as f:
+    f.write(f"{name} start {os.getpid()}\\n")
+time.sleep(float(os.environ.get("STUB_TURN_SLEEP", "0")))
+with open(os.environ["STUB_LOG"], "a") as f:
+    f.write(f"{name} end\\n")
+reply = {"status": "done", "summary": "stub"}
+if name == "codex":
+    pathlib.Path(args[args.index("-o") + 1]).write_text(json.dumps(reply))
+else:
+    print(json.dumps({"structured_output": reply, "total_cost_usd": 0}))
+"""
+
+
+@unittest.skipUnless(os.name == "posix", "the session's signal handling is POSIX")
+class SessionProcess(unittest.TestCase):
+    """tandem.py as a user runs it, on a pseudo-terminal, with stub agents on PATH."""
+
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory(dir=ROOT)
+        self.addCleanup(temp.cleanup)
+        self.base = pathlib.Path(temp.name).resolve()
+        self.repo, self.runs, home, bin_dir = (self.base / n for n in ("repo", "runs", "home", "bin"))
+        for d in (self.repo, home / ".tandem", bin_dir):
+            d.mkdir(parents=True)
+        (home / ".tandem" / "config.json").write_text(json.dumps({"consent": {"version": "test"}}))
+        for name in ("claude", "codex"):
+            (bin_dir / name).write_text(f"#!{sys.executable}\n{STUB_AGENT}")
+            (bin_dir / name).chmod(0o755)
+        self.log = self.base / "agents.log"
+        self.output = []
+        self.env = dict(os.environ, PATH=f"{bin_dir}{os.pathsep}{os.environ['PATH']}", HOME=str(home),
+                        TANDEM_RUNS=str(self.runs), NO_COLOR="1", STUB_LOG=str(self.log),
+                        GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@example.com",
+                        GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@example.com")
+        self.env.pop("TANDEM_PROG", None)
+        subprocess.run(["git", "init", "-q"], cwd=self.repo, check=True, env=self.env)
+        subprocess.run(["git", "commit", "-q", "--allow-empty", "-m", "init"], cwd=self.repo, check=True, env=self.env)
+
+    def start(self, *args, **env):
+        import pty
+        master, slave = pty.openpty()
+        self.output, lock = [], threading.Lock()
+        # Its own session, as a terminal's job would be: signals to its group are the terminal's.
+        self.proc = subprocess.Popen([sys.executable, "-B", str(ROOT / "tandem.py"), "--repo", str(self.repo), *args],
+                                     stdin=slave, stdout=slave, stderr=slave, cwd=self.repo,
+                                     env=dict(self.env, **env), start_new_session=True)
+        os.close(slave)
+
+        def read():
+            while True:
+                try:
+                    chunk = os.read(master, 4096)
+                except OSError:
+                    break
+                if not chunk:
+                    break
+                with lock:
+                    self.output.append(chunk.decode(errors="replace"))
+
+        reader = threading.Thread(target=read, daemon=True)
+        reader.start()
+
+        def cleanup():
+            for pid in self.agent_pids():
+                with contextlib.suppress(ProcessLookupError):
+                    os.kill(pid, signal.SIGKILL)
+            if self.proc.poll() is None:
+                os.killpg(self.proc.pid, signal.SIGKILL)
+            self.proc.wait()
+            os.close(master)
+
+        self.addCleanup(cleanup)
+        self.master = master
+
+    def text(self):
+        return "".join(self.output)
+
+    def wait_for(self, predicate, what, timeout=20):
+        deadline = time.monotonic() + timeout
+        while not predicate():
+            if time.monotonic() > deadline:
+                self.fail(f"never saw {what}; output:\n{self.text()}")
+            time.sleep(.05)
+
+    def type(self, line):
+        os.write(self.master, (line + "\n").encode())
+
+    def log_text(self):
+        return self.log.read_text() if self.log.exists() else ""
+
+    def agent_pids(self):
+        return [int(l.split()[2]) for l in self.log_text().splitlines() if " start " in l]
+
+    def state(self):
+        return tandem.load(next(d for d in self.runs.iterdir() if (d / "state.json").exists()))
+
+    def alive(self, pid):
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        return True
+
+    def start_slow_turn(self):
+        self.start(STUB_TURN_SLEEP="60")
+        self.wait_for(lambda: "tandem> " in self.text(), "the prompt")
+        self.type("make a file")
+        self.wait_for(lambda: "claude start" in self.log_text(), "the agent starting")
+        return self.agent_pids()[0]
+
+    def check_signal_ends_session(self, sig):
+        agent = self.start_slow_turn()
+        os.kill(self.proc.pid, sig)  # the terminal closing, or a supervisor; not the agent's group
+        self.assertEqual(self.proc.wait(timeout=20), 128 + sig, self.text())
+        self.wait_for(lambda: not self.alive(agent), "the agent stopping", timeout=5)
+        self.assertNotIn("claude end", self.log_text())
+        self.assertEqual(self.state()["outcome"], "stopped")
+
+    def test_hangup_stops_the_agent(self):
+        self.check_signal_ends_session(signal.SIGHUP)
+
+    def test_sigterm_stops_the_agent(self):
+        self.check_signal_ends_session(signal.SIGTERM)
+
+    def test_ctrl_c_while_quitting_stops_the_agent(self):
+        agent = self.start_slow_turn()
+        self.type("/quit")
+        self.wait_for(lambda: "waiting for the current turn" in self.text(), "the quit wait")
+        os.killpg(self.proc.pid, signal.SIGINT)  # Ctrl+C reaches the terminal's foreground group
+        self.assertEqual(self.proc.wait(timeout=20), 0, self.text())
+        self.assertFalse(self.alive(agent))
+        self.assertEqual(self.state()["outcome"], "stopped")
+        self.assertNotIn("type a goal, /resume", self.text())
+
+    def test_ctrl_c_at_the_prompt_spares_the_check(self):
+        started, done = self.base / "check-started", self.base / "check-done"
+        self.start("--check", f"touch {started} && sleep 2 && touch {done}")
+        self.wait_for(lambda: "tandem> " in self.text(), "the prompt")
+        self.type("make a file")
+        self.wait_for(started.exists, "the check starting")
+        os.killpg(self.proc.pid, signal.SIGINT)
+        self.wait_for(lambda: "FINISHED" in self.text(), "the run finishing")
+        self.assertTrue(done.exists())
+        self.assertEqual((self.state()["outcome"], self.state()["turn"]), ("done", 3))
+        self.type("/quit")
+        self.assertEqual(self.proc.wait(timeout=10), 0, self.text())
+
+    def test_ctrl_c_during_a_command_keeps_the_session(self):
+        self.start(STUB_VERSION_SLEEP="5")
+        self.wait_for(lambda: "tandem> " in self.text(), "the prompt")
+        self.type("/doctor")
+        time.sleep(1)
+        os.killpg(self.proc.pid, signal.SIGINT)
+        self.wait_for(lambda: "interrupted" in self.text(), "the command being interrupted")
+        self.type("/help")
+        self.wait_for(lambda: "/transcript" in self.text(), "the session answering")
+        self.type("/quit")
+        self.assertEqual(self.proc.wait(timeout=10), 0, self.text())
+
+    def test_sigterm_in_headless_mode_stops_the_agent(self):
+        log = self.base / "headless.txt"
+        with open(log, "w") as out:
+            proc = subprocess.Popen([sys.executable, "-B", str(ROOT / "tandem.py"), "-p", "goal",
+                                     "--repo", str(self.repo), "--output-format", "json"],
+                                    stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.DEVNULL,
+                                    env=dict(self.env, STUB_TURN_SLEEP="60"), start_new_session=True)
+            self.addCleanup(lambda: proc.poll() is None and os.killpg(proc.pid, signal.SIGKILL))
+            self.wait_for(lambda: "claude start" in self.log_text(), "the agent starting")
+            proc.send_signal(signal.SIGTERM)  # only tandem, as the npm launcher forwards it
+            self.assertEqual(proc.wait(timeout=20), 4)
+        self.assertFalse(self.alive(self.agent_pids()[0]))
+        self.assertEqual(json.loads(log.read_text())["outcome"], "stopped")
 
 
 if __name__ == "__main__":

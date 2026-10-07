@@ -150,13 +150,17 @@ you can keep typing and talk to the agents while they work. Slash commands:
 
 - `/help`, `/status`, `/runs`, `/transcript` (prints the transcript path), `/doctor`
 - `/say TEXT` leaves a message the next turn reads
-- `/stop` stops after the current turn; `/resume [TURNS]` continues the last run
+- `/stop` stops after the current turn; `/resume [TURNS]` continues the last run (in a new
+  session, the latest run in this repo)
 - `/goal FILE` starts a run from a goal file; `/campaign ARGS...` is `tandem campaign ARGS...`
 - `/quit` or Ctrl+D leaves after the current turn finishes
 
 Only one run or campaign runs in a session at a time. Another goal or `/resume` while it is busy
-leaves the current run and any pending `/stop` unchanged. Ctrl+C at the prompt clears the line;
-it does not cancel a turn, including while `/quit` waits for that turn to finish.
+leaves the current run and any pending `/stop` unchanged. Ctrl+C at the prompt clears the line
+and during a slow command (such as `/doctor`) cancels that command; neither touches the run.
+While `/quit` waits for the turn to finish, Ctrl+C stops the agent instead: the turn is recorded
+as failed and `/resume` or `tandem resume` continues from there. Closing the terminal or sending
+the session SIGTERM does the same without asking, so no agent keeps working unsupervised.
 
 On a terminal without `NO_COLOR`, an updating
 "turn 3: Claude Code working... 2m14s" line shows above the prompt. Set `NO_COLOR` to disable
@@ -287,11 +291,11 @@ bad output) is benched and the other one finishes alone.
 
 | Variable | Effect |
 | --- | --- |
-| `TANDEM_PYTHON` | First interpreter the npm launcher tries; give a Python executable name or path, without flags. It must be Python 3.9+ to be selected. |
+| `TANDEM_PYTHON` | The interpreter the npm launcher uses; give a Python executable name or path, without flags. If it is not Python 3.9+, the launcher stops with an error instead of searching further. |
 | `TANDEM_RUNS` | Run storage directory. Relative paths resolve from the directory where tandem starts; use an absolute path to find the same runs from any repo. |
 | `NO_COLOR` | When present, disables escape codes and the updating status line. |
 
-The launcher tries `TANDEM_PYTHON`, then `python3`, then `python3.13` through `python3.9`,
+Without `TANDEM_PYTHON`, the launcher tries `python3`, then `python3.15` through `python3.9`,
 then `python` (and `py -3` on Windows). Each candidate must pass a version check. If none
 qualifies, the launcher lists what it tried and how to install Python.
 
@@ -303,7 +307,10 @@ Run storage uses the first applicable path:
 
 The directory is created when needed. `doctor` prints its resolved path and checks an actual
 write. Run directories must stay outside the target repository and tandem's own files because
-Claude Code is not sandboxed. If you already have runs under `../tandem-runs`, set
+Claude Code is not sandboxed; tandem refuses to start a run when the runs directory is inside the
+target repository (a repository at your home directory contains `~/.tandem/runs`, for example).
+Usage limits seen by either agent are kept in `~/.tandem/availability.json`, shared by every copy
+of tandem on the machine. If you already have runs under `../tandem-runs`, set
 `TANDEM_RUNS` to that directory's absolute path to keep those run ids reachable after the npm
 install. For example:
 

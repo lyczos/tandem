@@ -8,6 +8,7 @@ The orchestrator owns git: after every turn it commits what the agent changed.
 """
 
 import argparse
+import concurrent.futures
 import contextlib
 import datetime
 import io
@@ -17,11 +18,13 @@ import pathlib
 import re
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
 import threading
 import time
+import traceback
 
 __version__ = "0.1.0"  # single source of truth; package.json must match (a test checks)
 
@@ -86,8 +89,9 @@ MAX_TRANSIENT_RETRIES = 6
 LIMIT_FALLBACK_WAIT = 3600      # usage limit without a readable reset time
 PLAN_RETRY_WAIT = 600
 
-# Accounts are shared by every run on this machine, so availability is too.
-AVAILABILITY = RUNS / ".availability.json"
+# Accounts are shared by every run on this machine, so availability is too: it lives beside the
+# user's config, not in RUNS, so a source checkout and an npm install see the same usage limits.
+AVAILABILITY = pathlib.Path.home() / ".tandem" / "availability.json"
 LIMIT_MARKERS = ("usage limit", "hit your limit", "limit reached", "rate limit", "quota exceeded",
                  "credit balance is too low")
 TRANSIENT_MARKERS = ("enotfound", "econnreset", "etimedout", "econnrefused", "can't reach the api",
@@ -110,10 +114,66 @@ class GitError(Exception):
 
 
 def git(cwd, *args, check=True):
-    proc = subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True)
+    proc = subprocess.run(["git", *args], cwd=cwd, stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                          **CHILD_POPEN)
     if check and proc.returncode != 0:
         raise GitError(f"`git {' '.join(args[:2])}` in {cwd} failed: {tail(proc.stderr or proc.stdout, 400)}")
     return proc.stdout.strip()
+
+
+# The interactive session sets start_new_session here, so a Ctrl+C at its prompt reaches neither a
+# turn in flight nor the check and git commands around it. Those children never get the terminal
+# on stdin either: a detached shell holding it hangs up the session's terminal when it exits.
+CHILD_POPEN = {}
+# Agents and checks being waited on, so a session that is going away can stop them: an agent left
+# behind keeps editing the worktree with nobody to time it out or commit what it did.
+CHILDREN = set()
+CHILDREN_LOCK = threading.Lock()
+KILL_GRACE = 5  # seconds between asking those processes to stop and killing them
+
+
+def run_child(cmd, input=None, timeout=None, **kwargs):
+    """subprocess.run for the long calls (agents, the check), tracked in CHILDREN while they run."""
+    with subprocess.Popen(cmd, stdin=subprocess.PIPE if input is not None else subprocess.DEVNULL,
+                          stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                          **CHILD_POPEN, **kwargs) as proc:
+        # In its own session the process leads a group, and killing the group takes its tools along.
+        proc.tandem_group = bool(CHILD_POPEN.get("start_new_session")) and hasattr(os, "killpg")
+        with CHILDREN_LOCK:
+            CHILDREN.add(proc)
+        try:
+            out, err = proc.communicate(input, timeout=timeout)
+        except BaseException:
+            signal_child(proc, hard=True)
+            proc.wait()
+            raise
+        finally:
+            with CHILDREN_LOCK:
+                CHILDREN.discard(proc)
+    return subprocess.CompletedProcess(cmd, proc.returncode, out, err)
+
+
+def signal_child(proc, hard=False):
+    if proc.returncode is not None:
+        return
+    try:
+        if proc.tandem_group:
+            os.killpg(proc.pid, signal.SIGKILL if hard else signal.SIGTERM)
+        elif hard:
+            proc.kill()
+        else:
+            proc.terminate()
+    except (ProcessLookupError, PermissionError):
+        pass
+
+
+def signal_children(hard=False):
+    """Stop every tracked agent and check; returns how many there were."""
+    with CHILDREN_LOCK:
+        procs = list(CHILDREN)
+    for proc in procs:
+        signal_child(proc, hard)
+    return len(procs)
 
 
 OUT_LOCK = threading.RLock()  # every line the orchestrator prints goes through here
@@ -127,15 +187,18 @@ def log(msg):
 def emit(text):
     """Print one line; in an interactive session redraw the prompt so log and input do not interleave."""
     with OUT_LOCK:
-        if CONSOLE:
-            CONSOLE.write(text)
-        else:
-            print(text, flush=True)
+        try:
+            if CONSOLE:
+                CONSOLE.write(text)
+            else:
+                print(text, flush=True)
+        except OSError:
+            pass  # the terminal is gone; the run must still record its turn and stop cleanly
 
 
 def prog_name():
     """How the user invoked tandem, for advice we print: `tandem` via the npm wrapper, else the script path."""
-    return os.environ.get("TANDEM_PROG") or "./tandem.py"
+    return os.environ.get("TANDEM_PROG") or (sys.argv[0] if sys.argv and sys.argv[0] else "./tandem.py")
 
 
 def require_repo(path):
@@ -147,6 +210,10 @@ def require_repo(path):
         sys.exit(f"{repo} is not a git repository; run `git init` there or pass --repo")
     if not git(repo, "rev-parse", "--verify", "-q", "HEAD", check=False):
         sys.exit(f"{repo} has no commits yet; make one (git add -A && git commit -m init) so tandem can branch from it")
+    if RUNS == repo or repo in RUNS.parents:
+        # Claude Code is not sandboxed, and run directories inside the target would be edited and
+        # committed as part of it (a repo at $HOME holds ~/.tandem/runs, for one).
+        sys.exit(f"the runs directory {RUNS} is inside {repo}; set TANDEM_RUNS to a directory outside it")
     return repo
 
 
@@ -209,7 +276,7 @@ def wait_until(when, stop_file=None):
     while datetime.datetime.now() < when:
         if stop_file and pathlib.Path(stop_file).exists():
             return False
-        time.sleep(min(60, max(1, (when - datetime.datetime.now()).total_seconds())))
+        time.sleep(min(5, max(1, (when - datetime.datetime.now()).total_seconds())))
     return True
 
 
@@ -382,8 +449,7 @@ def run_claude(cfg, worktree, prompt, out_base, schema, key, readonly):
         cmd += ["--model", cfg["claude_model"]]
     if cfg.get("claude_budget"):
         cmd += ["--max-budget-usd", str(cfg["claude_budget"])]
-    proc = subprocess.run(cmd, input=prompt, cwd=worktree, capture_output=True, text=True,
-                          timeout=cfg["timeout"], **AGENT_POPEN)
+    proc = run_child(cmd, input=prompt, cwd=worktree, timeout=cfg["timeout"])
     out_base.with_suffix(".json").write_text(proc.stdout)
     out_base.with_suffix(".stderr").write_text(proc.stderr)
     try:
@@ -408,8 +474,7 @@ def run_codex(cfg, worktree, prompt, out_base, schema, key, readonly):
     if cfg.get("codex_effort"):
         cmd += ["-c", f'model_reasoning_effort="{cfg["codex_effort"]}"']
     cmd.append("-")
-    proc = subprocess.run(cmd, input=prompt, cwd=worktree, capture_output=True, text=True,
-                          timeout=cfg["timeout"], **AGENT_POPEN)
+    proc = run_child(cmd, input=prompt, cwd=worktree, timeout=cfg["timeout"])
     out_base.with_suffix(".log").write_text(proc.stdout + "\n--- stderr ---\n" + proc.stderr)
     if proc.returncode != 0:
         errors = [l for l in (proc.stderr + "\n" + proc.stdout).splitlines() if l.startswith("ERROR")]
@@ -417,8 +482,6 @@ def run_codex(cfg, worktree, prompt, out_base, schema, key, readonly):
     return parse_result(last.read_text() if last.exists() else proc.stdout, key), 0.0
 
 
-# The interactive session sets start_new_session so Ctrl+C at the prompt does not kill a turn in flight.
-AGENT_POPEN = {}
 RUNNERS = {"claude": run_claude, "codex": run_codex}
 
 
@@ -440,8 +503,7 @@ def run_check(state):
     cmd = state["config"].get("check")
     if not cmd:
         return True, ""
-    proc = subprocess.run(cmd, shell=True, cwd=state["worktree"], capture_output=True, text=True,
-                          timeout=state["config"]["timeout"])
+    proc = run_child(cmd, shell=True, cwd=state["worktree"], timeout=state["config"]["timeout"])
     return proc.returncode == 0, tail(proc.stdout + proc.stderr, 2000)
 
 
@@ -486,7 +548,7 @@ def loop(run_dir):
     inboxes = state.get("inboxes") or [str(run_dir / "inbox.md")]
     while True:
         if stop_requested(state):
-            return finish(run_dir, state, "stopped", "The owner asked the campaign to stop.")
+            return finish(run_dir, state, "stopped", "The owner asked to stop.")
         if state["turn"] > state["max_turns"]:
             return finish(run_dir, state, "max_turns", "Turn limit reached before both agents agreed.")
 
@@ -680,7 +742,7 @@ def push_branch(camp):
         log(f"not pushing {branch}: campaigns never push the default branch")
         return
     proc = subprocess.run(["git", "push", "origin", f"{branch}:{branch}"], cwd=camp["repo"],
-                          capture_output=True, text=True)
+                          stdin=subprocess.DEVNULL, capture_output=True, text=True, **CHILD_POPEN)
     if proc.returncode == 0:
         log(f"pushed {branch} to origin at {git(camp['worktree'], 'rev-parse', '--short', 'HEAD')}")
     else:
@@ -978,6 +1040,9 @@ def cmd_headless(args):
                 raise
             state.update(outcome="error", outcome_message=str(exc))
             print(str(exc), file=sys.stderr)
+        except Exception as exc:  # a bug must still leave one JSON object on stdout
+            traceback.print_exc()
+            state.update(outcome="error", outcome_message=f"{type(exc).__name__}: {exc}")
 
     result = headless_result(run_dir, state)
     if args.output_format == "json":
@@ -1055,7 +1120,7 @@ def list_runs(limit=None):
             turns = sum(r.get("turns", 0) for r in data.get("runs", []))
             name = d.name
         rows.append({"id": d.name, "name": name, "branch": data.get("branch", "-"), "outcome": outcome,
-                     "turns": turns, "path": str(d)})
+                     "turns": turns, "path": str(d), "repo": data.get("repo")})
     return rows
 
 
@@ -1272,8 +1337,9 @@ def build_parser():
 # reads input, so `/say` reaches the next turn while the agents work. All output goes through
 # emit() and OUT_LOCK; on a real terminal the Console clears the prompt line, prints, and redraws
 # the prompt (plus a one-line "turn N: Agent working... 2m14s" status above it). I chose it over
-# the Ctrl+C-interrupts-the-run fallback because the redraw is a few escape codes, and agents run
-# in their own session (AGENT_POPEN) so a Ctrl+C at the prompt cannot kill a turn in flight.
+# the Ctrl+C-interrupts-the-run fallback because the redraw is a few escape codes, and the worker's
+# children run in their own session (CHILD_POPEN) so a Ctrl+C at the prompt cannot kill a turn in
+# flight. The price is that the session must stop those children itself when it goes away.
 
 SLASH_COMMANDS = ["help", "status", "say", "stop", "resume", "goal", "campaign", "runs", "transcript",
                   "doctor", "quit"]
@@ -1378,8 +1444,11 @@ def banner(repo):
     branch = git(repo, "rev-parse", "--abbrev-ref", "HEAD", check=False) or "?"
     py = f"{sys.executable} {sys.version.split()[0]}"
     lines = [f"tandem {__version__}", f"repo    {repo} ({branch})", f"python  {py}"]
-    for name in ("claude", "codex"):
-        lines.append(f"{name:<7} {agent_login_status(name)}")
+    # Both probes at once: a hung CLI costs one timeout before the prompt, not two.
+    with concurrent.futures.ThreadPoolExecutor(2) as pool:
+        logins = pool.map(agent_login_status, ("claude", "codex"))
+        for name, status in zip(("claude", "codex"), logins):
+            lines.append(f"{name:<7} {status}")
     lines.append("type a goal, or /help")
     return "\n".join(lines)
 
@@ -1408,9 +1477,13 @@ class Console:
     def _buffer(self):
         try:
             import readline
-            return readline.get_line_buffer()
         except ImportError:
             return ""
+        # macOS libedit hands back the line just submitted while the new one is still empty, which
+        # would redraw stale text after every log line. Redrawing nothing there is the lesser evil.
+        if getattr(readline, "backend", "") == "editline" or "libedit" in (readline.__doc__ or ""):
+            return ""
+        return readline.get_line_buffer()
 
     def write(self, text):
         if not self.prompt_active:
@@ -1456,6 +1529,7 @@ class Session:
         self.args = args
         self.console = console
         self.thread = None
+        self.quitting = False
 
     def busy(self):
         return self.thread is not None and self.thread.is_alive()
@@ -1485,12 +1559,40 @@ class Session:
             finally:
                 with OUT_LOCK:
                     self.console.running = False
-                emit(f"{label} ended; type a goal, /resume or /quit")
+                if not self.quitting:
+                    emit(f"{label} ended; type a goal, /resume or /quit")
 
         with OUT_LOCK:
             self.console.running = True
-        self.thread = threading.Thread(target=work)
+        # A daemon, so a session ended by a signal is never held open by a turn it could not stop.
+        self.thread = threading.Thread(target=work, daemon=True)
         self.thread.start()
+
+    def wait_for_worker(self, forced, pause):
+        """Before leaving, let the turn in flight end; a signal, or Ctrl+C here, stops the agent instead."""
+        if not self.busy():
+            return
+        if CURRENT.get("target"):
+            (CURRENT["target"] / "STOP").write_text(now())
+        if not forced:
+            emit("waiting for the current turn to end; Ctrl+C stops the agent now (the turn is recorded as failed)")
+        stopped_at = None
+        while self.busy():
+            if forced and stopped_at is None:
+                signal_children()
+                stopped_at = time.monotonic()
+            try:
+                pause(0.1)
+            except KeyboardInterrupt:
+                if stopped_at is None:
+                    emit("stopping the agent")
+                    forced = True
+            except SessionEnd:
+                forced = True
+            if stopped_at is not None and time.monotonic() - stopped_at > KILL_GRACE:
+                signal_children(hard=True)
+                if time.monotonic() - stopped_at > 3 * KILL_GRACE:
+                    break  # the worker is stuck outside an agent; its state is saved after each turn
 
     def start_goal(self, text=None, goal_file=None):
         # Refuse before creating files or changing CURRENT: /say and /stop must keep targeting
@@ -1509,8 +1611,16 @@ class Session:
         save(run_dir, state)
         self.launch("run", lambda: loop(run_dir))
 
-    def target(self):
+    def target(self, latest=False):
         target = CURRENT.get("target")
+        repo = getattr(self.args, "repo", None)
+        if not target and latest and repo:
+            # A new session has no run of its own yet; /resume, /status and /transcript then mean the
+            # newest run or campaign in this repo, so work from an earlier session is reachable.
+            row = next((r for r in list_runs() if r.get("repo") == str(repo)), None)
+            if row:
+                target = CURRENT["target"] = pathlib.Path(row["path"])
+                emit(f"using {row['id']}, the latest run in this repo")
         if not target:
             emit("no run yet; type a goal first")
         return target
@@ -1544,7 +1654,7 @@ class Session:
         elif name == "stop":
             self.guarded(lambda _: self.request_stop(), None)
         else:
-            target = self.target()
+            target = self.target(latest=name in ("resume", "status", "transcript"))
             if not target:
                 return True
             if name == "say":
@@ -1636,6 +1746,10 @@ class Session:
             self.guarded(parsed.fn, parsed)
 
 
+class SessionEnd(BaseException):
+    """SIGHUP or SIGTERM reached the interactive session: leave now and take the agents along."""
+
+
 def cmd_interactive(args):
     global CONSOLE
     args.repo = require_repo(args.repo)
@@ -1648,8 +1762,25 @@ def cmd_interactive(args):
     print(banner(args.repo))
     console = Console(fancy_terminal())
     session = Session(args, console)
-    AGENT_POPEN["start_new_session"] = True
+    CHILD_POPEN["start_new_session"] = True
     CONSOLE = console
+
+    # Agents run in their own session, out of reach of the terminal's hangup, so the session has to
+    # stop them itself when the window closes or someone sends SIGTERM.
+    ended_by = []
+
+    def on_signal(signum, frame):
+        if ended_by:
+            return  # the npm launcher forwards what the terminal already sent; once is enough
+        ended_by.append(signum)
+        if signum == getattr(signal, "SIGHUP", None):
+            sys.stdout = sys.stderr = open(os.devnull, "w")  # the terminal is gone
+        raise SessionEnd()
+
+    previous = {}
+    for name in ("SIGHUP", "SIGTERM"):
+        if hasattr(signal, name):
+            previous[name] = signal.signal(getattr(signal, name), on_signal)
 
     ticker_stop = threading.Event()
 
@@ -1669,30 +1800,33 @@ def cmd_interactive(args):
             except KeyboardInterrupt:
                 emit("")  # Ctrl+C at the prompt clears the line; /quit or Ctrl+D leaves
                 continue
-            kind, name, rest = parse_input(line)
-            if kind == "empty":
-                continue
-            if kind == "goal":
-                session.start_goal(name)
-            elif kind == "unknown":
-                emit(f"unknown command /{name}; valid: " + " ".join("/" + c for c in SLASH_COMMANDS))
-            elif not session.handle(name, rest):
-                break
+            try:
+                kind, name, rest = parse_input(line)
+                if kind == "goal":
+                    session.start_goal(name)
+                elif kind == "unknown":
+                    emit(f"unknown command /{name}; valid: " + " ".join("/" + c for c in SLASH_COMMANDS))
+                elif kind == "command" and not session.handle(name, rest):
+                    break
+            except KeyboardInterrupt:
+                emit("interrupted")  # Ctrl+C cancels a slow command, never the session or its run
+    except SessionEnd:
+        pass
     finally:
-        if session.busy():
-            if CURRENT.get("target"):
-                (CURRENT["target"] / "STOP").write_text(now())
-            emit("waiting for the current turn to end")
-            # Detached agents must finish before exit, or a later resume could start a second
-            # agent in their worktree. Event waits also avoid interrupting Thread.join on 3.9.
-            while session.busy():
-                try:
-                    ticker_stop.wait(0.1)
-                except KeyboardInterrupt:
-                    emit("still waiting for the current turn; /stop takes effect after it ends")
+        session.quitting = True
+        # A detached agent left running would keep editing the worktree, and a later resume could
+        # start a second agent there. Event waits also avoid interrupting Thread.join on 3.9.
+        try:
+            session.wait_for_worker(bool(ended_by), ticker_stop.wait)
+        except SessionEnd:
+            session.wait_for_worker(True, ticker_stop.wait)
         ticker_stop.set()
         CONSOLE = None
-        AGENT_POPEN.clear()
+        CHILD_POPEN.clear()
+        for name, handler in previous.items():
+            signal.signal(getattr(signal, name), handler)
+    if ended_by:
+        sys.exit(128 + ended_by[0])
 
 
 def pick_command(p, args):
@@ -1710,12 +1844,20 @@ def main(argv=None):
     p = build_parser()
     args = p.parse_args(argv)
     fn = pick_command(p, args)
+    previous = None
+    if fn is not cmd_interactive and threading.current_thread() is threading.main_thread():
+        # SIGTERM (a supervisor, or the npm launcher passing one on) ends a run the way Ctrl+C does,
+        # so run_child kills the agent instead of leaving it running in the worktree.
+        previous = signal.signal(signal.SIGTERM, signal.default_int_handler)
     try:
         fn(args)
     except KeyboardInterrupt:
         print("\ninterrupted; continue with resume")
     except GitError as e:
         sys.exit(f"{e}\nfix it, then continue with resume")
+    finally:
+        if previous is not None:
+            signal.signal(signal.SIGTERM, previous)
 
 
 if __name__ == "__main__":

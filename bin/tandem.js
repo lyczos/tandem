@@ -11,10 +11,8 @@ const PROBE = "import sys; print('%d.%d' % sys.version_info[:2])";
 const script = path.join(__dirname, "..", "tandem.py");
 
 function candidates() {
-  const list = [];
-  if (process.env.TANDEM_PYTHON) list.push([process.env.TANDEM_PYTHON]);
-  list.push(["python3"]);
-  for (let minor = 13; minor >= MIN[1]; minor--) list.push([`python3.${minor}`]);
+  const list = [["python3"]];
+  for (let minor = 15; minor >= MIN[1]; minor--) list.push([`python3.${minor}`]);
   list.push(["python"]);
   if (process.platform === "win32") list.push(["py", "-3"]);
   return list;
@@ -27,13 +25,28 @@ function version(cmd) {
   return m ? [Number(m[1]), Number(m[2])] : null;
 }
 
+function supported(v) {
+  return v && (v[0] > MIN[0] || (v[0] === MIN[0] && v[1] >= MIN[1]));
+}
+
 function find() {
+  const override = process.env.TANDEM_PYTHON;
+  if (override) {
+    // An explicit choice that does not work is an error, not a hint: falling through would run
+    // some other Python without saying so.
+    const v = version([override]);
+    if (supported(v)) return { cmd: [override], version: v.join(".") };
+    console.error(
+      `TANDEM_PYTHON=${override} ` +
+        (v ? `is Python ${v.join(".")}; tandem needs ${MIN.join(".")} or newer.` : "could not be run as Python.") +
+        "\nPoint it at a Python 3.9+ executable, or unset it to search PATH."
+    );
+    process.exit(1);
+  }
   const tried = [];
   for (const cmd of candidates()) {
     const v = version(cmd);
-    if (v && (v[0] > MIN[0] || (v[0] === MIN[0] && v[1] >= MIN[1]))) {
-      return { cmd, version: v.join(".") };
-    }
+    if (supported(v)) return { cmd, version: v.join(".") };
     tried.push(cmd.join(" ") + (v ? ` (${v.join(".")})` : ""));
   }
   console.error(
@@ -62,8 +75,9 @@ child.on("error", (e) => {
 
 // On a tty Ctrl+C reaches the whole foreground group. Forwarding it again can interrupt
 // Python's KeyboardInterrupt cleanup. Non-tty parents need explicit SIGINT forwarding.
+// SIGHUP is passed on too, so a closed terminal reaches Python even if only Node was told.
 const signalHandlers = new Map();
-for (const sig of ["SIGINT", "SIGTERM"]) {
+for (const sig of process.platform === "win32" ? ["SIGINT", "SIGTERM"] : ["SIGINT", "SIGTERM", "SIGHUP"]) {
   const forward = () => {
     if (sig === "SIGINT" && process.stdin.isTTY) return;
     if (child.exitCode === null && child.signalCode === null) child.kill(sig);

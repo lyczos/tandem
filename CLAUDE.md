@@ -10,8 +10,8 @@ only — no Python dependencies, no Python package, no build step. Keep it that 
 design change, not a detail.
 
 The npm package is `@lyczos/tandem` and installs the `tandem` command through `bin/tandem.js`.
-That launcher tries `TANDEM_PYTHON`, `python3`, `python3.13` through `python3.9`, `python`, then
-`py -3` on Windows. It requires Python 3.9+, forwards arguments and signals, and runs the same `tandem.py`
+That launcher uses `TANDEM_PYTHON` when set (and fails if it is not 3.9+), otherwise tries `python3`,
+`python3.15` through `python3.9`, `python`, then `py -3` on Windows. It requires Python 3.9+, forwards arguments and signals, and runs the same `tandem.py`
 used from a source checkout. The npm package must have no runtime dependencies and no install
 scripts; users install and log in to Claude Code and Codex themselves. Keep `package.json`'s
 version equal to `__version__` in `tandem.py`, and ship `prompts/` and `schema/` alongside it.
@@ -44,9 +44,13 @@ is absent, so the Python suite still runs without Node.
 
 The interactive session (`cmd_interactive`, `Session`, `Console`) runs `loop()` in a worker thread
 while the main thread reads input. All output must go through `emit()`/`log()` (one `OUT_LOCK`),
-never bare `print` from code that can run during a run, or the prompt redraw breaks. Agents are
-started in their own session while it runs (`AGENT_POPEN`) so Ctrl+C at the prompt cannot kill a
-turn. First-run consent lives in `~/.tandem/config.json`.
+never bare `print` from code that can run during a run, or the prompt redraw breaks. While it
+runs, every child the worker starts (agents, the check, git) gets its own session and `/dev/null`
+on stdin (`CHILD_POPEN`) so Ctrl+C at the prompt cannot kill a turn or fail a check. Being out of
+the terminal's reach, agents and checks go through `run_child()`, which tracks them in `CHILDREN`:
+SIGHUP, SIGTERM or Ctrl+C during `/quit` stop them with `signal_children()`, because an agent left
+behind keeps editing the worktree with nobody to commit or time it out. Long subprocesses started
+from the worker must use `run_child()`. First-run consent lives in `~/.tandem/config.json`.
 Check `Session.refuse_if_busy()` before creating a run or changing a stop file. Campaign setup
 finishes before launching the worker so `/say` and `/stop` always have the right target.
 `INBOX_LOCK` protects messages sent within the session from a simultaneous inbox read and clear.
@@ -76,14 +80,15 @@ Two nested loops over state that lives entirely on disk, so every command is res
 
 Nothing is held in memory between turns. A run is `state.json` in its directory; a campaign is
 `campaign.json` plus one subdirectory per run. `resume` just reloads and re-enters the loop. Agent
-availability is shared across all runs on the machine in `RUNS/.availability.json`, because the
-accounts are shared.
+availability is shared across all runs on the machine in `~/.tandem/availability.json` (not in
+`RUNS`, so a source checkout and an npm install agree), because the accounts are shared.
 
 `RUNS` uses `TANDEM_RUNS` when set, otherwise `ROOT.parent / "tandem-runs"` when `ROOT` has its
 own `.git` directory or worktree file, otherwise `~/.tandem/runs` for an installed copy. Resolve
 the path without creating it at import time; run creation and `doctor` create it on demand.
 `doctor` reports the resolved path and probes an actual write. Run directories must stay outside
-the target repository and tandem's own files because Claude Code is not sandboxed.
+the target repository and tandem's own files because Claude Code is not sandboxed;
+`require_repo()` refuses a target that contains `RUNS`.
 Users moving existing runs from `../tandem-runs` to an npm install can set `TANDEM_RUNS` to
 the old directory's absolute path to keep their run ids reachable. Interactive consent stays
 in `~/.tandem/config.json`, independently of run storage.
