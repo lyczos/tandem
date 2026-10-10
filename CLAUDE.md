@@ -116,6 +116,11 @@ agent name, and both return `(result_dict, cost_usd)` — Codex cost is always 0
 schema to the CLI and fall back to `parse_result()`, which accepts a bare JSON object or the last
 fenced ```json block in free text.
 
+Images travel inside the prompt text as `[image: PATH]` (pasted or dropped in the session, stored in
+`~/.tandem/images`). Each runner finds them with `prompt_images()` and hands them to its CLI
+(`--image` for Codex, `--add-dir` for Claude). Both flags take several values, so they go before
+another flag, never at the end of the command.
+
 `prompts/turn.md` and `prompts/plan.md` are `str.format` templates, so **every literal brace in them
 must be doubled** and the placeholders must match the kwargs in `build_prompt()` and `plan_next()`
 exactly. A new result field means editing three places together: the schema in `schema/`, the field

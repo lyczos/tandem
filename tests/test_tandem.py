@@ -655,7 +655,7 @@ class Interactive(unittest.TestCase):
         self.assertEqual(parse("/"), ("unknown", "", ""))
 
     def test_every_documented_command_is_known(self):
-        for name in ("help", "status", "say", "stop", "resume", "goal", "campaign", "runs", "transcript",
+        for name in ("help", "status", "say", "paste", "stop", "resume", "goal", "campaign", "runs", "transcript",
                      "doctor", "quit"):
             self.assertEqual(tandem.parse_input("/" + name)[0], "command")
             self.assertIn("/" + name, tandem.SLASH_HELP)
@@ -885,6 +885,127 @@ class Interactive(unittest.TestCase):
                 self.assertEqual(console._buffer(), expected)
 
 
+PNG = b"\x89PNG\r\n\x1a\n" + b"\0" * 16
+
+
+class Images(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.dir = pathlib.Path(self.tmp.name)
+        patcher = mock.patch.object(tandem, "IMAGES", self.dir / "images")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.shot = self.dir / "Screen Shot 1.png"
+        self.shot.write_bytes(PNG)
+
+    def session(self):
+        return tandem.Session(argparse.Namespace(), tandem.Console(fancy=False))
+
+    def test_dropped_paths_are_cut_from_the_line(self):
+        other = self.dir / "it's.jpg"
+        other.write_bytes(PNG)
+        escaped = str(self.shot).replace(" ", "\\ ")
+        self.assertEqual(tandem.take_dropped_images(f"fix this {escaped} now"), ("fix this now", [self.shot]))
+        self.assertEqual(tandem.take_dropped_images(f"'{self.shot}' \"{other}\""), ("", [self.shot, other]))
+        self.assertEqual(tandem.take_dropped_images(f"/say look {escaped}"), ("/say look", [self.shot]))
+        notes = self.dir / "notes.md"
+        notes.write_text("x")
+        for line in (f"read {notes}", "/say  keep   spacing", f"x{escaped}", "/nope/missing.png"):
+            self.assertEqual(tandem.take_dropped_images(line), (line, []))
+
+    def test_prompt_images_are_existing_images_once_each(self):
+        notes = self.dir / "notes.md"
+        notes.write_text("x")
+        prompt = f"[image: {self.shot}] [image: /gone.png] [image: {notes}] again [image: {self.shot}]"
+        self.assertEqual(tandem.prompt_images(prompt), [self.shot])
+
+    def test_agents_get_the_images_before_their_variadic_flags_end(self):
+        cfg = {"timeout": 5, "claude_permission_mode": "acceptEdits"}
+        schema = self.dir / "schema.json"
+        schema.write_text("{}")
+        prompt = f"goal\n\n[image: {self.shot}]"
+        done = subprocess.CompletedProcess([], 0, json.dumps({"structured_output": {"status": "done"}}), "")
+        with mock.patch.object(tandem, "run_child", return_value=done) as run:
+            tandem.run_claude(cfg, self.dir, prompt, self.dir / "c", schema, "status", False)
+        cmd, given = run.call_args[0][0], run.call_args[1]["input"]
+        self.assertEqual(cmd[2:5], ["--add-dir", str(self.dir), "--output-format"])
+        self.assertIn("Open it with Read", given)
+        with mock.patch.object(tandem, "run_child", return_value=subprocess.CompletedProcess([], 0, "", "")) as run:
+            tandem.run_codex(cfg, self.dir, prompt, self.dir / "x", schema, "status", False)
+        cmd = run.call_args[0][0]
+        self.assertEqual(cmd[2:5], ["--image", str(self.shot), "-C"])
+        self.assertEqual(cmd[-1], "-")
+        with mock.patch.object(tandem, "run_child", return_value=done) as run:
+            tandem.run_claude(cfg, self.dir, "no images", self.dir / "c", schema, "status", False)
+        self.assertNotIn("--add-dir", run.call_args[0][0])
+
+    def test_images_wait_for_the_next_goal(self):
+        session = self.session()
+        with mock.patch.object(tandem, "emit"):
+            session.attach([self.shot])
+        copy = session.images[0]
+        self.assertEqual((copy.parent, copy.read_bytes()), (tandem.IMAGES, PNG))
+        session.thread = mock.Mock()
+        session.thread.is_alive.return_value = True
+        with mock.patch.object(tandem, "prepare_run") as prepare, mock.patch.object(tandem, "emit"):
+            session.start_goal("fix the layout")
+        prepare.assert_not_called()
+        self.assertEqual(session.images, [copy])  # refused while busy: still waiting
+        session.thread = None
+        run_dir = self.dir / "run"
+        run_dir.mkdir()
+        (run_dir / "state.json").write_text("{}")
+        with mock.patch.object(tandem, "prepare_run", return_value=run_dir) as prepare, \
+                mock.patch.object(session, "launch"):
+            session.start_goal("fix the layout")
+        self.assertEqual(prepare.call_args[0][0].goal, f"fix the layout\n\n[image: {copy}]")
+        self.assertEqual(session.images, [])
+
+    def test_say_carries_images_and_paste_clear_drops_them(self):
+        session = self.session()
+        run = self.dir / "run"
+        run.mkdir()
+        with mock.patch.dict(tandem.CURRENT, {"target": run}), mock.patch.object(tandem, "emit"):
+            session.attach([self.shot])
+            session.handle("say", "")
+            self.assertIn("[image: ", (run / "inbox.md").read_text())
+            self.assertEqual(session.images, [])
+            session.attach([self.shot])
+            session.handle("paste", "clear")
+            self.assertEqual(session.images, [])
+            session.handle("say", "")
+        self.assertEqual((run / "inbox.md").read_text().count("[image: "), 1)
+
+    def test_paste_saves_the_clipboard_or_says_there_is_none(self):
+        def osascript(cmd, **kw):
+            pathlib.Path(cmd[-1]).write_bytes(PNG)
+            return subprocess.CompletedProcess(cmd, 0)
+        with mock.patch.object(sys, "platform", "darwin"), mock.patch.object(subprocess, "run", side_effect=osascript):
+            path = tandem.paste_image()
+        self.assertEqual((path.parent, path.read_bytes()), (tandem.IMAGES, PNG))
+        failed = subprocess.CompletedProcess([], 1)
+        with mock.patch.object(sys, "platform", "darwin"), mock.patch.object(subprocess, "run", return_value=failed):
+            with self.assertRaisesRegex(ValueError, "no image"):
+                tandem.paste_image()
+        self.assertEqual(list(tandem.IMAGES.iterdir()), [path])  # nothing half-written left behind
+        with mock.patch.object(sys, "platform", "linux"), mock.patch.dict(os.environ, {}, clear=True), \
+                mock.patch.object(shutil, "which", return_value=None):
+            with self.assertRaisesRegex(ValueError, "drag the image"):
+                tandem.paste_image()
+
+    def test_banner_logo_only_on_a_fancy_terminal(self):
+        with mock.patch.object(tandem, "agent_login_status", return_value="logged in"), \
+                mock.patch.object(tandem, "git", return_value="main"):
+            plain = tandem.banner(pathlib.Path("/repo"))
+            fancy = tandem.banner(pathlib.Path("/repo"), fancy=True)
+        self.assertNotIn("\x1b", plain)
+        self.assertIn("claude  logged in", plain)
+        self.assertIn("Ctrl+V", plain)
+        self.assertIn("▀█▀", fancy)
+        self.assertIn("\x1b[32m●\x1b[0m logged in", fancy)
+
+
 class Children(unittest.TestCase):
     def setUp(self):
         temp = tempfile.TemporaryDirectory(dir=ROOT)
@@ -952,6 +1073,9 @@ if args == ["--version"]:
     print(name, "stub")
     sys.exit()
 sys.stdin.read()
+if os.environ.get("STUB_ARGS"):
+    with open(os.environ["STUB_ARGS"], "a") as f:
+        f.write(json.dumps([name, args]) + "\\n")
 with open(os.environ["STUB_LOG"], "a") as f:
     f.write(f"{name} start {os.getpid()}\\n")
 time.sleep(float(os.environ.get("STUB_TURN_SLEEP", "0")))
@@ -980,6 +1104,11 @@ class SessionProcess(unittest.TestCase):
         for name in ("claude", "codex"):
             (bin_dir / name).write_text(f"#!{sys.executable}\n{STUB_AGENT}")
             (bin_dir / name).chmod(0o755)
+        # The clipboard holds an image: osascript writes it to its last argument, xclip to stdout.
+        clip = {"osascript": "open(sys.argv[-1], 'wb').write(PNG)", "xclip": "sys.stdout.buffer.write(PNG)"}
+        for name, body in clip.items():
+            (bin_dir / name).write_text(f"#!{sys.executable}\nimport sys\nPNG = {PNG!r}\n{body}\n")
+            (bin_dir / name).chmod(0o755)
         self.log = self.base / "agents.log"
         self.output = []
         self.env = dict(os.environ, PATH=f"{bin_dir}{os.pathsep}{os.environ['PATH']}", HOME=str(home),
@@ -987,6 +1116,7 @@ class SessionProcess(unittest.TestCase):
                         GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@example.com",
                         GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@example.com")
         self.env.pop("TANDEM_PROG", None)
+        self.env.pop("WAYLAND_DISPLAY", None)
         subprocess.run(["git", "init", "-q"], cwd=self.repo, check=True, env=self.env)
         subprocess.run(["git", "commit", "-q", "--allow-empty", "-m", "init"], cwd=self.repo, check=True, env=self.env)
 
@@ -1108,6 +1238,26 @@ class SessionProcess(unittest.TestCase):
         self.wait_for(lambda: "interrupted" in self.text(), "the command being interrupted")
         self.type("/help")
         self.wait_for(lambda: "/transcript" in self.text(), "the session answering")
+        self.type("/quit")
+        self.assertEqual(self.proc.wait(timeout=10), 0, self.text())
+
+    def test_ctrl_v_puts_the_clipboard_image_in_the_goal(self):
+        argv_log = self.base / "argv.log"
+        self.start(STUB_ARGS=str(argv_log))
+        self.wait_for(lambda: "tandem> " in self.text(), "the prompt")
+        os.write(self.master, b"fix the layout in")
+        os.write(self.master, b"\x16")
+        self.wait_for(lambda: "[image #1]" in self.text(), "the image in the line")
+        self.type("please")
+        self.wait_for(lambda: "FINISHED" in self.text(), "the run finishing")
+        goal = self.state()["goal"]
+        image = tandem.IMAGE_MARK.search(goal).group(1)
+        self.assertEqual(goal, f"fix the layout in [image: {image}] please")
+        self.assertEqual(pathlib.Path(image).parent, self.base / "home" / ".tandem" / "images")
+        self.assertEqual(pathlib.Path(image).read_bytes(), PNG)
+        calls = dict(json.loads(l) for l in argv_log.read_text().splitlines())
+        self.assertEqual(calls["codex"][:3], ["exec", "--image", image])
+        self.assertEqual(calls["claude"][:3], ["-p", "--add-dir", str(pathlib.Path(image).parent)])
         self.type("/quit")
         self.assertEqual(self.proc.wait(timeout=10), 0, self.text())
 

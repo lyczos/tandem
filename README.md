@@ -140,8 +140,9 @@ git worktree remove <runs-directory>/<id>/work
 
 ## Interactive session
 
-Run `tandem` with no arguments in a terminal. It prints the version, repo and branch, the Python
-in use, and whether `claude` and `codex` are installed and logged in. The first time on a machine
+Run `tandem` with no arguments in a terminal. It prints the version, repo and branch, and whether
+`claude` and `codex` are installed and logged in (with `NO_COLOR` or no terminal, also the Python in
+use, as plain lines). The first time on a machine
 it shows the security warning and asks you to type `yes`; the answer is saved in
 `~/.tandem/config.json`.
 
@@ -150,6 +151,10 @@ you can keep typing and talk to the agents while they work. Slash commands:
 
 - `/help`, `/status`, `/runs`, `/transcript` (prints the transcript path), `/doctor`
 - `/say TEXT` leaves a message the next turn reads
+- Ctrl+V pastes the image on the clipboard (a screenshot) into the line as `[image #1]`, as in
+  Claude Code. `/paste` attaches it to your next goal or `/say` instead, and so does dragging
+  image files onto the terminal; `/paste clear` drops what is waiting. Cmd+V stays the
+  terminal's own text paste
 - `/stop` stops after the current turn; `/resume [TURNS]` continues the last run (in a new
   session, the latest run in this repo)
 - `/goal FILE` starts a run from a goal file; `/campaign ARGS...` is `tandem campaign ARGS...`
@@ -161,6 +166,11 @@ and during a slow command (such as `/doctor`) cancels that command; neither touc
 While `/quit` waits for the turn to finish, Ctrl+C stops the agent instead: the turn is recorded
 as failed and `/resume` or `tandem resume` continues from there. Closing the terminal or sending
 the session SIGTERM does the same without asking, so no agent keeps working unsupervised.
+
+Images are copied to `~/.tandem/images` and named in the message as `[image: PATH]`, so every
+later turn sees them too. Codex gets them attached with `--image`; Claude Code gets the folder
+with `--add-dir` and is told to open them. `/paste` reads the clipboard with `osascript` on
+macOS and `wl-paste` or `xclip` on Linux; elsewhere, drag the file in.
 
 On a terminal without `NO_COLOR`, an updating
 "turn 3: Claude Code working... 2m14s" line shows above the prompt. Set `NO_COLOR` to disable

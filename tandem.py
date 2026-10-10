@@ -92,6 +92,11 @@ PLAN_RETRY_WAIT = 600
 # Accounts are shared by every run on this machine, so availability is too: it lives beside the
 # user's config, not in RUNS, so a source checkout and an npm install see the same usage limits.
 AVAILABILITY = pathlib.Path.home() / ".tandem" / "availability.json"
+# Pasted and dropped images are copied outside every repo and worktree, so no turn's commit can pick
+# one up, and a screenshot deleted from the desktop stays readable for the rest of the run.
+IMAGES = pathlib.Path.home() / ".tandem" / "images"
+IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".gif", ".webp")
+IMAGE_MARK = re.compile(r"\[image: ([^\]\n]+)\]")
 LIMIT_MARKERS = ("usage limit", "hit your limit", "limit reached", "rate limit", "quota exceeded",
                  "credit balance is too low")
 TRANSIENT_MARKERS = ("enotfound", "econnreset", "etimedout", "econnrefused", "can't reach the api",
@@ -437,9 +442,26 @@ def parse_result(text, key):
     return None
 
 
+def prompt_images(prompt):
+    """Image files the prompt names as [image: PATH] that still exist, once each, in order."""
+    found = []
+    for m in IMAGE_MARK.finditer(prompt):
+        p = pathlib.Path(m.group(1))
+        if p.suffix.lower() in IMAGE_EXTS and p.is_file() and p not in found:
+            found.append(p)
+    return found
+
+
 def run_claude(cfg, worktree, prompt, out_base, schema, key, readonly):
-    cmd = ["claude", "-p", "--output-format", "json", "--json-schema", schema.read_text(),
-           "--setting-sources", "project,local"]
+    cmd = ["claude", "-p"]
+    images = prompt_images(prompt)
+    if images:
+        # Read reaches files outside the worktree only through --add-dir. It takes several values,
+        # so it goes before the next flag, never last.
+        cmd += ["--add-dir", *dict.fromkeys(str(p.parent) for p in images)]
+        prompt += "\n\nEach [image: PATH] above is an image from the owner. Open it with Read before you start.\n"
+    cmd += ["--output-format", "json", "--json-schema", schema.read_text(),
+            "--setting-sources", "project,local"]
     if readonly:
         cmd += ["--permission-mode", "dontAsk", "--allowedTools", *CLAUDE_READ]
     else:
@@ -464,7 +486,14 @@ def run_claude(cfg, worktree, prompt, out_base, schema, key, readonly):
 
 def run_codex(cfg, worktree, prompt, out_base, schema, key, readonly):
     last = out_base.with_suffix(".last.json")
-    cmd = ["codex", "exec", "-C", worktree, "-s", "read-only" if readonly else "workspace-write",
+    cmd = ["codex", "exec"]
+    images = prompt_images(prompt)
+    if images:
+        # --image takes several values and would swallow the trailing "-" (prompt on stdin), so it
+        # goes first, closed off by -C.
+        cmd += ["--image", *map(str, images)]
+        prompt += "\n\nEach [image: PATH] above is an image from the owner, attached to this message in that order.\n"
+    cmd += ["-C", worktree, "-s", "read-only" if readonly else "workspace-write",
            "-c", 'approval_policy="never"', "--output-schema", str(schema), "-o", str(last),
            "--color", "never"]
     if cfg.get("codex_network") and not readonly:
@@ -1341,14 +1370,17 @@ def build_parser():
 # children run in their own session (CHILD_POPEN) so a Ctrl+C at the prompt cannot kill a turn in
 # flight. The price is that the session must stop those children itself when it goes away.
 
-SLASH_COMMANDS = ["help", "status", "say", "stop", "resume", "goal", "campaign", "runs", "transcript",
-                  "doctor", "quit"]
+SLASH_COMMANDS = ["help", "status", "say", "paste", "stop", "resume", "goal", "campaign", "runs",
+                  "transcript", "doctor", "quit"]
 
 SLASH_HELP = """\
 type a goal to start a run in this repo; while it runs, type /say to talk to the agents
   /help                show this list
   /status              one line per turn of the current run
   /say TEXT            leave a message the next turn reads
+  Ctrl+V               paste the clipboard's image into the line as [image #N]
+  /paste               attach the clipboard's image to your next goal or /say
+                       (or drag image files onto the terminal; /paste clear drops them)
   /stop                stop after the current turn
   /resume [TURNS]      continue the last run, optionally allowing TURNS more
   /goal FILE           start a run from a goal file
@@ -1372,6 +1404,98 @@ def parse_input(line):
     if name in SLASH_COMMANDS:
         return "command", name, rest.strip()
     return "unknown", name, ""
+
+
+def new_image_path(suffix):
+    IMAGES.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    n = 1
+    while (IMAGES / f"{stamp}-{n}{suffix}").exists():
+        n += 1
+    return IMAGES / f"{stamp}-{n}{suffix}"
+
+
+# AppleScript writes the clipboard's PNG to the path given as its argument; it fails when there is none.
+CLIPBOARD_SCRIPT = [
+    "on run argv",
+    "set f to open for access (POSIX file (item 1 of argv)) with write permission",
+    "try",
+    "write (the clipboard as «class PNGf») to f",
+    "on error",
+    "close access f",
+    "error number 1",
+    "end try",
+    "close access f",
+    "end run",
+]
+
+
+def paste_image():
+    """Save the clipboard's image under IMAGES. Raises ValueError saying why there is none."""
+    path = new_image_path(".png")
+    if sys.platform == "darwin":
+        cmd = ["osascript", *[a for line in CLIPBOARD_SCRIPT for a in ("-e", line)], str(path)]
+        out = None
+    elif os.environ.get("WAYLAND_DISPLAY") and shutil.which("wl-paste"):
+        cmd, out = ["wl-paste", "--no-newline", "--type", "image/png"], path
+    elif shutil.which("xclip"):
+        cmd, out = ["xclip", "-selection", "clipboard", "-t", "image/png", "-o"], path
+    else:
+        raise ValueError("no clipboard tool (macOS, wl-paste or xclip); drag the image file in instead")
+    try:
+        with open(out, "wb") if out else contextlib.nullcontext() as f:
+            proc = subprocess.run(cmd, stdin=subprocess.DEVNULL, stdout=f or subprocess.DEVNULL,
+                                  stderr=subprocess.DEVNULL, timeout=10, **CHILD_POPEN)
+        ok = proc.returncode == 0 and path.read_bytes()[:8] == b"\x89PNG\r\n\x1a\n"
+    except (OSError, subprocess.TimeoutExpired):
+        ok = False
+    if not ok:
+        path.unlink(missing_ok=True)
+        raise ValueError("no image on the clipboard")
+    return path
+
+
+INLINE_IMAGE = re.compile(r"\[image #(\d+)\]")
+
+
+def bind_paste_key(complete):
+    """Make Ctrl+V paste an image at the prompt, with GNU readline or macOS libedit.
+
+    readline cannot run Python on a key press, but it runs the completer, so Ctrl+V is bound to
+    completion (Tab stays a plain insert, as Python sets it). A macro that types a word and then
+    Tab does not work: in Python's callback mode libedit plays one macro key per real key press."""
+    try:
+        import readline
+    except ImportError:
+        return
+    readline.set_completer(complete)
+    if "libedit" in (readline.__doc__ or ""):
+        readline.parse_and_bind("bind ^V rl_complete")
+    else:
+        # GNU readline rebinds the tty's literal-next key (Ctrl+V) to quoted-insert on every prompt
+        # unless told not to; erase, kill and word-rubout keep their default bindings.
+        readline.parse_and_bind("set bind-tty-special-chars off")
+        readline.parse_and_bind('"\\C-v": complete')
+
+
+# A file dragged onto the terminal arrives as its path: quoted, or with spaces escaped by backslashes.
+DROPPED = re.compile(r"(?<![^ \t])(?:'([^']+)'|\"([^\"]+)\"|((?:~|/)(?:\\.|[^ \t\\'\"])+))")
+
+
+def take_dropped_images(line):
+    """Split image paths dropped into the line from the rest. Returns (rest, [path, ...])."""
+    found, rest, last = [], [], 0
+    for m in DROPPED.finditer(line):
+        raw = m.group(1) or m.group(2) or re.sub(r"\\(.)", r"\1", m.group(3))
+        p = pathlib.Path(raw).expanduser()
+        if p.suffix.lower() in IMAGE_EXTS and p.is_file():
+            found.append(p)
+            rest.append(line[last:m.start()])
+            last = m.end()
+    if not found:
+        return line, []
+    rest.append(line[last:])
+    return re.sub(r"[ \t]{2,}", " ", "".join(rest)).strip(), found
 
 
 def config_path():
@@ -1440,16 +1564,35 @@ def agent_login_status(name):
     return "logged in" if proc.returncode == 0 else "not logged in"
 
 
-def banner(repo):
+# One letter per pair; colored from Claude orange to Codex blue on a terminal.
+LOGO = [("▀█▀", " █ "), ("▄▀█", "█▀█"), ("█▄ █", "█ ▀█"), ("█▀▄", "█▄▀"), ("█▀▀", "██▄"), ("█▀▄▀█", "█ ▀ █")]
+LOGO_COLORS = [208, 209, 215, 117, 111, 75]
+
+
+def banner(repo, fancy=False):
     branch = git(repo, "rev-parse", "--abbrev-ref", "HEAD", check=False) or "?"
-    py = f"{sys.executable} {sys.version.split()[0]}"
-    lines = [f"tandem {__version__}", f"repo    {repo} ({branch})", f"python  {py}"]
     # Both probes at once: a hung CLI costs one timeout before the prompt, not two.
     with concurrent.futures.ThreadPoolExecutor(2) as pool:
-        logins = pool.map(agent_login_status, ("claude", "codex"))
-        for name, status in zip(("claude", "codex"), logins):
-            lines.append(f"{name:<7} {status}")
-    lines.append("type a goal, or /help")
+        logins = list(zip(("claude", "codex"), pool.map(agent_login_status, ("claude", "codex"))))
+    if not fancy:
+        lines = [f"tandem {__version__}", f"repo    {repo} ({branch})",
+                 f"python  {sys.executable} {sys.version.split()[0]}"]
+        lines += [f"{name:<7} {status}" for name, status in logins]
+        lines.append("type a goal, Ctrl+V to paste an image, or /help")
+        return "\n".join(lines)
+
+    def paint(code, text):
+        return f"\x1b[{code}m{text}\x1b[0m"
+
+    home = str(pathlib.Path.home())
+    where = "~" + str(repo)[len(home):] if str(repo) == home or str(repo).startswith(home + os.sep) else str(repo)
+    rows = [" ".join(paint(f"1;38;5;{c}", letter[i]) for letter, c in zip(LOGO, LOGO_COLORS)) for i in (0, 1)]
+    lines = ["", "  " + rows[0], "  " + rows[1] + "   " + paint("2", f"v{__version__}"), "",
+             f"  {paint('2', 'repo   ')} {where} ({branch})"]
+    for name, status in logins:
+        color = "32" if status == "logged in" else "33" if status == "login unknown" else "31"
+        lines.append(f"  {paint('2', f'{name:<7}')} {paint(color, '●')} {status}")
+    lines += ["", "  " + paint("2", "type a goal · Ctrl+V pastes an image · /help"), ""]
     return "\n".join(lines)
 
 
@@ -1530,6 +1673,9 @@ class Session:
         self.console = console
         self.thread = None
         self.quitting = False
+        self.images = []  # pasted or dropped, waiting for the next goal or /say
+        self.inline = {}  # N -> path for each [image #N] Ctrl+V put in the line
+        self.image_count = 0
 
     def busy(self):
         return self.thread is not None and self.thread.is_alive()
@@ -1594,13 +1740,73 @@ class Session:
                 if time.monotonic() - stopped_at > 3 * KILL_GRACE:
                     break  # the worker is stuck outside an agent; its state is saved after each turn
 
+    def attach(self, paths, copy=True):
+        for src in paths:
+            try:
+                path = shutil.copyfile(src, new_image_path(src.suffix.lower())) if copy else src
+            except OSError as exc:
+                emit(f"cannot attach {src}: {exc}")
+                continue
+            self.images.append(pathlib.Path(path))
+            self.image_count += 1
+            emit(f"image #{self.image_count} attached ({pathlib.Path(src).name}); "
+                 f"it goes with your next goal or /say")
+
+    def complete(self, text, state):
+        """readline completer, called for Ctrl+V (see bind_paste_key). text is the word before the cursor."""
+        if state:
+            return None
+        before = text + " " if text else ""
+        try:
+            path = paste_image()
+        except (ValueError, OSError):
+            sys.stdout.write("\a")  # mid-line, the bell is the only thing that does not garble the prompt
+            sys.stdout.flush()
+            return before
+        self.image_count += 1
+        self.inline[self.image_count] = path
+        return f"{before}[image #{self.image_count}] "
+
+    def expand_inline(self, line):
+        """Turn each [image #N] into [image: PATH]. A line of nothing but images waits for the next goal or /say."""
+        used = []
+
+        def swap(m):
+            path = self.inline.get(int(m.group(1)))
+            if path:
+                used.append(path)
+            return f"[image: {path}]" if path else m.group(0)
+
+        line = INLINE_IMAGE.sub(swap, line)
+        if used and not IMAGE_MARK.sub("", line).strip():
+            self.images.extend(used)
+            emit(f"{len(self.images)} image(s) waiting for your next goal or /say")
+            return ""
+        return line
+
+    def with_images(self, text):
+        """Name the waiting images in the message; prompt_images finds them there on every later turn."""
+        return "\n\n".join([text, *(f"[image: {p}]" for p in self.images)]).strip()
+
+    def paste(self, rest):
+        if rest == "clear":
+            emit(f"dropped {len(self.images)} image(s)")
+            self.images.clear()
+        elif rest:
+            emit("usage: /paste [clear]")
+        else:
+            try:
+                self.attach([paste_image()], copy=False)
+            except (ValueError, OSError) as exc:
+                emit(str(exc))
+
     def start_goal(self, text=None, goal_file=None):
         # Refuse before creating files or changing CURRENT: /say and /stop must keep targeting
         # the live run even when the user accidentally types another goal.
         if self.refuse_if_busy():
             return
         args = argparse.Namespace(**vars(self.args))
-        args.goal, args.goal_file = text, goal_file
+        args.goal, args.goal_file = (self.with_images(text) if text else text), goal_file
         try:
             run_dir = prepare_run(args)
         except (SystemExit, GitError, OSError, ValueError) as exc:
@@ -1609,6 +1815,8 @@ class Session:
         state = load(run_dir)
         state["stop_file"] = str(run_dir / "STOP")
         save(run_dir, state)
+        if text:
+            self.images.clear()
         self.launch("run", lambda: loop(run_dir))
 
     def target(self, latest=False):
@@ -1651,6 +1859,8 @@ class Session:
                 self.start_goal(goal_file=rest)
         elif name == "campaign":
             self.campaign(rest)
+        elif name == "paste":
+            self.paste(rest)
         elif name == "stop":
             self.guarded(lambda _: self.request_stop(), None)
         else:
@@ -1658,10 +1868,10 @@ class Session:
             if not target:
                 return True
             if name == "say":
-                if not rest:
+                if not rest and not self.images:
                     emit("usage: /say TEXT")
-                else:
-                    self.guarded(cmd_say, argparse.Namespace(run=str(target), message=rest))
+                elif self.guarded(cmd_say, argparse.Namespace(run=str(target), message=self.with_images(rest))):
+                    self.images.clear()
             elif name == "status":
                 fn = cmd_campaign_status if (target / "campaign.json").exists() else cmd_status
                 self.guarded(fn, argparse.Namespace(run=str(target), dir=str(target)))
@@ -1684,13 +1894,18 @@ class Session:
         return pathlib.Path(run) / "transcript.md" if run else target
 
     def guarded(self, fn, args):
+        """Run a command, reporting its failure instead of ending the session. True when it succeeded."""
         try:
             fn(args)
+            return True
         except SystemExit as exc:
             if exc.code not in (None, 0):
                 emit(str(exc.code))
+                return False
+            return True
         except (GitError, OSError, ValueError) as exc:
             emit(str(exc))
+        return False
 
     def resume(self, target, rest):
         if self.refuse_if_busy():
@@ -1759,9 +1974,11 @@ def cmd_interactive(args):
         import readline  # noqa: F401  # line editing and history for input(); absent on some builds
     except ImportError:
         pass
-    print(banner(args.repo))
+    # The logo and dots need escape codes and UTF-8; anything less gets the plain lines.
+    print(banner(args.repo, fancy_terminal() and "utf" in (sys.stdout.encoding or "").lower()))
     console = Console(fancy_terminal())
     session = Session(args, console)
+    bind_paste_key(session.complete)
     CHILD_POPEN["start_new_session"] = True
     CONSOLE = console
 
@@ -1801,6 +2018,8 @@ def cmd_interactive(args):
                 emit("")  # Ctrl+C at the prompt clears the line; /quit or Ctrl+D leaves
                 continue
             try:
+                line, dropped = take_dropped_images(session.expand_inline(line))
+                session.attach(dropped)
                 kind, name, rest = parse_input(line)
                 if kind == "goal":
                     session.start_goal(name)

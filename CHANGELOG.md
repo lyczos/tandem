@@ -19,5 +19,8 @@
 - Refuse to start a run when the runs directory is inside the target repository.
 - Closing the terminal or sending SIGTERM stops the agents along with tandem, in the interactive
   session and in `start`/`-p`. A `TANDEM_PYTHON` that is not Python 3.9+ is now an error.
+- The interactive session takes screenshots: Ctrl+V pastes the clipboard's image into the line,
+  `/paste` attaches it, and image files dragged onto the terminal are attached too. Both agents see them on every later turn.
+- The interactive session opens with a colored logo and login status on a terminal.
 - Add `tandem runs`, `--version`, current-directory repo defaults, and doctor checks for
   the interpreter, Node launcher, writable runs directory, and repository readiness.
