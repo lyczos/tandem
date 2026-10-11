@@ -2,6 +2,8 @@
 
 ## 0.1.0
 
+- Add `--claude-effort`. Model and effort choices made with `/models` are saved in
+  `~/.tandem/config.json` and used when the matching flag is not given.
 - Add the public npm package `@lyczos/tandem`, installing the `tandem` command. The Node
   launcher has no runtime dependencies or install scripts; source execution still works.
 - Lower the supported Python floor to 3.9, including macOS Command Line Tools Python 3.9.6.

@@ -888,6 +888,42 @@ class Interactive(unittest.TestCase):
 PNG = b"\x89PNG\r\n\x1a\n" + b"\0" * 16
 
 
+class Defaults(unittest.TestCase):
+    def setUp(self):
+        self.home = tempfile.TemporaryDirectory()
+        self.addCleanup(self.home.cleanup)
+        p = mock.patch.dict(os.environ, {"HOME": self.home.name})
+        p.start()
+        self.addCleanup(p.stop)
+
+    def test_saved_defaults_fill_only_missing_flags(self):
+        tandem.record_consent()
+        tandem.save_defaults({"claude_model": "opus", "codex_effort": "high", "bogus": 1})
+        args = tandem.build_parser().parse_args(["start", "--goal", "g", "--claude-model", "sonnet"])
+        cfg = tandem.config_from(args)
+        self.assertEqual((cfg["claude_model"], cfg["codex_effort"], cfg["claude_effort"]), ("sonnet", "high", None))
+        self.assertTrue(tandem.consent_recorded())  # other keys survive
+        tandem.save_defaults({"claude_model": None})
+        self.assertEqual(tandem.load_defaults(), {"codex_effort": "high"})
+
+    def test_broken_config_means_no_defaults(self):
+        tandem.config_path().parent.mkdir(parents=True)
+        tandem.config_path().write_text("[1, 2")
+        self.assertEqual(tandem.load_defaults(), {})
+
+    def test_claude_gets_effort(self):
+        tmp = pathlib.Path(self.home.name)
+        schema = tmp / "schema.json"
+        schema.write_text("{}")
+        done = subprocess.CompletedProcess([], 0, json.dumps({"structured_output": {"status": "done"}}), "")
+        for effort, expected in (("max", True), (None, False)):
+            cfg = {"timeout": 5, "claude_permission_mode": "acceptEdits", "claude_effort": effort}
+            with mock.patch.object(tandem, "run_child", return_value=done) as run:
+                tandem.run_claude(cfg, tmp, "goal", tmp / "c", schema, "status", False)
+            cmd = run.call_args[0][0]
+            self.assertEqual("--effort" in cmd and cmd[cmd.index("--effort") + 1] == "max", expected)
+
+
 class Images(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()

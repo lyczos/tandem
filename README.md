@@ -291,11 +291,12 @@ available ones are in `~/.codex/models_cache.json`.
 
 ## Options worth knowing
 
-`--first codex` to let Codex start, `--claude-model` / `--codex-model`, `--codex-effort`,
-`--timeout` (seconds per turn, default 1800), `--codex-role reviewer` (Claude builds, Codex
+`--first codex` to let Codex start, `--claude-model` / `--codex-model`, `--claude-effort` /
+`--codex-effort`, `--timeout` (seconds per turn, default 1800), `--codex-role reviewer` (Claude builds, Codex
 reviews each goal instead of alternating), `--base` (start from another branch), `--push`
 (campaigns: push the branch after every goal). An agent that fails three turns in a row (crash,
-bad output) is benched and the other one finishes alone.
+bad output) is benched and the other one finishes alone. `/models` choices are saved in
+`~/.tandem/config.json` and used when a flag is not given.
 
 ## Configuration
 

@@ -52,6 +52,9 @@ RUNS = resolve_runs()
 
 NAMES = {"claude": "Claude Code", "codex": "Codex"}
 EFFORTS = ["low", "medium", "high", "xhigh", "max", "ultra"]
+CLAUDE_EFFORTS = ["low", "medium", "high", "xhigh", "max"]
+# The settings a saved default and a mid-run change can both touch; nothing else is stored or tuned.
+TUNABLE = ("claude_model", "claude_effort", "codex_model", "codex_effort")
 OTHER = {"claude": "codex", "codex": "claude"}
 
 CLAUDE_READ = [
@@ -469,6 +472,8 @@ def run_claude(cfg, worktree, prompt, out_base, schema, key, readonly):
                 "--allowedTools", *CLAUDE_ALLOWED, "--disallowedTools", *CLAUDE_DISALLOWED]
     if cfg.get("claude_model"):
         cmd += ["--model", cfg["claude_model"]]
+    if cfg.get("claude_effort"):
+        cmd += ["--effort", cfg["claude_effort"]]
     if cfg.get("claude_budget"):
         cmd += ["--max-budget-usd", str(cfg["claude_budget"])]
     proc = run_child(cmd, input=prompt, cwd=worktree, timeout=cfg["timeout"])
@@ -702,12 +707,15 @@ def create_run(run_dir, repo, goal, name, cfg, max_turns, first, worktree=None, 
 
 
 def config_from(args):
+    saved = load_defaults()
+    # A flag given on the command line beats what /models saved; absent flags fall back to it.
+    chosen = {k: getattr(args, k) if getattr(args, k) is not None else saved.get(k) for k in TUNABLE}
     return {
         "check": getattr(args, "check", None), "timeout": args.timeout,
-        "claude_model": args.claude_model, "claude_budget": args.claude_budget,
+        "claude_budget": args.claude_budget,
         "claude_permission_mode": args.claude_permission_mode,
-        "codex_model": args.codex_model, "codex_effort": args.codex_effort,
         "codex_network": args.codex_network, "codex_role": args.codex_role,
+        **chosen,
     }
 
 
@@ -1237,6 +1245,7 @@ def add_agent_options(p, max_turns):
     p.add_argument("--max-turns", type=int, default=max_turns, help="turns per goal")
     p.add_argument("--timeout", type=int, default=1800, help="seconds per turn")
     p.add_argument("--claude-model")
+    p.add_argument("--claude-effort", choices=CLAUDE_EFFORTS, help="Claude effort (default: Claude Code's own)")
     p.add_argument("--claude-budget", type=float, help="max USD per Claude turn")
     p.add_argument("--claude-permission-mode", default="acceptEdits")
     p.add_argument("--codex-model")
@@ -1268,7 +1277,7 @@ usage shapes:
 
 HELP_EPILOG = """\
 -p takes the options of `start`: --repo --check --max-turns --first --name --base,
---claude-model --codex-model --codex-effort --codex-role --codex-network --claude-budget --timeout.
+--claude-model --claude-effort --codex-model --codex-effort --codex-role --codex-network --claude-budget --timeout.
 """
 
 
@@ -1511,15 +1520,41 @@ def consent_recorded():
 
 def record_consent():
     path = config_path()
-    try:
-        data = json.loads(path.read_text())
-    except (OSError, ValueError):
-        data = {}
-    if not isinstance(data, dict):
-        data = {}
+    data = read_config()
     data["consent"] = {"version": __version__, "date": datetime.date.today().isoformat()}
     path.parent.mkdir(parents=True, exist_ok=True)
     write_json(path, data)
+
+
+def read_config():
+    try:
+        data = json.loads(config_path().read_text())
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def load_defaults():
+    saved = read_config().get("defaults")
+    if not isinstance(saved, dict):
+        return {}
+    return {k: v for k, v in saved.items() if k in TUNABLE}
+
+
+def save_defaults(values):
+    """Merge into the saved defaults; None forgets a key. Other config keys (consent) stay."""
+    data = read_config()
+    defaults = data.get("defaults") if isinstance(data.get("defaults"), dict) else {}
+    for k, v in values.items():
+        if k not in TUNABLE:
+            continue
+        if v is None:
+            defaults.pop(k, None)
+        else:
+            defaults[k] = v
+    data["defaults"] = defaults
+    config_path().parent.mkdir(parents=True, exist_ok=True)
+    write_json(config_path(), data)
 
 
 CONSENT_TEXT = """\
