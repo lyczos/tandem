@@ -313,6 +313,35 @@ def write_json(path, data):
     tmp.replace(path)
 
 
+def write_tuning(target, values):
+    """Merge values into target/tuning.json. The loop re-reads it every turn, so a session never has to
+    touch state.json, which the loop owns and rewrites. None means "back to the default"."""
+    path = target / "tuning.json"
+    current = read_tuning(path)
+    current.update({k: v for k, v in values.items() if k in TUNABLE})
+    write_json(path, current)
+
+
+def read_tuning(path):
+    try:
+        data = json.loads(pathlib.Path(path).read_text())
+    except (OSError, ValueError):
+        return {}  # missing, or caught mid-edit by hand: keep the current settings
+    return {k: v for k, v in data.items() if k in TUNABLE} if isinstance(data, dict) else {}
+
+
+def apply_tuning(state, paths):
+    """Fold tuning files (later wins) into state["config"] in place; returns [(key, old, new)] for changes."""
+    wanted = {}
+    for path in paths:
+        wanted.update(read_tuning(path))
+    cfg = state["config"]
+    changes = [(k, cfg.get(k), v) for k, v in wanted.items() if cfg.get(k) != v]
+    for k, _, v in changes:
+        cfg[k] = v
+    return changes
+
+
 def save(run_dir, state):
     write_json(run_dir / "state.json", state)
 
@@ -580,6 +609,7 @@ def loop(run_dir):
     state.pop("outcome", None)
     cfg = state["config"]
     inboxes = state.get("inboxes") or [str(run_dir / "inbox.md")]
+    tuning_files = state.get("tuning_files") or [str(run_dir / "tuning.json")]
     while True:
         if stop_requested(state):
             return finish(run_dir, state, "stopped", "The owner asked to stop.")
@@ -608,6 +638,12 @@ def loop(run_dir):
             wait_until(away, state.get("stop_file"))
             continue
         agent = wanted if wanted in ready else ready[0]
+
+        changes = apply_tuning(state, tuning_files)
+        for key, old, new in changes:
+            log(f"config: {key} {old or 'default'} -> {new or 'default'}")
+        if changes:
+            save(run_dir, state)
 
         human = take_inbox(inboxes)
         if human:
@@ -893,11 +929,13 @@ def _campaign_loop(camp_dir):
                     "check": plan.get("check", "")}
             log(f"next goal: {item['name']} - {plan.get('reason')}")
         n = len(camp["runs"]) + 1
+        # The next run starts from whatever /models set since the last one began.
+        apply_tuning(camp, [camp_dir / "tuning.json"])
         cfg = dict(camp["config"], check=item.get("check") or None)
         run_dir = create_run(camp_dir / f"{n:02d}-{slug(item['name'])}", camp["repo"], item["goal"],
                              item["name"], cfg, item.get("max_turns", camp["max_turns"]), item.get("first", "claude"),
                              worktree=camp["worktree"], branch=camp["branch"],
-                             extra={"stop_file": str(stop_file),
+                             extra={"stop_file": str(stop_file), "tuning_files": [str(camp_dir / "tuning.json")],
                                     **({"review_goal": True, "review_from": item["review_from"]} if item.get("review") else {}),
                                     "inboxes": [str(camp_dir / f"{n:02d}-{slug(item['name'])}" / "inbox.md"),
                                                 str(camp_dir / "inbox.md")]})
@@ -920,6 +958,7 @@ def prepare_campaign_start(args):
         state.setdefault("name", run_dir.name)
         state["inboxes"] = [str(run_dir / "inbox.md"), str(camp_dir / "inbox.md")]
         state["stop_file"] = str(camp_dir / "STOP")
+        state["tuning_files"] = [str(run_dir / "tuning.json"), str(camp_dir / "tuning.json")]
         state["max_turns"] = state["turn"] - 1 + args.max_turns
         state["failures"] = {"claude": 0, "codex": 0}
         state["config"].update({k: v for k, v in cfg.items() if v is not None and k != "check"})

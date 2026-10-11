@@ -93,6 +93,11 @@ Users moving existing runs from `../tandem-runs` to an npm install can set `TAND
 the old directory's absolute path to keep their run ids reachable. Interactive consent stays
 in `~/.tandem/config.json`, independently of run storage.
 
+`tuning.json` (in a run or campaign directory) is how the session changes the models and effort of
+a running run: `write_tuning()` merges into it, and `loop` re-reads it at the start of every turn
+(`apply_tuning()`, later file wins, `null` means default). A campaign run reads the campaign's file.
+Never write `state.json` from the session: the loop holds a copy in memory and would overwrite it.
+
 ### Invariants worth protecting
 
 - **The orchestrator owns git.** Agents never commit, push or switch branches: `commit_turn()` does

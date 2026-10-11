@@ -640,6 +640,88 @@ class Headless(unittest.TestCase):
         self.assertEqual((state["goal"], state["outcome"]), ("Legacy goal", "max_turns"))
 
 
+class Tuning(unittest.TestCase):
+    setUp = Headless.setUp  # same throwaway repo and RUNS patches
+
+    def run_dir_with(self, **cfg):
+        home = tempfile.TemporaryDirectory()
+        self.addCleanup(home.cleanup)
+        patch = mock.patch.dict(os.environ, {"HOME": home.name})
+        patch.start()
+        self.addCleanup(patch.stop)
+        base = dict(timeout=5, claude_permission_mode="acceptEdits", codex_role="peer", check=None,
+                    **{k: None for k in tandem.TUNABLE})
+        with mock.patch.object(tandem, "log"):
+            return tandem.create_run(self.runs / "r1", self.repo, "goal", "r1", dict(base, **cfg), 3, "codex")
+
+    def test_tuning_applies_next_turn_and_is_logged(self):
+        run_dir = self.run_dir_with()
+        seen, lines = [], []
+
+        def agent(name, cfg, *rest):
+            if name == "codex":
+                seen.append(cfg["codex_model"])
+                if len(seen) == 1:
+                    tandem.write_tuning(run_dir, {"codex_model": "gpt-y"})
+            return {"status": "continue"}, 0
+
+        with mock.patch.object(tandem, "call_agent", side_effect=agent), \
+                mock.patch.object(tandem, "log", side_effect=lines.append):
+            tandem.loop(run_dir)
+        self.assertEqual(seen, [None, "gpt-y"])
+        self.assertIn("config: codex_model default -> gpt-y", lines)
+        self.assertEqual(tandem.load(run_dir)["config"]["codex_model"], "gpt-y")
+        self.assertEqual(sum("config: " in l for l in lines), 1)
+
+    def test_unset_and_broken_files(self):
+        d = self.base / "t"
+        d.mkdir()
+        state = {"config": {"claude_model": "sonnet"}}
+        tandem.write_tuning(d, {"claude_model": "opus", "bogus": "x"})
+        self.assertEqual(tandem.apply_tuning(state, [d / "tuning.json"]), [("claude_model", "sonnet", "opus")])
+        self.assertNotIn("bogus", json.loads((d / "tuning.json").read_text()))
+        tandem.write_tuning(d, {"claude_model": None})
+        self.assertEqual(tandem.apply_tuning(state, [d / "tuning.json"]), [("claude_model", "opus", None)])
+        self.assertIsNone(state["config"]["claude_model"])
+        (d / "tuning.json").write_text("{")
+        self.assertEqual(tandem.apply_tuning(state, [d / "tuning.json", d / "missing.json"]), [])
+
+    def test_later_file_wins(self):
+        a, b = self.base / "a", self.base / "b"
+        for d, model in ((a, "one"), (b, "two")):
+            d.mkdir()
+            tandem.write_tuning(d, {"codex_model": model})
+        state = {"config": {}}
+        tandem.apply_tuning(state, [a / "tuning.json", b / "tuning.json"])
+        self.assertEqual(state["config"]["codex_model"], "two")
+
+    def test_campaign_runs_read_the_campaign_file(self):
+        self.run_dir_with()  # patches HOME
+        camp_dir = self.runs / "campaign-x"
+        camp_dir.mkdir(parents=True)
+        worktree = self.base / "camp-work"
+        tandem.git(self.repo, "worktree", "add", "-q", "-b", "camp", str(worktree), "HEAD")
+        cfg = {"timeout": 5, "claude_permission_mode": "acceptEdits", "codex_role": "peer", "check": None,
+               **{k: None for k in tandem.TUNABLE}}
+        tandem.write_json(camp_dir / "campaign.json", {
+            "id": "x", "config": cfg, "max_turns": 2, "push": False, "runs": [], "blockers": [], "no_progress": 0,
+            "cost_usd": 0.0, "current": None, "repo": str(self.repo), "worktree": str(worktree), "branch": "camp",
+            "queue": [{"goal": "g", "name": "first", "first": "claude"}]})
+        tandem.write_tuning(camp_dir, {"codex_model": "gpt-z"})
+
+        def agent(name, cfg, *rest):
+            (camp_dir / "STOP").write_text("")  # one turn is enough to inspect the run
+            return {"status": "continue"}, 0
+
+        with mock.patch.object(tandem, "call_agent", side_effect=agent), mock.patch.object(tandem, "log"):
+            tandem._campaign_loop(camp_dir)
+        camp = json.loads((camp_dir / "campaign.json").read_text())
+        state = tandem.load(pathlib.Path(camp["current"]))
+        self.assertEqual(state["tuning_files"], [str(camp_dir / "tuning.json")])
+        self.assertEqual(state["config"]["codex_model"], "gpt-z")
+        self.assertEqual(camp["config"]["codex_model"], "gpt-z")
+
+
 class Interactive(unittest.TestCase):
     def test_slash_parser(self):
         parse = tandem.parse_input
