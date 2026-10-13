@@ -22,6 +22,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import textwrap
 import threading
 import time
 import traceback
@@ -393,6 +394,123 @@ def render_history(history):
     return "\n".join(lines)
 
 
+# ---------- turn cards and the board ----------
+
+AGENT_COLORS = {"claude": 208, "codex": 75}  # the banner logo's two ends
+STATUS_COLORS = {"continue": "36", "done": "32", "blocked": "33", "error": "31"}
+CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+MIN_CARD_WIDTH = 20  # the narrowest box that still closes with a title and a few words
+
+
+def card_width():
+    return max(MIN_CARD_WIDTH, min(100, shutil.get_terminal_size().columns))
+
+
+def wrap_field(text, width, label="", max_lines=3):
+    """Wrap label+text to at most max_lines lines of at most width; the last one ends in an ellipsis if cut.
+
+    Agent text goes through the terminal, so control characters (an escape sequence in a summary) become spaces.
+    """
+    lines = textwrap.wrap(CONTROL_CHARS.sub(" ", f"{label}{text}"), width, subsequent_indent="  " if label else "",
+                          break_long_words=True)
+    if len(lines) > max_lines:
+        lines = lines[:max_lines]
+        last = lines[-1]
+        lines[-1] = (last if len(last) < width else last[:width - 1]) + "\u2026"
+    return lines
+
+
+def draw_box(title, rows, color, fancy, width):
+    """A closed box of exactly `width` columns. rows are (text, style) pairs, each already at most width-4 wide."""
+    width = max(width, MIN_CARD_WIDTH)
+    tl, tr, bl, br, h, v = "\u256d\u256e\u2570\u256f\u2500\u2502" if fancy else "++++-|"
+    edge = f"38;5;{color}"
+
+    def paint(code, text):
+        return f"\x1b[{code}m{text}\x1b[0m" if fancy and code else text
+
+    title = title if len(title) <= width - 6 else title[:width - 7] + "\u2026"
+    out = [paint(edge, tl + h + " ") + paint("1;" + edge, title) + paint(edge, " " + h * (width - 5 - len(title)) + tr)]
+    for text, style in rows:
+        out.append(paint(edge, v) + " " + paint(style, text) + " " * (width - 4 - len(text)) + " " + paint(edge, v))
+    out.append(paint(edge, bl + h * (width - 2) + br))
+    return "\n".join(out)
+
+
+def turn_card(entry, fancy, width):
+    agent, inner = entry["agent"], max(width, MIN_CARD_WIDTH) - 4
+    status, seconds = entry.get("status", ""), entry.get("seconds")
+    head = [status]
+    if seconds is not None:
+        head.append(f"{seconds // 60}m{seconds % 60:02d}s" if seconds >= 60 else f"{seconds}s")
+    if entry.get("commit"):
+        head.append(f"commit {entry['commit']}")
+    rows = [(line, STATUS_COLORS.get(status)) for line in wrap_field(" \u00b7 ".join(head), inner, max_lines=2)]
+    for key, label, style in (("summary", "", None), ("error", "error: ", "31"),
+                              ("handoff", f"\u2192 {NAMES[OTHER[agent]]}: ", None),
+                              ("could_not_do", "\u2717 could not: ", "33"), ("checks", "\u2713 checks: ", "32")):
+        if entry.get(key):
+            rows += [(line, style) for line in wrap_field(entry[key], inner, label)]
+    return draw_box(f"turn {entry['turn']} \u00b7 {NAMES[agent]}", rows, AGENT_COLORS[agent], fancy, width)
+
+
+def board(state, fancy, width, campaign=None):
+    """Where the run stands: what the agents agree on, what is still open, the models and the cost."""
+    inner, history, cfg = max(width, MIN_CARD_WIDTH) - 4, state["history"], state.get("config", {})
+    outcome, last = state.get("outcome"), (state["history"][-1] if state["history"] else None)
+    rows = [(line, None) for line in wrap_field(state.get("goal", ""), inner, "goal: ", 2)]
+    if outcome:
+        rows.append((f"outcome: {outcome}", None))
+    if campaign:
+        rows += [(line, None) for line in wrap_field(
+            f"campaign: {campaign.get('branch', '?')} \u00b7 {len(campaign.get('runs', []))} done \u00b7 "
+            f"{len(campaign.get('queue', []))} queued", inner, max_lines=2)]
+
+    rows.append(("agreed", "1"))
+    if outcome == "done" and last:
+        who = f"{NAMES[last['agent']]} alone" if state.get("needs_review") else "both agents agreed"
+        agreed = [f"\u2713 {who}"]
+    elif last and last["status"] == "done" and not outcome:
+        agreed = [f"\u2713 {NAMES[last['agent']]} says done (turn {last['turn']}) \u00b7 "
+                  f"waiting for {NAMES[OTHER[last['agent']]]}"]
+    else:
+        agreed = ["nothing agreed yet"]
+    rows += [(line, "32" if agreed[0][0] == "\u2713" else None) for text in agreed
+             for line in wrap_field(text, inner, max_lines=2)]
+    if cfg.get("check"):
+        verdict = ("passed" if outcome == "done" else "failed last time" if state.get("check_feedback")
+                   else "not run yet")
+        rows += [(line, None) for line in wrap_field(f"check: {cfg['check']} \u00b7 {verdict}", inner)]
+    else:
+        rows.append(("no check", None))
+
+    open_items = []
+    if last and last.get("handoff"):
+        open_items.append(f"\u2022 {NAMES[OTHER[last['agent']]]}: {last['handoff']}")
+    open_items += [f"\u2022 could not (turn {h['turn']}): {h['could_not_do']}" for h in history[-2:]
+                   if h.get("could_not_do")]
+    if state.get("owner_messages"):
+        open_items.append(f"owner messages: {len(state['owner_messages'])}")
+    if open_items:
+        rows.append(("open", "1"))
+        rows += [(line, None) for text in open_items for line in wrap_field(text, inner, max_lines=2)]
+
+    def model(agent):
+        return f"{agent} {cfg.get(agent + '_model') or 'default'}/{cfg.get(agent + '_effort') or 'default'}"
+    rows += [(line, "2") for line in wrap_field(
+        f"models: {model('claude')} \u00b7 {model('codex')} \u00b7 ${state.get('cost_usd', 0):.2f}", inner)]
+    title = f"{state.get('name') or 'run'} \u00b7 turn {state['turn'] - 1}/{state['max_turns']}"
+    return draw_box(title, rows, AGENT_COLORS[last["agent"]] if last else AGENT_COLORS["claude"], fancy, width)
+
+
+def report_turn(entry):
+    """One finished turn: a card in a fancy session, the single log line everywhere else (logs, pipes, NO_COLOR)."""
+    if CONSOLE and CONSOLE.fancy:
+        return emit(turn_card(entry, True, card_width()))
+    log(f"turn {entry['turn']}: {NAMES[entry['agent']]} -> {entry['status']} ({entry['seconds']}s"
+        f"{', commit ' + entry['commit'] if entry['commit'] else ''}) {entry.get('summary') or entry.get('error', '')}")
+
+
 def owner_block(messages, fresh):
     """Every owner message stays in every later prompt; the newest one is flagged."""
     if not messages:
@@ -692,8 +810,7 @@ def loop(run_dir):
         save(run_dir, state)
 
         append_transcript(run_dir, render_history([entry]) + f"_{entry['seconds']}s_\n")
-        log(f"turn {turn}: {NAMES[agent]} -> {entry['status']} ({entry['seconds']}s"
-            f"{', commit ' + entry['commit'] if entry['commit'] else ''}) {entry.get('summary') or entry.get('error', '')}")
+        report_turn(entry)
 
         status = entry["status"]
         prev = state["history"][-2] if len(state["history"]) > 1 else None
@@ -1419,12 +1536,13 @@ def build_parser():
 # flight. The price is that the session must stop those children itself when it goes away.
 
 SLASH_COMMANDS = ["help", "status", "say", "paste", "stop", "resume", "goal", "campaign", "runs",
-                  "transcript", "doctor", "quit"]
+                  "transcript", "doctor", "board", "quit"]
 
 SLASH_HELP = """\
 type a goal to start a run in this repo; while it runs, type /say to talk to the agents
   /help                show this list
   /status              one line per turn of the current run
+  /board               what the agents agree on, what is open, models and cost
   /say TEXT            leave a message the next turn reads
   Ctrl+V               paste the clipboard's image into the line as [image #N]
   /paste               attach the clipboard's image to your next goal or /say
@@ -1938,7 +2056,7 @@ class Session:
         elif name == "stop":
             self.guarded(lambda _: self.request_stop(), None)
         else:
-            target = self.target(latest=name in ("resume", "status", "transcript"))
+            target = self.target(latest=name in ("resume", "status", "transcript", "board"))
             if not target:
                 return True
             if name == "say":
@@ -1949,6 +2067,8 @@ class Session:
             elif name == "status":
                 fn = cmd_campaign_status if (target / "campaign.json").exists() else cmd_status
                 self.guarded(fn, argparse.Namespace(run=str(target), dir=str(target)))
+            elif name == "board":
+                self.guarded(lambda _: self.show_board(target), None)
             elif name == "transcript":
                 emit(str(self.transcript_path(target)))
             elif name == "resume":
@@ -1958,14 +2078,26 @@ class Session:
     @staticmethod
     def transcript_path(target):
         """A run has its own transcript; a campaign has one per goal, so point at the running (or last) one."""
+        run, _ = Session.current_run(target)
+        return run / "transcript.md" if run else target
+
+    @staticmethod
+    def current_run(target):
+        """(run dir, campaign or None): a campaign stands for the run it is on, or the last one it finished."""
         if (target / "state.json").exists():
-            return target / "transcript.md"
+            return target, None
         try:
             camp = json.loads((target / "campaign.json").read_text())
         except (OSError, ValueError):
-            return target
+            return None, None
         run = camp.get("current") or (camp["runs"][-1]["dir"] if camp.get("runs") else None)
-        return pathlib.Path(run) / "transcript.md" if run else target
+        return (pathlib.Path(run) if run else None), camp
+
+    def show_board(self, target):
+        run, camp = self.current_run(target)
+        if not run:
+            return emit("no run to show yet")
+        emit(board(load(run), self.console.fancy, card_width(), camp))
 
     def guarded(self, fn, args):
         """Run a command, reporting its failure instead of ending the session. True when it succeeded."""

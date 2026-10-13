@@ -6,6 +6,7 @@ import io
 import json
 import os
 import pathlib
+import re
 import shlex
 import shutil
 import signal
@@ -722,6 +723,136 @@ class Tuning(unittest.TestCase):
         self.assertEqual(camp["config"]["codex_model"], "gpt-z")
 
 
+ANSI = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def plain(text):
+    return ANSI.sub("", text)
+
+
+class Cards(unittest.TestCase):
+    ENTRY = {"turn": 3, "agent": "claude", "status": "continue", "seconds": 134, "commit": "abc1234",
+             "summary": "Moved the parser into its own module.", "handoff": "review",
+             "could_not_do": "run the integration suite", "checks": "unit tests pass", "error": ""}
+
+    def test_card_has_every_field_and_skips_empty(self):
+        card = plain(tandem.turn_card(self.ENTRY, True, 80))
+        for text in ("Moved the parser", "\u2192 Codex: review", "\u2717 could not:", "\u2713 checks:", "2m14s", "abc1234"):
+            self.assertIn(text, card)
+        bare = plain(tandem.turn_card(dict(self.ENTRY, could_not_do="", checks="", handoff=""), True, 80))
+        self.assertNotIn("could not", bare)
+        self.assertNotIn("checks", bare)
+
+    def test_card_fits_a_narrow_terminal(self):
+        entry = dict(self.ENTRY, summary="word " * 40 + "x" * 90 + " tail")
+        for fancy in (True, False):
+            lines = plain(tandem.turn_card(entry, fancy, 24)).split("\n")
+            self.assertTrue(all(len(line) == 24 for line in lines), lines)
+            self.assertEqual(lines[0][0], "\u256d" if fancy else "+")
+            self.assertEqual(lines[-1][0], "\u2570" if fancy else "+")
+            self.assertIn("\u2026", "\n".join(lines))
+            summary = [line for line in lines if "word" in line or "xxx" in line]
+            self.assertLessEqual(len(summary), 3)
+
+    def test_card_stays_closed_at_the_minimum_width(self):
+        lines = plain(tandem.turn_card(self.ENTRY, True, 20)).split("\n")
+        self.assertTrue(all(len(line) == 20 for line in lines), lines)
+
+    def test_card_width_is_clamped(self):
+        for columns, expected in ((10, 20), (30, 30), (300, 100)):
+            with mock.patch.object(tandem.shutil, "get_terminal_size", return_value=os.terminal_size((columns, 24))):
+                self.assertEqual(tandem.card_width(), expected)
+
+    def test_status_colors(self):
+        for status, code in (("continue", "36"), ("done", "32"), ("blocked", "33"), ("error", "31")):
+            card = tandem.turn_card(dict(self.ENTRY, status=status), True, 60)
+            self.assertIn(f"\x1b[{code}m{status}", card)
+
+    def test_plain_card_has_no_escape_codes(self):
+        card = tandem.turn_card(self.ENTRY, False, 60)
+        self.assertNotIn("\x1b", card)
+        self.assertTrue(card.startswith("+"))
+
+    def test_error_turn_shows_the_error_in_red(self):
+        entry = dict(self.ENTRY, status="error", error="codex exited 1: boom", summary="")
+        card = tandem.turn_card(entry, True, 60)
+        self.assertIn("\x1b[31m", card)
+        self.assertIn("codex exited 1: boom", plain(card))
+
+    def test_agent_text_cannot_inject_escape_codes(self):
+        card = tandem.turn_card(dict(self.ENTRY, summary="hi \x1b[2J there"), True, 60)
+        self.assertNotIn("\x1b[2J", card)
+
+    def state(self, history, **extra):
+        state = {"name": "parser", "goal": "Split the parser", "turn": len(history) + 1, "max_turns": 20,
+                 "history": history, "cost_usd": 1.5, "config": {"claude_model": "opus", "check": "make test"}}
+        state.update(extra)
+        return state
+
+    def test_board_agreement_states(self):
+        done = lambda agent, n: dict(self.ENTRY, agent=agent, turn=n, status="done")
+        waiting = plain(tandem.board(self.state([done("claude", 1)]), True, 80))
+        self.assertIn("Claude Code says done (turn 1) \u00b7 waiting for Codex", waiting)
+        agreed = plain(tandem.board(self.state([done("claude", 1), done("codex", 2)], outcome="done"), True, 80))
+        self.assertIn("both agents agreed", agreed)
+        self.assertIn("passed", agreed)
+        alone = plain(tandem.board(self.state([done("claude", 1)], outcome="done", needs_review=True), True, 80))
+        self.assertIn("Claude Code alone", alone)
+        none = plain(tandem.board(self.state([self.ENTRY]), True, 80))
+        self.assertIn("nothing agreed yet", none)
+        self.assertIn("not run yet", none)
+        failed = plain(tandem.board(self.state([self.ENTRY], check_feedback="it failed"), True, 80))
+        self.assertIn("failed last time", failed)
+        self.assertIn("no check", plain(tandem.board(self.state([self.ENTRY], config={}), True, 80)))
+
+    def test_board_lists_what_is_open_and_the_models(self):
+        history = [dict(self.ENTRY, turn=1, could_not_do="start the server"), dict(self.ENTRY, turn=2)]
+        text = plain(tandem.board(self.state(history, owner_messages=[{"text": "hi"}]), True, 100))
+        for expected in ("\u2022 Codex: review", "run the integration suite", "start the server", "owner messages: 1",
+                         "models: claude opus/default \u00b7 codex default/default \u00b7 $1.50", "Split the parser"):
+            self.assertIn(expected, text)
+
+    def test_board_fits_its_width_and_has_no_codes_when_plain(self):
+        state = self.state([self.ENTRY], goal="g " * 100)
+        camp = {"branch": "tandem/x", "runs": [{}], "queue": ["a", "b"]}
+        for fancy in (True, False):
+            text = tandem.board(state, fancy, 30, camp)
+            self.assertTrue(all(len(line) == 30 for line in plain(text).split("\n")))
+        self.assertNotIn("\x1b", tandem.board(state, False, 30))
+
+    def test_board_command_uses_latest_run(self):
+        with tempfile.TemporaryDirectory() as d:
+            run = pathlib.Path(d)
+            (run / "state.json").write_text(json.dumps(self.state([self.ENTRY])))
+            rows = [{"id": "mine", "path": str(run), "repo": "/repo"}]
+            session = tandem.Session(argparse.Namespace(repo=pathlib.Path("/repo")), tandem.Console(fancy=False))
+            with mock.patch.dict(tandem.CURRENT, {}, clear=True), mock.patch.object(tandem, "list_runs", return_value=rows), \
+                    mock.patch.object(tandem, "emit") as emit:
+                session.handle("board", "")
+            self.assertIn("Split the parser", "\n".join(c.args[0] for c in emit.call_args_list))
+
+    def test_board_command_follows_a_campaign_to_its_current_run(self):
+        with tempfile.TemporaryDirectory() as d:
+            camp, run = pathlib.Path(d), pathlib.Path(d) / "run1"
+            run.mkdir()
+            (run / "state.json").write_text(json.dumps(self.state([self.ENTRY])))
+            (camp / "campaign.json").write_text(json.dumps(
+                {"branch": "b", "runs": [], "queue": [], "current": str(run)}))
+            session = tandem.Session(argparse.Namespace(repo=None), tandem.Console(fancy=False))
+            with mock.patch.dict(tandem.CURRENT, {"target": camp}), mock.patch.object(tandem, "emit") as emit:
+                session.handle("board", "")
+            self.assertIn("Split the parser", "\n".join(c.args[0] for c in emit.call_args_list))
+
+    def test_loop_prints_a_card_only_in_a_fancy_session(self):
+        for fancy, expect_card in ((True, True), (False, False)):
+            console = tandem.Console(fancy=fancy)
+            with mock.patch.object(tandem, "CONSOLE", console), mock.patch.object(tandem, "emit") as emit:
+                tandem.report_turn(dict(self.ENTRY))
+            text = "\n".join(c.args[0] for c in emit.call_args_list)
+            self.assertEqual("\u256d" in text, expect_card)
+            self.assertIn("turn 3", plain(text))
+
+
 class Interactive(unittest.TestCase):
     def test_slash_parser(self):
         parse = tandem.parse_input
@@ -738,7 +869,7 @@ class Interactive(unittest.TestCase):
 
     def test_every_documented_command_is_known(self):
         for name in ("help", "status", "say", "paste", "stop", "resume", "goal", "campaign", "runs", "transcript",
-                     "doctor", "quit"):
+                     "doctor", "board", "quit"):
             self.assertEqual(tandem.parse_input("/" + name)[0], "command")
             self.assertIn("/" + name, tandem.SLASH_HELP)
 

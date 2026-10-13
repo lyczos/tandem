@@ -2,6 +2,8 @@
 
 ## 0.1.0
 
+- Each turn of an interactive session shows as a card, and `/board` summarizes what the agents agree
+  on, what is open, the models and the cost. Plain output (pipes, `NO_COLOR`) keeps the one-line log.
 - Add `--claude-effort`. Model and effort choices made with `/models` are saved in
   `~/.tandem/config.json` and used when the matching flag is not given.
 - Add the public npm package `@lyczos/tandem`, installing the `tandem` command. The Node

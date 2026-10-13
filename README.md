@@ -150,6 +150,8 @@ Plain text is a goal and starts a run in the current repo. The run goes on in th
 you can keep typing and talk to the agents while they work. Slash commands:
 
 - `/help`, `/status`, `/runs`, `/transcript` (prints the transcript path), `/doctor`
+- `/board` shows where the run stands: what both agents agree on, what is still open, the models in use
+  and the cost. Each finished turn appears in the session as a small card with its summary, handoff and checks.
 - `/say TEXT` leaves a message the next turn reads
 - Ctrl+V pastes the image on the clipboard (a screenshot) into the line as `[image #1]`, as in
   Claude Code. `/paste` attaches it to your next goal or `/say` instead, and so does dragging
