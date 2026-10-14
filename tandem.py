@@ -16,6 +16,7 @@ import json
 import os
 import pathlib
 import re
+import select
 import shlex
 import shutil
 import signal
@@ -26,6 +27,11 @@ import textwrap
 import threading
 import time
 import traceback
+
+try:
+    import termios  # raw keys for the /models picker; Windows has none and gets the plain answer
+except ImportError:
+    termios = None
 
 __version__ = "0.1.0"  # single source of truth; package.json must match (a test checks)
 
@@ -1536,13 +1542,15 @@ def build_parser():
 # flight. The price is that the session must stop those children itself when it goes away.
 
 SLASH_COMMANDS = ["help", "status", "say", "paste", "stop", "resume", "goal", "campaign", "runs",
-                  "transcript", "doctor", "board", "quit"]
+                  "transcript", "doctor", "board", "models", "quit"]
 
 SLASH_HELP = """\
 type a goal to start a run in this repo; while it runs, type /say to talk to the agents
   /help                show this list
   /status              one line per turn of the current run
   /board               what the agents agree on, what is open, models and cost
+  /models              pick Claude and Codex model and effort (saved as the default;
+                       a running run takes it from its next turn)
   /say TEXT            leave a message the next turn reads
   Ctrl+V               paste the clipboard's image into the line as [image #N]
   /paste               attach the clipboard's image to your next goal or /say
@@ -1770,7 +1778,7 @@ def banner(repo, fancy=False):
         lines = [f"tandem {__version__}", f"repo    {repo} ({branch})",
                  f"python  {sys.executable} {sys.version.split()[0]}"]
         lines += [f"{name:<7} {status}" for name, status in logins]
-        lines.append("type a goal, Ctrl+V to paste an image, or /help")
+        lines.append("type a goal, Ctrl+V to paste an image, /models, or /help")
         return "\n".join(lines)
 
     def paint(code, text):
@@ -1784,13 +1792,180 @@ def banner(repo, fancy=False):
     for name, status in logins:
         color = "32" if status == "logged in" else "33" if status == "login unknown" else "31"
         lines.append(f"  {paint('2', f'{name:<7}')} {paint(color, '●')} {status}")
-    lines += ["", "  " + paint("2", "type a goal · Ctrl+V pastes an image · /help"), ""]
+    lines += ["", "  " + paint("2", "type a goal · Ctrl+V pastes an image · /models · /help"), ""]
     return "\n".join(lines)
 
 
 def fancy_terminal():
     """Escape codes and the status line only on a real terminal, and never with NO_COLOR."""
     return (sys.stdout.isatty() and "NO_COLOR" not in os.environ and os.environ.get("TERM") != "dumb")
+
+
+# Codex keeps the models an account can use in its own cache; tandem only reads it.
+CODEX_MODELS_CACHE = pathlib.Path.home() / ".codex" / "models_cache.json"
+CLAUDE_MODELS = [("fable", "Newest model"), ("opus", "Most capable; slower, pricier"),
+                 ("sonnet", "Fast and strong; the everyday choice"), ("haiku", "Fastest and cheapest")]
+DEFAULT_NOTE = "the CLI's own setting"
+EFFORT_NOTES = {"low": "quick, light reasoning", "medium": "balanced speed and depth",
+                "high": "deeper reasoning for hard problems", "xhigh": "extra deep reasoning",
+                "max": "the deepest reasoning; slowest", "ultra": "max reasoning with task delegation"}
+PICKER_HINT = "↑↓ move · ←→ change · Tab next · Enter save · Esc cancel"
+
+
+def codex_models():
+    """[(slug, description, [(effort, description), ...])] from Codex's cache; [] when it is unreadable."""
+    try:
+        data = json.loads(CODEX_MODELS_CACHE.read_text())
+    except (OSError, ValueError):
+        return []
+    models = data.get("models") if isinstance(data, dict) else None
+    found = []
+    for m in models if isinstance(models, list) else []:
+        if not isinstance(m, dict) or not isinstance(m.get("slug"), str) or m.get("visibility", "list") != "list":
+            continue
+        levels = m.get("supported_reasoning_levels")
+        levels = [(lv["effort"], lv.get("description") or EFFORT_NOTES.get(lv["effort"], ""))
+                  for lv in (levels if isinstance(levels, list) else [])
+                  if isinstance(lv, dict) and isinstance(lv.get("effort"), str)]
+        found.append((m["slug"], m.get("description") or "", levels))
+    return found
+
+
+def choice_row(key, label, choices, current):
+    """One picker row from [(value, note)]. A saved value the list lacks stays, right after default."""
+    values = ["default"] + [v for v, _ in choices]
+    if current is not None and current not in values:
+        values.insert(1, current)
+    return {"key": key, "label": label, "values": values, "notes": {"default": DEFAULT_NOTE, **dict(choices)},
+            "index": values.index(current) if current is not None else 0}
+
+
+def codex_effort_row(levels, model, current):
+    # Codex rejects an effort its model does not support, so offer only that model's levels.
+    choices = levels.get(model) or [(e, EFFORT_NOTES[e]) for e in EFFORTS]
+    return choice_row("codex_effort", "Codex effort", choices, current)
+
+
+def model_choices(current):
+    """The /models picker's four rows, each selecting current[key] (None is default)."""
+    codex = codex_models()
+    levels = {slug: lv for slug, _, lv in codex}
+    rows = [choice_row("claude_model", "Claude model", CLAUDE_MODELS, current.get("claude_model")),
+            choice_row("claude_effort", "Claude effort", [(e, EFFORT_NOTES[e]) for e in CLAUDE_EFFORTS],
+                       current.get("claude_effort")),
+            choice_row("codex_model", "Codex model", [(slug, note) for slug, note, _ in codex],
+                       current.get("codex_model")),
+            codex_effort_row(levels, current.get("codex_model"), current.get("codex_effort"))]
+    rows[2]["levels"] = levels
+    return rows
+
+
+PICKER_MOVES = {"up": -1, "k": -1, "shift-tab": -1, "down": 1, "j": 1, "tab": 1}
+PICKER_CHANGES = {"left": -1, "h": -1, "right": 1, "l": 1}
+
+
+def picker_step(rows, focus, key):
+    """Apply one key to the picker. Returns (focus, action); action is None, "save" or "cancel"."""
+    if not isinstance(key, str):
+        return focus, None  # a paste or another event the picker has no use for
+    if key == "enter":
+        return focus, "save"
+    if key in ("esc", "q", "ctrl-c"):
+        return focus, "cancel"
+    if key in PICKER_MOVES:
+        return (focus + PICKER_MOVES[key]) % len(rows), None
+    if key in PICKER_CHANGES:
+        row = rows[focus]
+        row["index"] = (row["index"] + PICKER_CHANGES[key]) % len(row["values"])
+        if row["key"] == "codex_model":
+            efforts = next(r for r in rows if r["key"] == "codex_effort")
+            kept = efforts["values"][efforts["index"]]
+            fresh = codex_effort_row(row.get("levels", {}), row["values"][row["index"]], None)
+            if kept in fresh["values"]:
+                fresh["index"] = fresh["values"].index(kept)
+            efforts.update(fresh)
+    return focus, None
+
+
+def render_picker(rows, focus, width):
+    """The picker's frame. Every line stays narrower than the terminal: a wrapped line would throw off
+    the line count the in-place redraw moves up by."""
+    def fit(text):
+        return text if len(text) < width else text[:max(width - 2, 0)] + "…"
+
+    lines = ["\x1b[1m" + fit("Models and effort") + "\x1b[0m", ""]
+    for i, row in enumerate(rows):
+        text = fit(f"{'▸' if i == focus else ' '} {row['label']:<16}‹ {row['values'][row['index']]} ›")
+        lines.append(f"\x1b[1m{text}\x1b[0m" if i == focus else text)
+    row = rows[focus]
+    note = row["notes"].get(row["values"][row["index"]], "")
+    lines += ["", fit("  " + note), "", "\x1b[2m" + fit(PICKER_HINT) + "\x1b[0m"]
+    return "\n".join(lines)
+
+
+KEYS = {"\x1b[A": "up", "\x1b[B": "down", "\x1b[C": "right", "\x1b[D": "left", "\x1b[Z": "shift-tab",
+        "\x1bOA": "up", "\x1bOB": "down", "\x1bOC": "right", "\x1bOD": "left",
+        "\t": "tab", "\r": "enter", "\n": "enter", "\x1b": "esc", "\x03": "ctrl-c"}
+
+
+def read_key(fd):
+    """One key press from a terminal in cbreak mode: a name from KEYS, else the character typed
+    (an unknown escape sequence comes back whole). "" means stdin is closed."""
+    data = os.read(fd, 1)
+    if data == b"\x1b":
+        # A lone Esc and the first byte of an arrow key are the same; only a pause tells them apart.
+        if select.select([fd], [], [], 0.05)[0]:
+            data += os.read(fd, 1)
+            if data[1:] in (b"[", b"O"):
+                while True:  # a CSI sequence ends with a byte from @ to ~
+                    c = os.read(fd, 1)
+                    data += c
+                    if not c or 0x40 <= c[0] <= 0x7e:
+                        break
+    elif data and data[0] >= 0xc0:
+        data += os.read(fd, 3 if data[0] >= 0xf0 else 2 if data[0] >= 0xe0 else 1)  # rest of a UTF-8 char
+    text = data.decode(errors="replace")
+    return KEYS.get(text, text)
+
+
+def run_picker(rows):
+    """Let the owner choose on the terminal. Returns {key: value, None for default} on Enter, None on cancel."""
+    fd = sys.stdin.fileno()
+    saved = termios.tcgetattr(fd)
+    mode = termios.tcgetattr(fd)
+    # cbreak without ISIG: Ctrl+C comes in as a key and cancels, instead of a KeyboardInterrupt that
+    # could land in the middle of a redraw. TCSANOW, unlike tty.setcbreak, keeps keys typed ahead.
+    mode[3] &= ~(termios.ICANON | termios.ECHO | termios.ISIG)
+    mode[6][termios.VMIN], mode[6][termios.VTIME] = 1, 0
+    focus, drawn, action = 0, 0, None
+    try:
+        termios.tcsetattr(fd, termios.TCSANOW, mode)
+        while action is None:
+            # Python before 3.11 reports 0 columns for a terminal whose size was never set.
+            frame = render_picker(rows, focus, shutil.get_terminal_size().columns or 80)
+            with OUT_LOCK:
+                sys.stdout.write((f"\x1b[{drawn}A" if drawn else "\x1b[?25l") + "\r\x1b[J" + frame + "\n")
+                sys.stdout.flush()
+            drawn = frame.count("\n") + 1
+            key = read_key(fd)
+            focus, action = picker_step(rows, focus, key) if key else (focus, "cancel")
+    except KeyboardInterrupt:
+        action = "cancel"  # a SIGINT from outside the terminal
+    finally:
+        # Even on SIGHUP or an error: the prompt after the picker needs line input and a cursor.
+        with contextlib.suppress(OSError, termios.error):
+            termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+        with contextlib.suppress(OSError), OUT_LOCK:
+            sys.stdout.write((f"\x1b[{drawn}A\r\x1b[J" if drawn else "") + "\x1b[?25h")
+            sys.stdout.flush()
+    if action != "save":
+        return None
+    return {r["key"]: (None if r["values"][r["index"]] == "default" else r["values"][r["index"]]) for r in rows}
+
+
+def models_line(values):
+    v = {k: values.get(k) or "default" for k in TUNABLE}
+    return f"claude {v['claude_model']}/{v['claude_effort']} · codex {v['codex_model']}/{v['codex_effort']}"
 
 
 class Console:
@@ -1802,6 +1977,7 @@ class Console:
         self.prompt_active = False
         self.status_shown = False
         self.running = False
+        self.held = None  # log lines kept back while the /models picker owns the screen
 
     def status_text(self):
         if not PROGRESS:
@@ -1821,7 +1997,9 @@ class Console:
         return readline.get_line_buffer()
 
     def write(self, text):
-        if not self.prompt_active:
+        if self.held is not None:
+            self.held.append(text)
+        elif not self.prompt_active:
             print(text, flush=True)
         elif not self.fancy:
             print("\n" + text, flush=True)
@@ -1832,6 +2010,20 @@ class Console:
                 out += self.status_text() + "\n"
             sys.stdout.write(out + self.prompt + self._buffer())
             sys.stdout.flush()
+
+    @contextlib.contextmanager
+    def hold(self):
+        """Keep log lines back until the block ends, then print them. OUT_LOCK guards only the list:
+        a worker logging during a turn must never wait for the owner's key press."""
+        with OUT_LOCK:
+            self.held = []
+        try:
+            yield
+        finally:
+            with OUT_LOCK, contextlib.suppress(OSError):
+                lines, self.held = self.held, None
+                for text in lines:
+                    self.write(text)
 
     def tick(self):
         """Redraw the status line in place, without moving the cursor the user is typing at."""
@@ -2055,6 +2247,8 @@ class Session:
             self.paste(rest)
         elif name == "stop":
             self.guarded(lambda _: self.request_stop(), None)
+        elif name == "models":
+            self.models()
         else:
             target = self.target(latest=name in ("resume", "status", "transcript", "board"))
             if not target:
@@ -2092,6 +2286,32 @@ class Session:
             return None, None
         run = camp.get("current") or (camp["runs"][-1]["dir"] if camp.get("runs") else None)
         return (pathlib.Path(run) if run else None), camp
+
+    def models(self):
+        """Pick models and effort: saved as the default, and handed to the current run or campaign."""
+        current = load_defaults()
+        target = CURRENT.get("target")
+        if target:
+            run, _ = self.current_run(target)
+            try:
+                cfg = load(run)["config"] if run else {}
+            except (OSError, ValueError, KeyError, TypeError):
+                cfg = {}
+            current.update({k: cfg[k] for k in TUNABLE if k in cfg})
+            current.update(read_tuning(target / "tuning.json"))  # chosen earlier, not applied yet
+        if not (self.console.fancy and termios):
+            emit("models: " + models_line(current))
+            emit("the picker needs a terminal; use --claude-model, --claude-effort, --codex-model, --codex-effort")
+            return
+        with self.console.hold():
+            choice = run_picker(model_choices(current))
+        if choice is None:
+            emit("models unchanged")
+            return
+        save_defaults(choice)
+        if target:
+            write_tuning(target, choice)
+        emit("saved: " + models_line(choice) + (" (applies from the next turn)" if self.busy() else ""))
 
     def show_board(self, target):
         run, camp = self.current_run(target)

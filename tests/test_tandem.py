@@ -869,7 +869,7 @@ class Interactive(unittest.TestCase):
 
     def test_every_documented_command_is_known(self):
         for name in ("help", "status", "say", "paste", "stop", "resume", "goal", "campaign", "runs", "transcript",
-                     "doctor", "board", "quit"):
+                     "doctor", "board", "models", "quit"):
             self.assertEqual(tandem.parse_input("/" + name)[0], "command")
             self.assertIn("/" + name, tandem.SLASH_HELP)
 
@@ -1098,6 +1098,218 @@ class Interactive(unittest.TestCase):
                 self.assertEqual(console._buffer(), expected)
 
 
+CODEX_CACHE = {"models": [
+    {"slug": "gpt-big", "description": "Frontier model", "visibility": "list",
+     "supported_reasoning_levels": [{"effort": e, "description": f"{e} effort"} for e in ("low", "high", "ultra")]},
+    {"slug": "gpt-hidden", "visibility": "hide", "supported_reasoning_levels": [{"effort": "low"}]},
+    {"slug": "gpt-small", "description": "Fast model",
+     "supported_reasoning_levels": [{"effort": "low"}, {"effort": "medium"}]},
+]}
+
+
+class Picker(unittest.TestCase):
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.cache = pathlib.Path(temp.name) / "models_cache.json"
+        self.cache.write_text(json.dumps(CODEX_CACHE))
+        for patch in (mock.patch.object(tandem, "CODEX_MODELS_CACHE", self.cache),
+                      mock.patch.dict(os.environ, {"HOME": temp.name})):
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    @staticmethod
+    def selected(row):
+        return row["values"][row["index"]]
+
+    def test_keys_move_change_wrap_and_finish(self):
+        rows = tandem.model_choices({})
+        self.assertEqual([r["key"] for r in rows], list(tandem.TUNABLE))
+        self.assertEqual(rows[0]["values"], ["default", "fable", "opus", "sonnet", "haiku"])
+        self.assertEqual(rows[1]["values"], ["default", *tandem.CLAUDE_EFFORTS])
+        self.assertEqual(rows[2]["values"], ["default", "gpt-big", "gpt-small"])
+        self.assertEqual(rows[0]["notes"]["default"], "the CLI's own setting")
+        focus = 0
+        for key in ("right", "right"):
+            focus, action = tandem.picker_step(rows, focus, key)
+            self.assertIsNone(action)
+        self.assertEqual(self.selected(rows[0]), "opus")
+        tandem.picker_step(rows, 0, "h")
+        tandem.picker_step(rows, 0, "left")
+        tandem.picker_step(rows, 0, "left")
+        self.assertEqual(self.selected(rows[0]), "haiku")  # left wraps around the values
+        tandem.picker_step(rows, 0, "l")
+        self.assertEqual(self.selected(rows[0]), "default")
+        self.assertEqual(tandem.picker_step(rows, 0, "up"), (3, None))
+        self.assertEqual(tandem.picker_step(rows, 3, "tab"), (0, None))
+        self.assertEqual(tandem.picker_step(rows, 0, "shift-tab"), (3, None))
+        self.assertEqual(tandem.picker_step(rows, 1, "j"), (2, None))
+        self.assertEqual(tandem.picker_step(rows, 1, "k"), (0, None))
+        self.assertEqual(tandem.picker_step(rows, 3, "down"), (0, None))
+        self.assertEqual(tandem.picker_step(rows, 2, "enter"), (2, "save"))
+        for key in ("esc", "q", "ctrl-c"):
+            self.assertEqual(tandem.picker_step(rows, 1, key), (1, "cancel"))
+        for key in ("x", ("paste", "text"), None, "\x1b[5~"):
+            self.assertEqual(tandem.picker_step(rows, 1, key), (1, None))
+
+    def test_codex_effort_follows_the_codex_model(self):
+        rows = tandem.model_choices({"codex_model": "gpt-big", "codex_effort": "high"})
+        self.assertEqual(self.selected(rows[2]), "gpt-big")
+        self.assertEqual(rows[3]["values"], ["default", "low", "high", "ultra"])
+        self.assertEqual(self.selected(rows[3]), "high")
+        self.assertEqual(rows[3]["notes"]["ultra"], "ultra effort")
+        tandem.picker_step(rows, 2, "right")
+        self.assertEqual(self.selected(rows[2]), "gpt-small")
+        self.assertEqual(rows[3]["values"], ["default", "low", "medium"])
+        self.assertEqual(self.selected(rows[3]), "default")  # high is not offered by gpt-small
+        tandem.picker_step(rows, 3, "right")
+        tandem.picker_step(rows, 2, "right")  # back to default: every effort Codex knows
+        self.assertEqual(rows[3]["values"], ["default", *tandem.EFFORTS])
+        self.assertEqual(self.selected(rows[3]), "low")
+
+    def test_codex_choices_survive_a_bad_cache(self):
+        for content in (None, "{", "{}", '{"models": 3}', '{"models": [1, {"no": "slug"}]}'):
+            with self.subTest(content=content):
+                if content is None:
+                    self.cache.unlink(missing_ok=True)
+                else:
+                    self.cache.write_text(content)
+                rows = tandem.model_choices({})
+                self.assertEqual(rows[2]["values"], ["default"])
+                self.assertEqual(rows[3]["values"], ["default", *tandem.EFFORTS])
+                self.assertIn("Codex model", tandem.render_picker(rows, 2, 80))
+
+    def test_saved_value_missing_from_the_list_is_kept(self):
+        rows = tandem.model_choices({"codex_model": "old-model", "claude_model": None, "claude_effort": "max"})
+        self.assertEqual(rows[2]["values"][:2], ["default", "old-model"])
+        self.assertEqual(self.selected(rows[2]), "old-model")
+        self.assertEqual(self.selected(rows[0]), "default")
+        self.assertEqual(self.selected(rows[1]), "max")
+
+    def test_render_shows_rows_focus_note_and_hint(self):
+        rows = tandem.model_choices({"claude_model": "opus"})
+        text = tandem.render_picker(rows, 0, 80)
+        plain = re.sub(r"\x1b\[[0-9;]*m", "", text)
+        lines = plain.split("\n")
+        self.assertEqual(lines[0], "Models and effort")
+        self.assertIn("▸ Claude model    ‹ opus ›", lines)
+        self.assertIn("  Codex model     ‹ default ›", lines)
+        self.assertIn(rows[0]["notes"]["opus"], plain)
+        self.assertEqual(lines[-1], "↑↓ move · ←→ change · Tab next · Enter save · Esc cancel")
+        self.assertIn("\x1b[2m↑↓ move", text)
+        self.assertIn("\x1b[1m▸ Claude model", text)
+        narrow = re.sub(r"\x1b\[[0-9;]*m", "", tandem.render_picker(rows, 2, 24))
+        self.assertTrue(all(len(line) < 24 for line in narrow.split("\n")), narrow)
+
+    def test_read_key_maps_escape_sequences(self):
+        for raw, key in ((b"\x1b[A", "up"), (b"\x1b[B", "down"), (b"\x1b[C", "right"), (b"\x1b[D", "left"),
+                         (b"\x1bOA", "up"), (b"\x1b[Z", "shift-tab"), (b"\t", "tab"), (b"\r", "enter"),
+                         (b"\n", "enter"), (b"\x1b", "esc"), (b"\x03", "ctrl-c"), (b"q", "q"), ("ż".encode(), "ż")):
+            r, w = os.pipe()
+            self.addCleanup(os.close, r)
+            os.write(w, raw)
+            os.close(w)
+            with self.subTest(raw=raw):
+                self.assertEqual(tandem.read_key(r), key)
+
+    @unittest.skipUnless(os.name == "posix", "raw keys are POSIX")
+    def test_interrupt_or_error_restores_the_terminal(self):
+        import pty
+        master, slave = pty.openpty()
+        self.addCleanup(os.close, master)
+        self.addCleanup(os.close, slave)
+        termios = tandem.termios
+
+        def attrs():
+            # The kernel sets PENDIN by itself when canonical mode comes back; it is not ours to restore.
+            a = termios.tcgetattr(slave)
+            a[3] &= ~getattr(termios, "PENDIN", 0)
+            return a
+
+        before = attrs()
+        stdin = mock.Mock(fileno=lambda: slave)
+        for failure, expected in ((KeyboardInterrupt, None), (RuntimeError("boom"), RuntimeError)):
+            out = io.StringIO()
+            keys = iter(["down", failure])
+
+            def key(fd):
+                k = next(keys)
+                if not isinstance(k, str):
+                    self.assertFalse(termios.tcgetattr(fd)[3] & termios.ICANON)  # raw while open
+                    raise k
+                return k
+
+            with self.subTest(failure=failure), mock.patch("sys.stdin", stdin), mock.patch("sys.stdout", out), \
+                    mock.patch.object(tandem, "read_key", key):
+                if expected is None:
+                    self.assertIsNone(tandem.run_picker(tandem.model_choices({})))
+                else:
+                    with self.assertRaises(expected):
+                        tandem.run_picker(tandem.model_choices({}))
+                self.assertEqual(attrs(), before)
+                self.assertTrue(out.getvalue().startswith("\x1b[?25l"))
+                self.assertTrue(out.getvalue().endswith("\x1b[10A\r\x1b[J\x1b[?25h"))  # frame cleared, cursor back
+
+    def test_logs_wait_while_the_picker_is_open(self):
+        console = tandem.Console(fancy=True)
+        out = io.StringIO()
+        with mock.patch.object(tandem, "CONSOLE", console), mock.patch("sys.stdout", out):
+            with console.hold():
+                tandem.emit("x")
+                worker = threading.Thread(target=tandem.emit, args=("from a worker",))
+                worker.start()
+                worker.join(3)
+                self.assertFalse(worker.is_alive())  # a worker never waits for the picker
+                self.assertEqual(out.getvalue(), "")
+            tandem.emit("after")
+        self.assertEqual(out.getvalue(), "x\nfrom a worker\nafter\n")
+
+    def test_picker_without_terminal_explains(self):
+        tandem.save_defaults({"claude_model": "opus"})
+        session = tandem.Session(argparse.Namespace(), tandem.Console(fancy=False))
+        with mock.patch.dict(tandem.CURRENT, {}, clear=True), mock.patch.object(tandem, "emit") as emit, \
+                mock.patch.object(tandem, "run_picker") as picker:
+            self.assertTrue(session.handle("models", ""))
+        picker.assert_not_called()
+        text = "\n".join(c.args[0] for c in emit.call_args_list)
+        self.assertIn("claude opus/default · codex default/default", text)
+        self.assertIn("the picker needs a terminal; use --claude-model, --claude-effort, --codex-model, "
+                      "--codex-effort", text)
+        self.assertNotIn("\x1b", text)
+
+    def test_saving_writes_defaults_and_the_running_target(self):
+        with tempfile.TemporaryDirectory() as d:
+            run = pathlib.Path(d)
+            tandem.save(run, {"config": {"claude_model": "sonnet", "claude_effort": None,
+                                         "codex_model": None, "codex_effort": "low"}})
+            session = tandem.Session(argparse.Namespace(), tandem.Console(fancy=True))
+            session.thread = mock.Mock()
+            session.thread.is_alive.return_value = True
+            seen = []
+
+            def pick(rows):
+                seen.append({r["key"]: r["values"][r["index"]] for r in rows})
+                return {"claude_model": "opus", "claude_effort": "high", "codex_model": "gpt-big",
+                        "codex_effort": None}
+
+            with mock.patch.dict(tandem.CURRENT, {"target": run}, clear=True), \
+                    mock.patch.object(tandem, "emit") as emit, mock.patch.object(tandem, "run_picker", pick):
+                session.handle("models", "")
+            self.assertEqual(seen, [{"claude_model": "sonnet", "claude_effort": "default",
+                                     "codex_model": "default", "codex_effort": "low"}])
+            self.assertEqual(tandem.load_defaults(), {"claude_model": "opus", "claude_effort": "high",
+                                                      "codex_model": "gpt-big"})
+            self.assertEqual(tandem.read_tuning(run / "tuning.json"),
+                             {"claude_model": "opus", "claude_effort": "high", "codex_model": "gpt-big",
+                              "codex_effort": None})
+            emit.assert_called_with("saved: claude opus/high · codex gpt-big/default (applies from the next turn)")
+            with mock.patch.dict(tandem.CURRENT, {}, clear=True), mock.patch.object(tandem, "emit"), \
+                    mock.patch.object(tandem, "run_picker", return_value=None) as cancel:
+                session.handle("models", "")
+            cancel.assert_called_once()
+            self.assertEqual(tandem.load_defaults()["claude_model"], "opus")  # cancel saves nothing
+
+
 PNG = b"\x89PNG\r\n\x1a\n" + b"\0" * 16
 
 
@@ -1250,8 +1462,9 @@ class Images(unittest.TestCase):
             fancy = tandem.banner(pathlib.Path("/repo"), fancy=True)
         self.assertNotIn("\x1b", plain)
         self.assertIn("claude  logged in", plain)
-        self.assertIn("Ctrl+V", plain)
+        self.assertIn("type a goal, Ctrl+V to paste an image, /models, or /help", plain)
         self.assertIn("▀█▀", fancy)
+        self.assertIn("type a goal · Ctrl+V pastes an image · /models · /help", fancy)
         self.assertIn("\x1b[32m●\x1b[0m logged in", fancy)
 
 
@@ -1370,13 +1583,15 @@ class SessionProcess(unittest.TestCase):
         subprocess.run(["git", "commit", "-q", "--allow-empty", "-m", "init"], cwd=self.repo, check=True, env=self.env)
 
     def start(self, *args, **env):
+        """env overrides the test environment; None removes a variable."""
         import pty
         master, slave = pty.openpty()
         self.output, lock = [], threading.Lock()
         # Its own session, as a terminal's job would be: signals to its group are the terminal's.
         self.proc = subprocess.Popen([sys.executable, "-B", str(ROOT / "tandem.py"), "--repo", str(self.repo), *args],
                                      stdin=slave, stdout=slave, stderr=slave, cwd=self.repo,
-                                     env=dict(self.env, **env), start_new_session=True)
+                                     env={k: v for k, v in dict(self.env, **env).items() if v is not None},
+                                     start_new_session=True)
         os.close(slave)
 
         def read():
@@ -1507,6 +1722,35 @@ class SessionProcess(unittest.TestCase):
         calls = dict(json.loads(l) for l in argv_log.read_text().splitlines())
         self.assertEqual(calls["codex"][:3], ["exec", "--image", image])
         self.assertEqual(calls["claude"][:3], ["-p", "--add-dir", str(pathlib.Path(image).parent)])
+        self.type("/quit")
+        self.assertEqual(self.proc.wait(timeout=10), 0, self.text())
+
+    def test_models_picker_saves_defaults(self):
+        codex = self.base / "home" / ".codex"
+        codex.mkdir()
+        (codex / "models_cache.json").write_text(json.dumps(CODEX_CACHE))
+        self.start(NO_COLOR=None, TERM="xterm-256color")
+        self.wait_for(lambda: "tandem> " in self.text(), "the prompt")
+        self.type("/models")
+        self.wait_for(lambda: "Enter save" in self.text(), "the picker")
+        self.assertIn("\x1b[?25l", self.text())  # cursor hidden while it is open
+        os.write(self.master, b"\x1b[C")
+        os.write(self.master, b"\r")
+        self.wait_for(lambda: "saved:" in self.text(), "the choice being saved")
+        config = json.loads((self.base / "home" / ".tandem" / "config.json").read_text())
+        self.assertEqual(config["defaults"]["claude_model"], "fable")
+        self.assertEqual(config["consent"], {"version": "test"})
+        # Ctrl+C cancels the picker, not the session, and the terminal is back to line input.
+        frames = self.text().count("Enter save")
+        self.type("/models")
+        self.wait_for(lambda: self.text().count("Enter save") > frames, "the picker again")
+        prompts = self.text().count("tandem> ")
+        os.write(self.master, b"\x03")
+        self.wait_for(lambda: self.text().count("tandem> ") > prompts, "the prompt after Ctrl+C")
+        self.assertGreater(self.text().rfind("\x1b[?25h"), self.text().rfind("\x1b[?25l"))
+        seen = len(self.text())
+        self.type("/help")
+        self.wait_for(lambda: "/transcript" in self.text()[seen:], "the session answering")
         self.type("/quit")
         self.assertEqual(self.proc.wait(timeout=10), 0, self.text())
 

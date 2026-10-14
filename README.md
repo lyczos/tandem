@@ -152,6 +152,11 @@ you can keep typing and talk to the agents while they work. Slash commands:
 - `/help`, `/status`, `/runs`, `/transcript` (prints the transcript path), `/doctor`
 - `/board` shows where the run stands: what both agents agree on, what is still open, the models in use
   and the cost. Each finished turn appears in the session as a small card with its summary, handoff and checks.
+- `/models` picks the Claude and Codex model and effort: ↑↓ move, ←→ change the value, Tab goes
+  to the next row, Enter saves, Esc cancels. The choice is saved as the default in
+  `~/.tandem/config.json`, and a running run takes it from its next turn. Codex models and the
+  efforts each supports come from `~/.codex/models_cache.json`; `default` leaves the setting to
+  the CLI's own config. Without a terminal, or with `NO_COLOR`, it prints the current settings instead
 - `/say TEXT` leaves a message the next turn reads
 - Ctrl+V pastes the image on the clipboard (a screenshot) into the line as `[image #1]`, as in
   Claude Code. `/paste` attaches it to your next goal or `/say` instead, and so does dragging
