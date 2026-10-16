@@ -27,9 +27,10 @@ import textwrap
 import threading
 import time
 import traceback
+import unicodedata
 
 try:
-    import termios  # raw keys for the /models picker; Windows has none and gets the plain answer
+    import termios  # raw keys for the prompt and the /models picker; Windows has none and gets readline
 except ImportError:
     termios = None
 
@@ -408,8 +409,13 @@ CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 MIN_CARD_WIDTH = 20  # the narrowest box that still closes with a title and a few words
 
 
+def term_width():
+    # Python before 3.11 reports 0 columns for a terminal whose size was never set.
+    return shutil.get_terminal_size().columns or 80
+
+
 def card_width():
-    return max(MIN_CARD_WIDTH, min(100, shutil.get_terminal_size().columns))
+    return max(MIN_CARD_WIDTH, min(100, term_width()))
 
 
 def wrap_field(text, width, label="", max_lines=3):
@@ -1541,28 +1547,41 @@ def build_parser():
 # children run in their own session (CHILD_POPEN) so a Ctrl+C at the prompt cannot kill a turn in
 # flight. The price is that the session must stop those children itself when it goes away.
 
-SLASH_COMMANDS = ["help", "status", "say", "paste", "stop", "resume", "goal", "campaign", "runs",
-                  "transcript", "doctor", "board", "models", "quit"]
+# The single list of slash commands: the parser, /help and the menu under the prompt all read it.
+SLASH = [
+    ("help", "", "show this list"),
+    ("status", "", "one line per turn of the current run"),
+    ("board", "", "what the agents agree on, what is open, models and cost"),
+    ("models", "", "pick Claude and Codex model and effort"),
+    ("say", "TEXT", "leave a message the next turn reads"),
+    ("paste", "", "attach the clipboard's image to your next goal or /say"),
+    ("stop", "", "stop after the current turn"),
+    ("resume", "[TURNS]", "continue the last run, optionally allowing TURNS more"),
+    ("goal", "FILE", "start a run from a goal file"),
+    ("campaign", "ARGS...", "same as `tandem campaign ARGS...` (start, resume, stop, status, say)"),
+    ("runs", "", "recent runs and campaigns"),
+    ("transcript", "", "print the transcript path"),
+    ("doctor", "", "check tools and logins"),
+    ("quit", "", "leave (also Ctrl+D)"),
+]
+SLASH_COMMANDS = [name for name, _, _ in SLASH]
+# /help has room for more than one menu line.
+HELP_MORE = {"models": " (saved as the default;\na running run takes it from its next turn)",
+             "paste": "\n(or drag image files onto the terminal; /paste clear drops them)"}
 
-SLASH_HELP = """\
-type a goal to start a run in this repo; while it runs, type /say to talk to the agents
-  /help                show this list
-  /status              one line per turn of the current run
-  /board               what the agents agree on, what is open, models and cost
-  /models              pick Claude and Codex model and effort (saved as the default;
-                       a running run takes it from its next turn)
-  /say TEXT            leave a message the next turn reads
-  Ctrl+V               paste the clipboard's image into the line as [image #N]
-  /paste               attach the clipboard's image to your next goal or /say
-                       (or drag image files onto the terminal; /paste clear drops them)
-  /stop                stop after the current turn
-  /resume [TURNS]      continue the last run, optionally allowing TURNS more
-  /goal FILE           start a run from a goal file
-  /campaign ARGS...    same as `tandem campaign ARGS...` (start, resume, stop, status, say)
-  /runs                recent runs and campaigns
-  /transcript          print the transcript path
-  /doctor              check tools and logins
-  /quit                leave (also Ctrl+D)"""
+
+def slash_help():
+    lines = ["type a goal to start a run in this repo; while it runs, type /say to talk to the agents"]
+    for name, args, text in SLASH:
+        if name == "paste":
+            lines.append(f"  {'Ctrl+V':<21}paste the clipboard's image into the line as [image #N]")
+        first, *more = (text + HELP_MORE.get(name, "")).split("\n")
+        lines.append(f"  {('/' + name + ' ' + args).strip():<21}{first}")
+        lines += [" " * 23 + line for line in more]
+    return "\n".join(lines)
+
+
+SLASH_HELP = slash_help()
 
 
 def parse_input(line):
@@ -1905,12 +1924,18 @@ def render_picker(rows, focus, width):
 
 KEYS = {"\x1b[A": "up", "\x1b[B": "down", "\x1b[C": "right", "\x1b[D": "left", "\x1b[Z": "shift-tab",
         "\x1bOA": "up", "\x1bOB": "down", "\x1bOC": "right", "\x1bOD": "left",
-        "\t": "tab", "\r": "enter", "\n": "enter", "\x1b": "esc", "\x03": "ctrl-c"}
+        "\x1b[H": "home", "\x1bOH": "home", "\x1b[1~": "home", "\x1b[7~": "home",
+        "\x1b[F": "end", "\x1bOF": "end", "\x1b[4~": "end", "\x1b[8~": "end", "\x1b[3~": "delete",
+        "\t": "tab", "\r": "enter", "\n": "enter", "\x1b": "esc", "\x7f": "backspace", "\x08": "backspace",
+        "\x01": "ctrl-a", "\x03": "ctrl-c", "\x04": "ctrl-d", "\x05": "ctrl-e", "\x0b": "ctrl-k",
+        "\x15": "ctrl-u", "\x16": "ctrl-v", "\x17": "ctrl-w"}
+PASTE_START, PASTE_END = b"\x1b[200~", b"\x1b[201~"
 
 
 def read_key(fd):
     """One key press from a terminal in cbreak mode: a name from KEYS, else the character typed
-    (an unknown escape sequence comes back whole). "" means stdin is closed."""
+    (an unknown escape sequence comes back whole), or ("paste", text) for a bracketed paste.
+    "" means stdin is closed."""
     data = os.read(fd, 1)
     if data == b"\x1b":
         # A lone Esc and the first byte of an arrow key are the same; only a pause tells them apart.
@@ -1922,27 +1947,43 @@ def read_key(fd):
                     data += c
                     if not c or 0x40 <= c[0] <= 0x7e:
                         break
+        if data == PASTE_START:
+            pasted = b""
+            while not pasted.endswith(PASTE_END):
+                c = os.read(fd, 1)
+                if not c:
+                    break
+                pasted += c
+            return ("paste", pasted[:-len(PASTE_END)].decode(errors="replace"))
     elif data and data[0] >= 0xc0:
         data += os.read(fd, 3 if data[0] >= 0xf0 else 2 if data[0] >= 0xe0 else 1)  # rest of a UTF-8 char
     text = data.decode(errors="replace")
     return KEYS.get(text, text)
 
 
+def raw_keys(fd):
+    """Put the terminal in cbreak mode without signals and return the settings to restore.
+
+    Without ISIG, Ctrl+C comes in as a key, never as a KeyboardInterrupt in the middle of a redraw, and
+    the terminal does not echo ^C where the cursor is. Without IEXTEN, Ctrl+V reaches us instead of
+    quoting the next key. TCSANOW, unlike tty.setcbreak, keeps keys typed ahead."""
+    saved = termios.tcgetattr(fd)
+    mode = termios.tcgetattr(fd)
+    mode[3] &= ~(termios.ICANON | termios.ECHO | termios.ISIG | termios.IEXTEN)
+    mode[6][termios.VMIN], mode[6][termios.VTIME] = 1, 0
+    termios.tcsetattr(fd, termios.TCSANOW, mode)
+    return saved
+
+
 def run_picker(rows):
     """Let the owner choose on the terminal. Returns {key: value, None for default} on Enter, None on cancel."""
     fd = sys.stdin.fileno()
     saved = termios.tcgetattr(fd)
-    mode = termios.tcgetattr(fd)
-    # cbreak without ISIG: Ctrl+C comes in as a key and cancels, instead of a KeyboardInterrupt that
-    # could land in the middle of a redraw. TCSANOW, unlike tty.setcbreak, keeps keys typed ahead.
-    mode[3] &= ~(termios.ICANON | termios.ECHO | termios.ISIG)
-    mode[6][termios.VMIN], mode[6][termios.VTIME] = 1, 0
     focus, drawn, action = 0, 0, None
     try:
-        termios.tcsetattr(fd, termios.TCSANOW, mode)
+        raw_keys(fd)
         while action is None:
-            # Python before 3.11 reports 0 columns for a terminal whose size was never set.
-            frame = render_picker(rows, focus, shutil.get_terminal_size().columns or 80)
+            frame = render_picker(rows, focus, term_width())
             with OUT_LOCK:
                 sys.stdout.write((f"\x1b[{drawn}A" if drawn else "\x1b[?25l") + "\r\x1b[J" + frame + "\n")
                 sys.stdout.flush()
@@ -1968,6 +2009,275 @@ def models_line(values):
     return f"claude {v['claude_model']}/{v['claude_effort']} · codex {v['codex_model']}/{v['codex_effort']}"
 
 
+# ---------- the prompt line ----------
+
+MENU_SIZE = 8
+MENU_HINT = "↑↓ select · Tab complete · Enter run · Esc close"
+HISTORY_SIZE = 500
+NAMED_KEYS = set(KEYS.values())
+
+
+def history_path():
+    return pathlib.Path.home() / ".tandem" / "history"
+
+
+def display_width(text):
+    """Columns text takes on a terminal: wide East Asian characters take two, combining marks none."""
+    return sum(0 if unicodedata.combining(c) else 2 if unicodedata.east_asian_width(c) in ("W", "F") else 1
+               for c in text)
+
+
+def fit_width(text, width):
+    """The longest start of text that takes at most width columns."""
+    used = 0
+    for i, c in enumerate(text):
+        used += display_width(c)
+        if used > width:
+            return text[:i]
+    return text
+
+
+def slash_matches(buffer):
+    """The commands the menu offers for what is typed: names that start with it, then names that contain it."""
+    if not buffer.startswith("/") or any(c.isspace() for c in buffer):
+        return []
+    typed = buffer[1:].lower()
+    first = [c for c in SLASH if c[0].startswith(typed)]
+    return (first + [c for c in SLASH if typed in c[0] and c not in first])[:MENU_SIZE]
+
+
+def editor_terminal():
+    """Our own line editor needs raw keys and cursor movement; anything less keeps readline's input()."""
+    return (termios is not None and sys.stdin.isatty() and sys.stdout.isatty()
+            and os.environ.get("TERM") != "dumb")
+
+
+class LineEditor:
+    """The prompt on a POSIX terminal. input() has no hook for each key, so the menu of slash commands
+    could not follow the typing; this reads the keys itself.
+
+    While it reads, it owns the rows from the status line (header) down to the menu: anything else
+    printed then goes through Console.write, which erases those rows, prints, and draws them again.
+    The prompt is one row that scrolls sideways, so the row count it moves up by is always right."""
+
+    def __init__(self, fd_in, out, history_path, keys=None, paste=None, color=False):
+        self.fd, self._out, self.history_path = fd_in, out, pathlib.Path(history_path)
+        self.keys = keys  # a script of keys for tests, instead of the terminal
+        self.paste = paste or (lambda: None)
+        self.color = color
+        self.header = lambda: []
+        self.prompt, self.buffer, self.cursor, self.scroll = "", "", 0, 0
+        self.selected, self.menu_closed = 0, False
+        self.reading = False
+        self.mid_line = False  # the last read left its line without a newline (Ctrl+C, Ctrl+D)
+        self.kept = False      # the last read was an empty Enter: its rows are still on screen, as drawn
+        self.above = 0         # rows drawn above the prompt row, where the cursor is
+        self.history = self.load_history()
+        self.hist_pos, self.draft = len(self.history), ""
+
+    @property
+    def out(self):
+        return self._out or sys.stdout  # looked up on each write: SIGHUP swaps sys.stdout for /dev/null
+
+    def write(self, text):
+        self.out.write(text)
+        self.out.flush()
+
+    def footer_lines(self, width):
+        return []  # rows under the menu, drawn on every redraw
+
+    def load_history(self):
+        try:
+            lines = self.history_path.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            return []
+        return [line for line in lines if line.strip()][-HISTORY_SIZE:]
+
+    def remember(self, line):
+        if not line.strip() or (self.history and self.history[-1] == line):
+            return
+        self.history = (self.history + [line])[-HISTORY_SIZE:]
+        with contextlib.suppress(OSError):
+            self.history_path.parent.mkdir(parents=True, exist_ok=True)
+            self.history_path.write_text("".join(h + "\n" for h in self.history), encoding="utf-8")
+
+    def next_key(self):
+        return next(self.keys, "") if self.keys is not None else read_key(self.fd)
+
+    def pending(self):
+        """More keys already waiting (typed fast, or a paste without brackets): draw once after them."""
+        return self.keys is None and bool(select.select([self.fd], [], [], 0)[0])
+
+    def read(self, prompt):
+        """One line, like input(): EOFError on Ctrl+D on an empty line, KeyboardInterrupt on Ctrl+C."""
+        saved = raw_keys(self.fd) if self.keys is None else None
+        line = None
+        try:
+            with OUT_LOCK:
+                self.prompt, self.buffer, self.cursor, self.scroll = prompt, "", 0, 0
+                self.selected, self.menu_closed = 0, False
+                self.hist_pos, self.draft = len(self.history), ""
+                fresh = "\n" if self.mid_line else ""
+                if not self.kept:
+                    self.above = 0
+                self.mid_line, self.kept, self.reading = False, False, True
+                self.write(fresh + "\x1b[?2004h" + self.redraw())
+            while line is None:
+                key = self.next_key()
+                if key == "ctrl-v":
+                    key = ("image", self.paste())  # outside OUT_LOCK: the clipboard tool may take seconds
+                with OUT_LOCK:
+                    line = self.apply(key)
+                    if line is None and not self.pending():
+                        self.write(self.redraw())
+        finally:
+            with OUT_LOCK:
+                self.reading = False
+                # An empty Enter changes nothing on screen: a new prompt row for each one would push the
+                # status line up. The next read draws over the same rows.
+                self.kept = line is not None and not line.strip()
+                # Otherwise the line stays as typed, without the menu. After Enter the cursor goes below
+                # it; after Ctrl+C or Ctrl+D it stays at the end, and the next output starts a fresh line.
+                with contextlib.suppress(OSError):
+                    self.write("\x1b[?2004l" if self.kept else self.erase() + self.prompt + self.buffer
+                               + ("\n" if line is not None else "") + "\x1b[?2004l")
+                self.mid_line = line is None
+            if saved is not None:
+                with contextlib.suppress(OSError, termios.error):
+                    termios.tcsetattr(self.fd, termios.TCSADRAIN, saved)
+        self.remember(line)
+        return line
+
+    def matches(self):
+        found = [] if self.menu_closed else slash_matches(self.buffer)
+        self.selected = min(self.selected, max(len(found) - 1, 0))
+        return found
+
+    def edit(self, buffer, cursor):
+        if buffer != self.buffer:
+            self.selected, self.menu_closed = 0, False
+        self.buffer, self.cursor = buffer, cursor
+
+    def insert(self, text):
+        self.edit(self.buffer[:self.cursor] + text + self.buffer[self.cursor:], self.cursor + len(text))
+
+    def recall(self, step):
+        pos = min(max(self.hist_pos + step, 0), len(self.history))
+        if pos == self.hist_pos:
+            return  # already at the oldest line, or back at the one being typed
+        if self.hist_pos == len(self.history):
+            self.draft = self.buffer
+        self.hist_pos = pos
+        text = self.history[pos] if pos < len(self.history) else self.draft
+        self.edit(text, len(text))
+        self.menu_closed = True  # ↑ again goes further back, not into a menu for the recalled command
+
+    def apply(self, key):
+        """Apply one key. Returns the line when it is submitted, else None."""
+        b, c, matches = self.buffer, self.cursor, self.matches()
+        if isinstance(key, tuple):
+            kind, text = key
+            if kind == "image" and text is None:
+                self.write("\a")  # no image on the clipboard
+            elif kind == "image":
+                self.insert(text if not c or b[c - 1].isspace() else " " + text)
+            else:  # a paste is one line: its newlines become spaces, and no escape code reaches the screen
+                self.insert(CONTROL_CHARS.sub(" ", text.replace("\r\n", "\n")))
+        elif key == "":
+            raise EOFError
+        elif key == "ctrl-c":
+            raise KeyboardInterrupt
+        elif key == "ctrl-d":
+            if not b:
+                raise EOFError
+            self.edit(b[:c] + b[c + 1:], c)
+        elif key == "enter":
+            if matches and b[1:].lower() not in SLASH_COMMANDS:
+                self.edit("/" + matches[self.selected][0], len(matches[self.selected][0]) + 1)
+            return self.buffer
+        elif key == "tab":
+            if matches:
+                name = matches[self.selected][0]
+                self.edit(f"/{name} ", len(name) + 2)
+        elif key == "esc":
+            self.menu_closed = True
+        elif key in ("up", "down"):
+            if matches:
+                self.selected = (self.selected + (1 if key == "down" else -1)) % len(matches)
+            else:
+                self.recall(1 if key == "down" else -1)
+        elif key == "left":
+            self.cursor = max(c - 1, 0)
+        elif key == "right":
+            self.cursor = min(c + 1, len(b))
+        elif key in ("home", "ctrl-a"):
+            self.cursor = 0
+        elif key in ("end", "ctrl-e"):
+            self.cursor = len(b)
+        elif key == "backspace":
+            if c:
+                self.edit(b[:c - 1] + b[c:], c - 1)
+        elif key == "delete":
+            self.edit(b[:c] + b[c + 1:], c)
+        elif key == "ctrl-u":
+            self.edit(b[c:], 0)
+        elif key == "ctrl-k":
+            self.edit(b[:c], c)
+        elif key == "ctrl-w":
+            start = re.search(r"\S*\s*$", b[:c]).start()
+            self.edit(b[:start] + b[c:], start)
+        elif key not in NAMED_KEYS and key.isprintable():
+            self.insert(key)  # escape sequences and control keys we do not use type nothing
+        return None
+
+    def prompt_line(self, width):
+        """(text, cursor column) of the prompt row. The text scrolls sideways so the cursor stays in view
+        and the row never wraps."""
+        prompt = fit_width(self.prompt, max(width - 2, 0))
+        room = max(width - 1 - display_width(prompt), 1)
+        start, used = self.cursor, 0  # the furthest left the row can start with the cursor still in view
+        while start and used + display_width(self.buffer[start - 1]) <= room:
+            start -= 1
+            used += display_width(self.buffer[start])
+        self.scroll = 0 if not start else min(max(self.scroll, start), self.cursor)
+        shown = fit_width(self.buffer[self.scroll:], room)
+        return prompt + shown, display_width(prompt) + display_width(self.buffer[self.scroll:self.cursor])
+
+    def menu_lines(self, width):
+        matches = self.matches()
+        if not matches:
+            return []
+        pad = max(len(name) for name, _, _ in matches) + 1
+        lines = []
+        for i, (name, _, text) in enumerate(matches):
+            mark = "▸ " if i == self.selected and not self.color else "  "
+            line = fit_width(f"{mark}{'/' + name:<{pad}}   {text}", width - 1)
+            lines.append(f"\x1b[7m{line}\x1b[0m" if i == self.selected and self.color else line)
+        hint = fit_width("  " + MENU_HINT, width - 1)
+        return lines + [f"\x1b[2m{hint}\x1b[0m" if self.color else hint]
+
+    def to_top(self):
+        return "\r" + (f"\x1b[{self.above}A" if self.above else "")
+
+    def erase(self):
+        """Clear every row the editor drew, leaving the cursor where the first one was."""
+        out, self.above = self.to_top() + "\x1b[J", 0
+        return out
+
+    def render(self):
+        """Draw the rows from where the cursor is, each line overwritten in place, and put the cursor back."""
+        width = term_width()
+        text, col = self.prompt_line(width)
+        head = [fit_width(line, width - 1) for line in self.header()]
+        below = self.menu_lines(width) + [fit_width(line, width - 1) for line in self.footer_lines(width)]
+        self.above = len(head)
+        return ("\x1b[K\n".join(head + [text] + below) + "\x1b[K\x1b[J"
+                + (f"\x1b[{len(below)}A" if below else "") + "\r" + (f"\x1b[{col}C" if col else ""))
+
+    def redraw(self):
+        return self.to_top() + self.render()
+
+
 class Console:
     """Prompt-aware output for the interactive session. write() is only called holding OUT_LOCK."""
 
@@ -1978,6 +2288,11 @@ class Console:
         self.status_shown = False
         self.running = False
         self.held = None  # log lines kept back while the /models picker owns the screen
+        self.editor = None  # the LineEditor when the terminal allows one, else input() with readline
+
+    def attach(self, editor):
+        self.editor = editor
+        editor.header = lambda: [self.status_text()] if self.running else []
 
     def status_text(self):
         if not PROGRESS:
@@ -1999,6 +2314,18 @@ class Console:
     def write(self, text):
         if self.held is not None:
             self.held.append(text)
+        elif self.editor and self.editor.reading:
+            self.editor.write(self.editor.erase() + text + "\n" + self.editor.render())
+        elif self.editor:
+            # A fresh line: after Ctrl+C the editor left its line open (the empty emit that follows only
+            # closes it), and keys typed while a command runs, or the ^C the terminal echoes then, sit
+            # where the cursor is.
+            if self.editor.mid_line:
+                out = "\n" + (text + "\n" if text else "")
+            else:
+                out = (self.editor.erase() if self.editor.kept else "\r\x1b[K") + text + "\n"
+            self.editor.write(out)
+            self.editor.mid_line = self.editor.kept = False
         elif not self.prompt_active:
             print(text, flush=True)
         elif not self.fancy:
@@ -2028,11 +2355,17 @@ class Console:
     def tick(self):
         """Redraw the status line in place, without moving the cursor the user is typing at."""
         with OUT_LOCK:
-            if self.fancy and self.running and self.prompt_active and self.status_shown:
+            if self.editor:
+                if self.editor.reading and self.running:
+                    self.editor.write(self.editor.redraw())
+            elif self.fancy and self.running and self.prompt_active and self.status_shown:
                 sys.stdout.write("\x1b7\x1b[1A\r\x1b[K" + self.status_text() + "\x1b8")
                 sys.stdout.flush()
 
     def ask(self, prompt):
+        if self.editor:
+            self.prompt = prompt
+            return self.editor.read(prompt)
         # Print the prompt under the same lock as logs. input(prompt) prints outside Python's
         # lock, and macOS libedit does not call readline's pre-input hook to release it safely.
         # input() still provides line editing; history redraws may omit the prefix until a log.
@@ -2136,20 +2469,27 @@ class Session:
             emit(f"image #{self.image_count} attached ({pathlib.Path(src).name}); "
                  f"it goes with your next goal or /say")
 
+    def paste_inline(self):
+        """Ctrl+V: save the clipboard's image and return "[image #N] " for the line, None when there is none."""
+        try:
+            path = paste_image()
+        except (ValueError, OSError):
+            return None
+        self.image_count += 1
+        self.inline[self.image_count] = path
+        return f"[image #{self.image_count}] "
+
     def complete(self, text, state):
         """readline completer, called for Ctrl+V (see bind_paste_key). text is the word before the cursor."""
         if state:
             return None
         before = text + " " if text else ""
-        try:
-            path = paste_image()
-        except (ValueError, OSError):
+        mark = self.paste_inline()
+        if mark is None:
             sys.stdout.write("\a")  # mid-line, the bell is the only thing that does not garble the prompt
             sys.stdout.flush()
             return before
-        self.image_count += 1
-        self.inline[self.image_count] = path
-        return f"{before}[image #{self.image_count}] "
+        return before + mark
 
     def expand_inline(self, line):
         """Turn each [image #N] into [image: PATH]. A line of nothing but images waits for the next goal or /say."""
@@ -2396,15 +2736,19 @@ def cmd_interactive(args):
     args.repo = require_repo(args.repo)
     if not ask_consent():
         sys.exit("not confirmed; nothing started")
-    try:
-        import readline  # noqa: F401  # line editing and history for input(); absent on some builds
-    except ImportError:
-        pass
     # The logo and dots need escape codes and UTF-8; anything less gets the plain lines.
     print(banner(args.repo, fancy_terminal() and "utf" in (sys.stdout.encoding or "").lower()))
     console = Console(fancy_terminal())
     session = Session(args, console)
-    bind_paste_key(session.complete)
+    if editor_terminal():
+        console.attach(LineEditor(sys.stdin.fileno(), None, history_path(), paste=session.paste_inline,
+                                  color=console.fancy))
+    else:
+        try:
+            import readline  # noqa: F401  # line editing and history for input(); absent on some builds
+        except ImportError:
+            pass
+        bind_paste_key(session.complete)
     CHILD_POPEN["start_new_session"] = True
     CONSOLE = console
 
@@ -2431,7 +2775,7 @@ def cmd_interactive(args):
         while not ticker_stop.wait(1):
             console.tick()
 
-    if console.fancy:
+    if console.fancy or console.editor:
         threading.Thread(target=ticker, daemon=True).start()
     try:
         while True:

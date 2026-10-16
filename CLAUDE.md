@@ -44,7 +44,9 @@ is absent, so the Python suite still runs without Node.
 
 The interactive session (`cmd_interactive`, `Session`, `Console`) runs `loop()` in a worker thread
 while the main thread reads input. All output must go through `emit()`/`log()` (one `OUT_LOCK`),
-never bare `print` from code that can run during a run, or the prompt redraw breaks. While it
+never bare `print` from code that can run during a run, or the prompt redraw breaks. On a POSIX
+terminal `LineEditor` owns the prompt row and the rows around it (status line above, slash-command
+menu below); `Console.write` must erase and redraw both around every line it prints. While it
 runs, every child the worker starts (agents, the check, git) gets its own session and `/dev/null`
 on stdin (`CHILD_POPEN`) so Ctrl+C at the prompt cannot kill a turn or fail a check. Being out of
 the terminal's reach, agents and checks go through `run_child()`, which tracks them in `CHILDREN`:

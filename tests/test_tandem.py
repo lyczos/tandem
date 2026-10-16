@@ -1310,6 +1310,266 @@ class Picker(unittest.TestCase):
             self.assertEqual(tandem.load_defaults()["claude_model"], "opus")  # cancel saves nothing
 
 
+SCREEN_TOKEN = re.compile(r"\x1b\[\??[0-9;]*[A-Za-z~]|\x1b.|.", re.S)
+
+
+def screen(text):
+    """The rows a terminal shows after text, with enough of VT100 for the editor's redraws (no wrapping)."""
+    rows, r, c = [""], 0, 0
+    for tok in SCREEN_TOKEN.findall(text):
+        if tok == "\r":
+            c = 0
+        elif tok == "\n":  # a pty sends \r\n; StringIO output only \n
+            r, c = r + 1, 0
+            rows += [""] * (r + 1 - len(rows))
+        elif tok == "\x08":
+            c = max(c - 1, 0)
+        elif tok.startswith("\x1b["):
+            arg, final = tok[2:-1].lstrip("?"), tok[-1]
+            n = int(arg) if arg.isdigit() else 1
+            if final == "A":
+                r = max(r - n, 0)
+            elif final == "B":
+                r += n
+                rows += [""] * (r + 1 - len(rows))
+            elif final == "C":
+                c += n
+            elif final == "D":
+                c = max(c - n, 0)
+            elif final == "G":
+                c = n - 1
+            elif final in "KJ":
+                rows[r] = rows[r][:c]
+                if final == "J":
+                    del rows[r + 1:]
+        elif tok.startswith("\x1b") or ord(tok) < 32:
+            pass
+        else:
+            line = rows[r].ljust(c)
+            rows[r] = line[:c] + tok + line[c + 1:]
+            c += 1
+    return rows
+
+
+class Editor(unittest.TestCase):
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.history = pathlib.Path(temp.name) / "history"
+
+    def editor(self, *keys, **kw):
+        self.out = io.StringIO()
+        return tandem.LineEditor(None, self.out, self.history, keys=iter(keys), **kw)
+
+    def read(self, *keys, **kw):
+        return self.editor(*keys, **kw).read("tandem> ")
+
+    def test_slash_matches(self):
+        def names(buffer):
+            return [m[0] for m in tandem.slash_matches(buffer)]
+        self.assertEqual(names("/m")[0], "models")
+        self.assertEqual(names("/"), [c[0] for c in tandem.SLASH][:8])
+        self.assertEqual(names("/s")[:3], ["status", "say", "stop"])  # prefix matches first, in table order
+        self.assertEqual(names("/say hi"), [])
+        self.assertEqual(names("hello"), [])
+        self.assertEqual(names("/oar"), ["board"])  # no prefix match: the names containing it
+
+    def test_slash_table_is_the_single_source(self):
+        self.assertEqual(tandem.SLASH_COMMANDS, [c[0] for c in tandem.SLASH])
+        self.assertIn(("models", "", "pick Claude and Codex model and effort"), tandem.SLASH)
+        help_text = tandem.SLASH_HELP
+        self.assertTrue(help_text.startswith("type a goal to start a run in this repo; while it runs"))
+        for line in ("  /help                show this list",
+                     "  /models              pick Claude and Codex model and effort (saved as the default;\n"
+                     "                       a running run takes it from its next turn)",
+                     "  /say TEXT            leave a message the next turn reads\n"
+                     "  Ctrl+V               paste the clipboard's image into the line as [image #N]\n"
+                     "  /paste               attach the clipboard's image to your next goal or /say\n"
+                     "                       (or drag image files onto the terminal; /paste clear drops them)",
+                     "  /resume [TURNS]      continue the last run, optionally allowing TURNS more",
+                     "  /quit                leave (also Ctrl+D)"):
+            self.assertIn(line, help_text)
+        self.assertTrue(help_text.endswith("(also Ctrl+D)"))
+
+    def test_display_width(self):
+        for text, width in (("abc", 3), ("ż", 1), ("漢字", 4), ("é", 1), ("", 0)):
+            self.assertEqual(tandem.display_width(text), width, text)
+
+    def test_editor_keys(self):
+        self.assertEqual(self.read("fix", "left", "left", "X", "end", "enter"), "fXix")
+        self.assertEqual(self.read("one two", "ctrl-w", "enter"), "one ")
+        self.assertEqual(self.read("abc", "ctrl-a", "ctrl-k", "enter"), "")
+        self.assertEqual(self.read("abc", "home", "delete", "end", "backspace", "enter"), "b")
+        self.assertEqual(self.read("abcd", "left", "ctrl-u", "ctrl-e", "x", "enter"), "dx")
+        self.assertEqual(self.read("a", "shift-tab", "\x1b[5~", "\x01", "enter"), "a")  # unused keys type nothing
+        with self.assertRaises(EOFError):
+            self.read("ctrl-d")
+        with self.assertRaises(KeyboardInterrupt):
+            self.read("ab", "ctrl-c")
+        self.assertTrue(screen(self.out.getvalue())[-1].startswith("tandem> ab"))  # the line stays, no menu
+
+    def test_empty_enter_does_nothing(self):
+        editor = self.editor("enter", " ", "enter", "x", "enter")
+        self.assertEqual([editor.read("tandem> ") for _ in range(3)], ["", " ", "x"])
+        self.assertEqual(screen(self.out.getvalue()), ["tandem> x", ""])
+        self.assertEqual(self.history.read_text(), "x\n")  # blank lines are not history
+
+    def test_menu_select_and_run(self):
+        self.assertEqual(self.read("/", "m", "enter"), "/models")
+        second = tandem.slash_matches("/")[1][0]
+        self.assertEqual(self.read("/", "down", "tab", "enter").strip(), "/" + second)
+        self.assertEqual(self.read("/", "up", "enter"), "/" + tandem.slash_matches("/")[-1][0])  # wraps
+        self.assertEqual(self.read("/m", "esc", "enter"), "/m")  # Esc closed the menu
+        self.assertEqual(self.read("/say", "enter"), "/say")  # an exact command runs as typed
+        self.assertEqual(self.read("/st", "tab", "hi", "enter"), "/status hi")
+
+    def test_menu_lines(self):
+        editor = self.editor()
+        editor.prompt, editor.buffer, editor.cursor = "tandem> ", "/mo", 3
+        lines = editor.menu_lines(80)
+        self.assertEqual(lines, ["▸ /models   pick Claude and Codex model and effort",
+                                 "  ↑↓ select · Tab complete · Enter run · Esc close"])
+        self.assertEqual(lines[-1], "  ↑↓ select · Tab complete · Enter run · Esc close")
+        self.assertNotIn("\x1b", "".join(lines))
+        editor.buffer, editor.cursor = "/", 1
+        lines = editor.menu_lines(30)
+        self.assertEqual(len(lines), 9)  # 8 commands and the hint
+        self.assertTrue(all(tandem.display_width(line) < 30 for line in lines))
+        self.assertTrue(lines[1].startswith("  /status"))
+        color = self.editor(color=True)
+        color.prompt, color.buffer, color.cursor = "tandem> ", "/mo", 3
+        lines = color.menu_lines(80)
+        self.assertEqual(lines[0], "\x1b[7m  /models   pick Claude and Codex model and effort\x1b[0m")
+        self.assertTrue(lines[-1].startswith("\x1b[2m"))
+        editor.buffer = "/say hi"
+        self.assertEqual(editor.menu_lines(80), [])
+
+    def test_history_up_down_and_file(self):
+        editor = self.editor("a", "enter", "b", "enter", "up", "up", "up", "enter", "x", "up", "down", "enter")
+        self.assertEqual([editor.read("> ") for _ in range(4)], ["a", "b", "a", "x"])
+        self.assertEqual(self.history.read_text(), "a\nb\na\nx\n")
+        again = self.editor("up", "enter", "up", "enter")
+        self.assertEqual([again.read("> ") for _ in range(2)], ["x", "x"])  # same as the last: not stored twice
+        self.assertEqual(self.history.read_text(), "a\nb\na\nx\n")
+        self.history.write_text("".join(f"{i}\n" for i in range(600)))
+        many = self.editor("new", "enter")
+        many.read("> ")
+        lines = self.history.read_text().splitlines()
+        self.assertEqual((len(lines), lines[0], lines[-1]), (500, "101", "new"))
+
+    def test_recalled_command_does_not_open_the_menu(self):
+        self.history.write_text("/st\n")
+        self.assertEqual(self.read("up", "enter"), "/st")  # an open menu would have made it /status
+        self.assertEqual(self.read("up", "down", "x", "enter"), "x")
+
+    def test_wide_chars_and_long_line_keep_cursor_visible(self):
+        editor = self.editor()
+        editor.prompt, editor.buffer = "tandem> ", "ż漢" * 25
+        for cursor in (50, 25, 0, 49):
+            editor.cursor = cursor
+            text, col = editor.prompt_line(20)
+            self.assertLessEqual(tandem.display_width(text), 20, cursor)
+            self.assertLessEqual(col, 20, cursor)
+            self.assertTrue(text.startswith("tandem> "))
+            before = editor.buffer[editor.scroll:cursor]
+            self.assertEqual(col, 8 + tandem.display_width(before))
+            self.assertTrue(text[8:].startswith(before))  # the cursor's place is on screen
+        with mock.patch.object(tandem, "term_width", return_value=20):
+            editor.buffer, editor.cursor = "/" + "ż" * 40, 41
+            rows = plain(editor.render()).split("\x1b[K")
+        self.assertTrue(all(tandem.display_width(re.sub(r"\x1b\[[0-9;]*[A-Za-z]|[\r\n]", "", r)) < 20
+                            for r in rows))
+
+    def test_ctrl_v_inserts_or_rings(self):
+        paste = mock.Mock(side_effect=["[image #1] ", None])
+        self.assertEqual(self.read("fix", "ctrl-v", "ctrl-v", "enter", paste=paste), "fix [image #1] ")
+        self.assertEqual(paste.call_count, 2)
+        self.assertIn("\a", self.out.getvalue())
+
+    def test_bracketed_paste(self):
+        self.assertEqual(self.read("a ", ("paste", "line1\nline2\r\nline3\x1b[31m"), "enter"),
+                         "a line1 line2 line3 [31m")
+        self.assertTrue(self.out.getvalue().startswith("\x1b[?2004h"))
+        self.assertIn("\x1b[?2004l", self.out.getvalue())
+
+    def test_read_key_maps_editing_keys(self):
+        for raw, key in ((b"\x7f", "backspace"), (b"\x08", "backspace"), (b"\x1b[3~", "delete"),
+                         (b"\x1b[H", "home"), (b"\x1b[F", "end"), (b"\x1bOH", "home"), (b"\x01", "ctrl-a"),
+                         (b"\x05", "ctrl-e"), (b"\x15", "ctrl-u"), (b"\x0b", "ctrl-k"), (b"\x17", "ctrl-w"),
+                         (b"\x04", "ctrl-d"), (b"\x16", "ctrl-v"),
+                         (b"\x1b[200~one\nz\xc5\xbc\x1b[201~", ("paste", "one\nzż"))):
+            r, w = os.pipe()
+            self.addCleanup(os.close, r)
+            os.write(w, raw)
+            os.close(w)
+            with self.subTest(raw=raw):
+                self.assertEqual(tandem.read_key(r), key)
+
+    def test_console_redraws_the_line_around_a_log(self):
+        console = tandem.Console(fancy=False)
+        editor = self.editor()
+        console.attach(editor)
+        keys, seen = iter(["a", "b", "log", "look"]), []
+
+        def key():
+            k = next(keys)
+            if k == "log":  # a worker logs and the status ticks while the owner types
+                tandem.emit("a log line")
+                console.tick()
+                return "c"
+            if k == "look":
+                seen.append(screen(self.out.getvalue()))
+                return ""  # stdin closed: EOFError
+            return k
+
+        editor.next_key = key
+        progress = dict(turn=2, agent="codex", since=time.time() - 5)
+        with mock.patch.object(tandem, "CONSOLE", console), mock.patch.dict(tandem.PROGRESS, progress):
+            console.running = True
+            with self.assertRaises(EOFError):
+                console.ask("tandem> ")
+            self.assertNotIn("\x1b7", self.out.getvalue())  # never save/restore cursor
+            self.assertEqual(seen[0][-3:], ["a log line", "turn 2: Codex working... 0m05s", "tandem> abc"])
+            self.assertEqual(sum("working..." in r for r in seen[0]), 1)
+            tandem.emit("")  # what the session prints after Ctrl+C or Ctrl+D: it only ends the line
+            tandem.emit("after")
+        self.assertEqual(screen(self.out.getvalue())[-4:], ["a log line", "tandem> abc", "after", ""])
+
+    @unittest.skipUnless(os.name == "posix", "raw keys are POSIX")
+    def test_raw_mode_is_restored(self):
+        import pty
+        master, slave = pty.openpty()
+        self.addCleanup(os.close, master)
+        self.addCleanup(os.close, slave)
+        termios = tandem.termios
+
+        def attrs():
+            a = termios.tcgetattr(slave)
+            a[3] &= ~getattr(termios, "PENDIN", 0)
+            return a
+
+        before = attrs()
+        for failure in (None, KeyboardInterrupt, RuntimeError):
+            keys = iter(["a", failure or "enter"])
+
+            def key(fd):
+                lflag = termios.tcgetattr(fd)[3]
+                self.assertFalse(lflag & (termios.ICANON | termios.ECHO | termios.ISIG))
+                k = next(keys)
+                if not isinstance(k, str):
+                    raise k
+                return k
+
+            editor = tandem.LineEditor(slave, io.StringIO(), self.history)
+            with self.subTest(failure=failure), mock.patch.object(tandem, "read_key", key):
+                if failure is None:
+                    self.assertEqual(editor.read("> "), "a")
+                else:
+                    with self.assertRaises(failure):
+                        editor.read("> ")
+                self.assertEqual(attrs(), before)
+
+
 PNG = b"\x89PNG\r\n\x1a\n" + b"\0" * 16
 
 
@@ -1574,7 +1834,7 @@ class SessionProcess(unittest.TestCase):
         self.log = self.base / "agents.log"
         self.output = []
         self.env = dict(os.environ, PATH=f"{bin_dir}{os.pathsep}{os.environ['PATH']}", HOME=str(home),
-                        TANDEM_RUNS=str(self.runs), NO_COLOR="1", STUB_LOG=str(self.log),
+                        TANDEM_RUNS=str(self.runs), NO_COLOR="1", TERM="xterm-256color", STUB_LOG=str(self.log),
                         GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@example.com",
                         GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@example.com")
         self.env.pop("TANDEM_PROG", None)
@@ -1649,8 +1909,8 @@ class SessionProcess(unittest.TestCase):
             return False
         return True
 
-    def start_slow_turn(self):
-        self.start(STUB_TURN_SLEEP="60")
+    def start_slow_turn(self, **env):
+        self.start(STUB_TURN_SLEEP="60", **env)
         self.wait_for(lambda: "tandem> " in self.text(), "the prompt")
         self.type("make a file")
         self.wait_for(lambda: "claude start" in self.log_text(), "the agent starting")
@@ -1706,8 +1966,14 @@ class SessionProcess(unittest.TestCase):
         self.assertEqual(self.proc.wait(timeout=10), 0, self.text())
 
     def test_ctrl_v_puts_the_clipboard_image_in_the_goal(self):
+        self.check_ctrl_v()
+
+    def test_ctrl_v_with_readline_on_a_dumb_terminal(self):
+        self.check_ctrl_v(TERM="dumb")  # no line editor of our own: readline's completer does it
+
+    def check_ctrl_v(self, **env):
         argv_log = self.base / "argv.log"
-        self.start(STUB_ARGS=str(argv_log))
+        self.start(STUB_ARGS=str(argv_log), **env)
         self.wait_for(lambda: "tandem> " in self.text(), "the prompt")
         os.write(self.master, b"fix the layout in")
         os.write(self.master, b"\x16")
@@ -1753,6 +2019,88 @@ class SessionProcess(unittest.TestCase):
         self.wait_for(lambda: "/transcript" in self.text()[seen:], "the session answering")
         self.type("/quit")
         self.assertEqual(self.proc.wait(timeout=10), 0, self.text())
+
+    def screen_ends_with_prompt(self, text="tandem> "):
+        return lambda: screen(self.text())[-1] == text
+
+    def test_slash_menu_shows_descriptions(self):
+        self.start(NO_COLOR=None)
+        self.wait_for(lambda: "tandem> " in self.text(), "the prompt")
+        os.write(self.master, b"/m")
+        self.wait_for(lambda: "pick Claude and Codex model" in self.text(), "the menu")
+        rows = screen(self.text())
+        at = rows.index("tandem> /m")
+        self.assertRegex(rows[at + 1], r"/models +pick Claude and Codex model and effort")
+        self.assertIn("/campaign", rows[-2])  # it has an m too, after the names that start with one
+        self.assertIn("Esc close", rows[-1])
+        os.write(self.master, b"\r")  # Enter takes the highlighted command
+        self.wait_for(lambda: "Enter save" in self.text(), "the picker")
+        os.write(self.master, b"\x1b")
+        self.wait_for(lambda: "models unchanged" in self.text(), "the picker closing")
+        self.type("/quit")
+        self.assertEqual(self.proc.wait(timeout=10), 0, self.text())
+
+    def test_prompt_comes_back_after_the_picker(self):
+        # Owner report: after Esc in /models the next line had no prompt.
+        self.start(NO_COLOR=None)
+        self.wait_for(lambda: "tandem> " in self.text(), "the prompt")
+        self.type("/models")
+        self.wait_for(lambda: "Enter save" in self.text(), "the picker")
+        os.write(self.master, b"\x1b")
+        self.wait_for(lambda: "models unchanged" in self.text(), "the picker closing")
+        self.wait_for(self.screen_ends_with_prompt(), "a fresh prompt")
+        self.assertEqual(screen(self.text())[-2], "models unchanged")
+
+    def test_prompt_cannot_be_erased(self):
+        # Owner report: Backspace on macOS libedit erased `tandem> ` and it never came back after /board.
+        self.start()
+        self.wait_for(lambda: "tandem> " in self.text(), "the prompt")
+        for _ in range(5):
+            os.write(self.master, b"\x7f")
+        os.write(self.master, b"x")
+        self.wait_for(self.screen_ends_with_prompt("tandem> x"), "the prompt with x")
+        os.write(self.master, b"\x15")
+        self.type("/board")
+        self.wait_for(lambda: "no run yet" in self.text(), "the board's answer")
+        self.wait_for(self.screen_ends_with_prompt(), "a fresh prompt")
+
+    def test_empty_enter_during_a_turn_prints_nothing(self):
+        # Owner report (iTerm2): each empty Enter during a turn printed another status line and prompt.
+        self.start_slow_turn(NO_COLOR=None)
+        self.wait_for(lambda: "working..." in self.text(), "the status line")
+
+        def count():
+            rows = screen(self.text())
+            return sum("tandem> " in r for r in rows), sum(r.startswith("turn 1: ") for r in rows)
+
+        self.wait_for(lambda: count() == (2, 1), "the goal line, the status and the prompt")
+        for _ in range(3):
+            os.write(self.master, b"\r")
+            time.sleep(.2)
+        os.write(self.master, b"/status")
+        self.wait_for(lambda: any(r.startswith("tandem> /status") for r in screen(self.text())), "the typed command")
+        self.wait_for(lambda: count() == (2, 1), "no new prompt or status line", timeout=3)
+        os.write(self.master, b"\r")
+        self.wait_for(lambda: "outcome running" in self.text(), "the status answer")
+
+    def check_typing_survives_a_log_line(self, **env):
+        self.start(STUB_TURN_SLEEP="60", **env)
+        self.wait_for(lambda: "tandem> " in self.text(), "the prompt")
+        self.type("make a file")
+        self.wait_for(lambda: "claude start" in self.log_text(), "the agent starting")
+        self.wait_for(lambda: "working..." in self.text(), "the status line")
+        os.write(self.master, b"abc")
+        seen = len(self.text())
+        self.wait_for(lambda: self.text()[seen:].count("working...") >= 2, "the status ticking while typing")
+        os.write(self.master, b"\r")
+        self.wait_for(lambda: "a run is already going" in self.text(), "the typed line arriving")
+        self.assertIn("tandem> abc", [plain(r) for r in screen(self.text())])
+
+    def test_typing_survives_a_log_line(self):
+        self.check_typing_survives_a_log_line()
+
+    def test_typing_survives_a_log_line_in_color(self):
+        self.check_typing_survives_a_log_line(NO_COLOR=None)
 
     def test_sigterm_in_headless_mode_stops_the_agent(self):
         log = self.base / "headless.txt"

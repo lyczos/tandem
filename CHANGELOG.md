@@ -4,6 +4,9 @@
 
 - Each turn of an interactive session shows as a card, and `/board` summarizes what the agents agree
   on, what is open, the models and the cost. Plain output (pipes, `NO_COLOR`) keeps the one-line log.
+- The session's prompt has its own line editor: typing `/` shows the matching slash commands with
+  a short description under the prompt, and earlier lines come back with ↑ from `~/.tandem/history`.
+  Log lines and the status line no longer garble what is being typed, and an empty Enter prints nothing.
 - `/models` picks Claude and Codex model and effort with the arrow keys; a running run or campaign
   takes the choice from its next turn.
 - Add `--claude-effort`. Model and effort choices made with `/models` are saved in
