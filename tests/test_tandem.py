@@ -1705,9 +1705,9 @@ class Editor(unittest.TestCase):
                      "  /paste               attach the clipboard's image to your next goal or /say\n"
                      "                       (or drag image files onto the terminal; /paste clear drops them)",
                      "  /resume [TURNS]      continue the last run, optionally allowing TURNS more",
-                     "  /quit                leave (also Ctrl+D)"):
+                     "  /quit                leave (also Ctrl+D, or Ctrl+C twice)"):
             self.assertIn(line, help_text)
-        self.assertTrue(help_text.endswith("(also Ctrl+D)"))
+        self.assertTrue(help_text.endswith("(also Ctrl+D, or Ctrl+C twice)"))
 
     def test_display_width(self):
         for text, width in (("abc", 3), ("ż", 1), ("漢字", 4), ("é", 1), ("", 0)):
@@ -2136,7 +2136,7 @@ class Children(unittest.TestCase):
 
 
 STUB_AGENT = """\
-import json, os, pathlib, sys, time
+import json, os, pathlib, signal, sys, time
 name, args = pathlib.Path(sys.argv[0]).name, sys.argv[1:]
 if args[:2] in (["auth", "status"], ["login", "status"]):
     print(json.dumps({"loggedIn": True}))
@@ -2151,6 +2151,10 @@ if os.environ.get("STUB_ARGS"):
         f.write(json.dumps([name, args]) + "\\n")
 with open(os.environ["STUB_LOG"], "a") as f:
     f.write(f"{name} start {os.getpid()}\\n")
+if os.environ.get("STUB_TOUCH"):
+    pathlib.Path(os.environ["STUB_TOUCH"]).write_text("half done")
+if os.environ.get("STUB_TERM_DELAY"):  # slow to stop, like a CLI cleaning up
+    signal.signal(signal.SIGTERM, lambda *a: (time.sleep(float(os.environ["STUB_TERM_DELAY"])), sys.exit(143)))
 time.sleep(float(os.environ.get("STUB_TURN_SLEEP", "0")))
 with open(os.environ["STUB_LOG"], "a") as f:
     f.write(f"{name} end\\n")
@@ -2160,6 +2164,12 @@ if name == "codex":
 else:
     print(json.dumps({"structured_output": reply, "total_cost_usd": 0}))
 """
+
+
+# Starts the command in a new session with the pty on stdin as its controlling terminal, as a shell's
+# job would have it: Ctrl+C typed while the session is not reading keys then arrives as SIGINT.
+WITH_TERMINAL = ("import fcntl, os, sys, termios\nos.setsid()\nfcntl.ioctl(0, termios.TIOCSCTTY, 0)\n"
+                 "os.execv(sys.executable, [sys.executable] + sys.argv[1:])\n")
 
 
 @unittest.skipUnless(os.name == "posix", "the session's signal handling is POSIX")
@@ -2199,10 +2209,10 @@ class SessionProcess(unittest.TestCase):
         master, slave = pty.openpty()
         self.output, lock = [], threading.Lock()
         # Its own session, as a terminal's job would be: signals to its group are the terminal's.
-        self.proc = subprocess.Popen([sys.executable, "-B", str(ROOT / "tandem.py"), "--repo", str(self.repo), *args],
+        self.proc = subprocess.Popen([sys.executable, "-c", WITH_TERMINAL, "-B", str(ROOT / "tandem.py"),
+                                      "--repo", str(self.repo), *args],
                                      stdin=slave, stdout=slave, stderr=slave, cwd=self.repo,
-                                     env={k: v for k, v in dict(self.env, **env).items() if v is not None},
-                                     start_new_session=True)
+                                     env={k: v for k, v in dict(self.env, **env).items() if v is not None})
         os.close(slave)
 
         def read():
@@ -2219,13 +2229,13 @@ class SessionProcess(unittest.TestCase):
         reader = threading.Thread(target=read, daemon=True)
         reader.start()
 
-        def cleanup():
+        def cleanup(proc=self.proc):  # this session's process: a test may start several
             for pid in self.agent_pids():
                 with contextlib.suppress(ProcessLookupError):
                     os.kill(pid, signal.SIGKILL)
-            if self.proc.poll() is None:
-                os.killpg(self.proc.pid, signal.SIGKILL)
-            self.proc.wait()
+            if proc.poll() is None:
+                os.killpg(proc.pid, signal.SIGKILL)
+            proc.wait()
             os.close(master)
 
         self.addCleanup(cleanup)
@@ -2298,6 +2308,7 @@ class SessionProcess(unittest.TestCase):
         self.type("make a file")
         self.wait_for(started.exists, "the check starting")
         os.killpg(self.proc.pid, signal.SIGINT)
+        self.wait_for(lambda: "press Ctrl+C again to exit" in self.text(), "the exit hint")
         self.wait_for(lambda: "FINISHED" in self.text(), "the run finishing")
         self.assertTrue(done.exists())
         self.assertEqual((self.state()["outcome"], self.state()["turn"]), ("done", 3))
@@ -2315,6 +2326,101 @@ class SessionProcess(unittest.TestCase):
         self.wait_for(lambda: "/transcript" in self.text(), "the session answering")
         self.type("/quit")
         self.assertEqual(self.proc.wait(timeout=10), 0, self.text())
+
+    def hints(self):
+        return self.text().count("press Ctrl+C again to exit")
+
+    def ctrl_c_at_the_prompt(self):
+        """Ctrl+C as a key, once the prompt is drawn, so it reaches the line editor and not the terminal."""
+        self.wait_for(self.screen_ends_with_prompt(), "the prompt")
+        os.write(self.master, b"\x03")
+
+    def test_double_ctrl_c_on_empty_line_exits(self):
+        self.start()
+        self.ctrl_c_at_the_prompt()
+        self.wait_for(lambda: self.hints() == 1, "the exit hint")
+        self.ctrl_c_at_the_prompt()
+        self.assertEqual(self.proc.wait(timeout=5), 0, self.text())
+        self.assertNotIn("Traceback", self.text())
+
+    def test_single_ctrl_c_clears_and_waits(self):
+        self.start()
+        self.wait_for(self.screen_ends_with_prompt(), "the prompt")
+        os.write(self.master, b"abc")
+        self.wait_for(self.screen_ends_with_prompt("tandem> abc"), "the typed text")
+        os.write(self.master, b"\x03")  # clears the line, asks nothing
+        self.wait_for(self.screen_ends_with_prompt(), "the empty prompt")
+        self.assertEqual(self.hints(), 0)
+        self.ctrl_c_at_the_prompt()   # so this one, on the empty line, only asks
+        self.wait_for(lambda: self.hints() == 1, "the exit hint")
+        time.sleep(2.5)                # past the window
+        self.ctrl_c_at_the_prompt()
+        self.wait_for(lambda: self.hints() == 2, "the exit hint again")
+        self.wait_for(self.screen_ends_with_prompt(), "the prompt")
+        os.write(self.master, b"x\x7f\x03")  # a key in between disarms it too
+        self.wait_for(lambda: self.hints() == 3, "the exit hint a third time")
+        self.assertIsNone(self.proc.poll(), self.text())
+        self.type("/quit")
+        self.assertEqual(self.proc.wait(timeout=10), 0, self.text())
+
+    def test_repeated_ctrl_c_while_quitting_exits_cleanly(self):
+        # Owner report: a second Ctrl+C while /quit waited killed tandem by SIGINT.
+        agent = self.start_slow_turn(STUB_TERM_DELAY="1")
+        self.type("/quit")
+        self.wait_for(lambda: "waiting for the current turn" in self.text(), "the quit wait")
+        presses = 0
+        while self.proc.poll() is None and presses < 100:  # on through the way out, not just the wait
+            with contextlib.suppress(OSError):  # the session may have gone since the check
+                os.write(self.master, b"\x03")  # the terminal turns each into a SIGINT now
+            presses += 1
+            time.sleep(.1)
+        self.assertGreaterEqual(presses, 3)
+        self.assertEqual(self.proc.wait(timeout=20), 0, self.text())
+        self.assertNotIn("Traceback", self.text())
+        self.assertNotIn("continue with resume", self.text())  # main's own KeyboardInterrupt message
+        self.assertFalse(self.alive(agent))
+        self.assertEqual(self.text().count("stopping the agent"), 1)
+
+    def run_dirs(self):
+        return [d for d in self.runs.iterdir() if d.is_dir()] if self.runs.exists() else []
+
+    def test_exit_word_leaves(self):
+        # Owner report: typing `exit` started a run whose goal was "exit".
+        for word in ("exit", "quit", " Q "):
+            with self.subTest(word=word):
+                self.start()
+                self.wait_for(self.screen_ends_with_prompt(), "the prompt")
+                self.type(word)
+                self.assertEqual(self.proc.wait(timeout=10), 0, self.text())
+                self.assertEqual(self.run_dirs(), [])
+        self.start()
+        self.wait_for(self.screen_ends_with_prompt(), "the prompt")
+        self.type("exit now please")
+        self.wait_for(lambda: "FINISHED" in self.text(), "the run finishing")
+        self.assertEqual(self.state()["goal"], "exit now please")
+        self.type("/quit")
+        self.assertEqual(self.proc.wait(timeout=10), 0, self.text())
+
+    def test_double_ctrl_c_during_a_turn_keeps_the_edits(self):
+        agent = self.start_slow_turn(STUB_TOUCH="half.txt")
+        self.wait_for(self.run_dirs, "the run")
+        self.wait_for(self.screen_ends_with_prompt(), "the prompt during the turn")
+        os.write(self.master, b"\x03\x03")
+        self.assertEqual(self.proc.wait(timeout=20), 0, self.text())
+        self.assertFalse(self.alive(agent))
+        self.assertNotIn("claude end", self.log_text())
+        state = self.state()
+        last = state["history"][-1]
+        self.assertEqual(last["status"], "interrupted")
+        self.assertEqual(state["failures"], {"claude": 0, "codex": 0})
+        self.assertEqual(state["outcome"], "stopped")
+        run = self.run_dirs()[0]
+        budget = int(re.search(r"Turn 1 of at most (\d+)", (run / "turn-01-claude.prompt.md").read_text()).group(1))
+        self.assertEqual(state["max_turns"], budget + 1)  # no turn used up
+        self.assertIn("half.txt", tandem.git(self.repo, "show", "--name-only", "--format=%s", last["commit"]))
+        self.assertIn("stopped the current turn; its edits are kept. /resume or `tandem resume` continues",
+                      self.text())
+        self.assertNotIn("Traceback", self.text())
 
     def test_ctrl_v_puts_the_clipboard_image_in_the_goal(self):
         self.check_ctrl_v()

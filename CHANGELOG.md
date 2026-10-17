@@ -2,9 +2,14 @@
 
 ## 0.1.0
 
+- Ctrl+C twice on an empty prompt leaves the session, as in Claude Code; a turn in flight is
+  stopped and recorded as interrupted, with its edits committed. `exit`, `quit` or `q` alone on
+  the line leaves like `/quit` instead of starting a run with that goal. Further Ctrl+C presses
+  while `/quit` waits no longer kill tandem, and the terminal's settings are put back on the way out.
 - Step in during a turn: plain text typed while a run is going is saved for the next turn, and
   `y` to the question that follows stops the turn, keeps its edits in a commit and hands the same
-  agent your correction. `/now TEXT` does it without the question. Interrupted turns show as
+  agent your correction; any other answer than `n` or Enter is saved as more of the correction.
+  `/now TEXT` does it without the question. Interrupted turns show as
   `interrupted` and neither count as a failure nor use up a turn.
 - Each turn of an interactive session shows as a card, and `/board` summarizes what the agents agree
   on, what is open, the models and the cost. Plain output (pipes, `NO_COLOR`) keeps the one-line log.

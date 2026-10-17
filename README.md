@@ -172,14 +172,20 @@ terminal the session uses Python's `input()` with readline instead, without the 
 - `/stop` stops after the current turn; `/resume [TURNS]` continues the last run (in a new
   session, the latest run in this repo)
 - `/goal FILE` starts a run from a goal file; `/campaign ARGS...` is `tandem campaign ARGS...`
-- `/quit` or Ctrl+D leaves after the current turn finishes
+- `/quit`, Ctrl+D, or `exit`, `quit` or `q` alone on the line leaves after the current turn finishes;
+  Ctrl+C twice leaves at once (see below)
 
 Only one run or campaign runs in a session at a time. `/goal FILE` or `/resume` while it is busy
-leaves the current run and any pending `/stop` unchanged. Ctrl+C at the prompt clears the line
-and during a slow command (such as `/doctor`) cancels that command; neither touches the run.
+leaves the current run and any pending `/stop` unchanged. Ctrl+C works as in Claude Code: on a
+line with text it clears the line; on an empty line it says `press Ctrl+C again to exit`, and a
+second Ctrl+C within two seconds leaves. If a turn is running then, its agent is stopped and the
+turn is recorded as interrupted, with its edits committed; it is not a failure and does not use up
+a turn, and `/resume` or `tandem resume` continues from there. During a slow command (such as
+`/doctor`) Ctrl+C cancels that command and leaves the run alone.
 While `/quit` waits for the turn to finish, Ctrl+C stops the agent instead: the turn is recorded
-as failed and `/resume` or `tandem resume` continues from there. Closing the terminal or sending
-the session SIGTERM does the same without asking, so no agent keeps working unsupervised.
+as failed and `/resume` or `tandem resume` continues from there; more presses change nothing.
+Closing the terminal or sending the session SIGTERM does the same without asking, so no agent
+keeps working unsupervised.
 
 ### Correcting a turn in progress
 

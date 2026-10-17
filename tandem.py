@@ -1638,7 +1638,7 @@ SLASH = [
     ("runs", "", "recent runs and campaigns"),
     ("transcript", "", "print the transcript path"),
     ("doctor", "", "check tools and logins"),
-    ("quit", "", "leave (also Ctrl+D)"),
+    ("quit", "", "leave (also Ctrl+D, or Ctrl+C twice)"),
 ]
 SLASH_COMMANDS = [name for name, _, _ in SLASH]
 # /help has room for more than one menu line.
@@ -2090,6 +2090,8 @@ def models_line(values):
 MENU_SIZE = 8
 MENU_HINT = "↑↓ select · Tab complete · Enter run · Esc close"
 HISTORY_SIZE = 500
+EXIT_ARM_SECONDS = 2  # a second Ctrl+C on an empty prompt within this many seconds leaves, as in Claude Code
+EXIT_WORDS = ("exit", "quit", "q")  # typed alone, they leave like /quit instead of becoming a goal
 NAMED_KEYS = set(KEYS.values())
 
 
@@ -2145,6 +2147,7 @@ class LineEditor:
         self.prompt, self.buffer, self.cursor, self.scroll = "", "", 0, 0
         self.selected, self.menu_closed = 0, False
         self.reading = False
+        self.touched = False   # a key other than Ctrl+C came during the last read
         self.mid_line = False  # the last read left its line without a newline (Ctrl+C, Ctrl+D)
         self.kept = False      # the last read was an empty Enter: its rows are still on screen, as drawn
         self.above = 0         # rows drawn above the prompt row, where the cursor is
@@ -2200,10 +2203,11 @@ class LineEditor:
                 fresh = "\n" if self.mid_line else ""
                 if not self.kept:
                     self.above = 0
-                self.mid_line, self.kept, self.reading = False, False, True
+                self.mid_line, self.kept, self.reading, self.touched = False, False, True, False
                 self.write(fresh + "\x1b[?2004h" + self.redraw())
             while line is None:
                 key = self.next_key()
+                self.touched = self.touched or key != "ctrl-c"
                 if key == "ctrl-v":
                     key = ("image", self.paste())  # outside OUT_LOCK: the clipboard tool may take seconds
                 with OUT_LOCK:
@@ -2433,6 +2437,13 @@ class Console:
                 for text in lines:
                     self.write(text)
 
+    def interrupted_line(self):
+        """After Ctrl+C at the prompt: (the line had text, a key was pressed before Ctrl+C)."""
+        if self.editor:
+            return bool(self.editor.buffer), self.editor.touched
+        text = bool(self._buffer())  # readline does not tell keys from text, and libedit gives no text
+        return text, text
+
     def tick(self):
         """Redraw the status line in place, without moving the cursor the user is typing at."""
         with OUT_LOCK:
@@ -2512,12 +2523,22 @@ class Session:
         self.thread = threading.Thread(target=work, daemon=True)
         self.thread.start()
 
-    def wait_for_worker(self, forced, pause):
-        """Before leaving, let the turn in flight end; a signal, or Ctrl+C here, stops the agent instead."""
+    def wait_for_worker(self, forced, pause, pressed, interrupt=False):
+        """Before leaving, let the turn in flight end; a signal, or Ctrl+C here, stops the agent instead.
+
+        pressed collects the Ctrl+C presses noted while waiting. interrupt (Ctrl+C twice at the prompt)
+        stops the agent at once and records its turn as interrupted, not failed."""
         if not self.busy():
             return
-        if CURRENT.get("target"):
-            (CURRENT["target"] / "STOP").write_text(now())
+        target = CURRENT.get("target")
+        if target:
+            (target / "STOP").write_text(now())
+        if interrupt:
+            # After STOP: once the loop has recorded the interrupted turn it must stop, not start the next.
+            run, camp = self.current_run(target) if target else (None, None)
+            if run and (camp is None or camp.get("current")):
+                interrupt_turn(run, quiet=True)
+            forced = True
         if not forced:
             emit("waiting for the current turn to end; Ctrl+C stops the agent now (the turn is recorded as failed)")
         stopped_at = None
@@ -2527,11 +2548,10 @@ class Session:
                 stopped_at = time.monotonic()
             try:
                 pause(0.1)
-            except KeyboardInterrupt:
-                if stopped_at is None:
-                    emit("stopping the agent")
-                    forced = True
             except SessionEnd:
+                forced = True
+            if pressed and not forced:
+                emit("stopping the agent")
                 forced = True
             if stopped_at is not None and time.monotonic() - stopped_at > KILL_GRACE:
                 signal_children(hard=True)
@@ -2907,6 +2927,8 @@ def cmd_interactive(args):
 
     if console.fancy or console.editor:
         threading.Thread(target=ticker, daemon=True).start()
+    armed = None        # when a Ctrl+C on the empty prompt asked for a second one
+    by_ctrl_c = False   # left by Ctrl+C twice: the turn in flight is stopped, not waited for
     try:
         while True:
             try:
@@ -2915,8 +2937,21 @@ def cmd_interactive(args):
                 emit("")
                 break
             except KeyboardInterrupt:
-                emit("")  # Ctrl+C at the prompt clears the line; /quit or Ctrl+D leaves
+                text, touched = console.interrupted_line()
+                if armed is not None and not touched and time.monotonic() - armed <= EXIT_ARM_SECONDS:
+                    emit("")
+                    by_ctrl_c = True
+                    break
+                armed = None
+                if text:
+                    emit("")  # Ctrl+C on a line with text clears it, nothing more
+                    continue
+                armed = time.monotonic()
+                emit("press Ctrl+C again to exit")
                 continue
+            armed = None
+            if line.strip().lower() in EXIT_WORDS:
+                break  # owner report: typing `exit` started a run whose goal was "exit"
             try:
                 line, dropped = take_dropped_images(session.expand_inline(line))
                 session.attach(dropped)
@@ -2929,16 +2964,28 @@ def cmd_interactive(args):
                     break
             except KeyboardInterrupt:
                 emit("interrupted")  # Ctrl+C cancels a slow command, never the session or its run
+    except KeyboardInterrupt:
+        # Ctrl+C as a signal while the one before it was still being handled, between two reads of
+        # the prompt: the second press of a pair.
+        by_ctrl_c = True
     except SessionEnd:
         pass
     finally:
+        # From here a Ctrl+C is only noted: raised as KeyboardInterrupt, a second press could land
+        # anywhere on the way out and kill tandem by SIGINT halfway through (owner report). Left in
+        # place to the end of the process for the same reason.
+        pressed = []
+        signal.signal(signal.SIGINT, lambda signum, frame: pressed.append(signum))
         session.quitting = True
+        stopped_turn = by_ctrl_c and session.busy()
         # A detached agent left running would keep editing the worktree, and a later resume could
         # start a second agent there. Event waits also avoid interrupting Thread.join on 3.9.
         try:
-            session.wait_for_worker(bool(ended_by), ticker_stop.wait)
+            session.wait_for_worker(bool(ended_by), ticker_stop.wait, pressed, interrupt=by_ctrl_c)
         except SessionEnd:
-            session.wait_for_worker(True, ticker_stop.wait)
+            session.wait_for_worker(True, ticker_stop.wait, pressed)
+        if stopped_turn:
+            emit("stopped the current turn; its edits are kept. /resume or `tandem resume` continues")
         ticker_stop.set()
         CONSOLE = None
         CHILD_POPEN.clear()
