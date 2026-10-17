@@ -148,13 +148,14 @@ CHILDREN_LOCK = threading.Lock()
 KILL_GRACE = 5  # seconds between asking those processes to stop and killing them
 
 
-def run_child(cmd, input=None, timeout=None, **kwargs):
+def run_child(cmd, input=None, timeout=None, kind="agent", **kwargs):
     """subprocess.run for the long calls (agents, the check), tracked in CHILDREN while they run."""
     with subprocess.Popen(cmd, stdin=subprocess.PIPE if input is not None else subprocess.DEVNULL,
                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                           **CHILD_POPEN, **kwargs) as proc:
         # In its own session the process leads a group, and killing the group takes its tools along.
         proc.tandem_group = bool(CHILD_POPEN.get("start_new_session")) and hasattr(os, "killpg")
+        proc.tandem_kind = kind
         with CHILDREN_LOCK:
             CHILDREN.add(proc)
         try:
@@ -183,10 +184,14 @@ def signal_child(proc, hard=False):
         pass
 
 
-def signal_children(hard=False):
-    """Stop every tracked agent and check; returns how many there were."""
+def tracked(kind=None):
     with CHILDREN_LOCK:
-        procs = list(CHILDREN)
+        return [p for p in CHILDREN if kind is None or p.tandem_kind == kind]
+
+
+def signal_children(hard=False, kind=None, procs=None):
+    """Stop every tracked agent and check (or only those of one kind, or only procs); returns how many."""
+    procs = tracked(kind) if procs is None else procs
     for proc in procs:
         signal_child(proc, hard)
     return len(procs)
@@ -296,12 +301,26 @@ def wait_until(when, stop_file=None):
     return True
 
 
-def call_agent(agent, cfg, worktree, prompt, out_base, schema, key, readonly, stop_file=None):
+class TurnInterrupted(RuntimeError):
+    """The owner stopped the turn to hand the agent a correction."""
+
+
+def interrupted(run_dir):
+    return bool(run_dir) and (pathlib.Path(run_dir) / "INTERRUPT").exists()
+
+
+def call_agent(agent, cfg, worktree, prompt, out_base, schema, key, readonly, stop_file=None, run_dir=None):
     """Run one agent call, retrying network hiccups; a usage limit pauses the agent and re-raises."""
     for attempt in range(MAX_TRANSIENT_RETRIES + 1):
+        if attempt and interrupted(run_dir):
+            raise TurnInterrupted("interrupted by the owner")
         try:
             return RUNNERS[agent](cfg, worktree, prompt, out_base, schema, key, readonly)
         except RuntimeError as e:
+            # Stopping the agent makes it exit like a crash; that must not count as a failure or a
+            # network hiccup worth waiting for.
+            if interrupted(run_dir):
+                raise TurnInterrupted("interrupted by the owner") from e
             kind = classify(str(e))
             if kind == "limit":
                 mark_unavailable(agent, parse_reset(str(e)))
@@ -387,7 +406,8 @@ def render_history(history):
     for h in older:
         lines.append(f"- Turn {h['turn']} {NAMES[h['agent']]} ({h['status']}): {h['summary']}")
     for h in recent:
-        head = f"### Turn {h['turn']} - {NAMES[h['agent']]} - {h['status']}"
+        owner = h["status"] == "interrupted"
+        head = f"### Turn {h['turn']} - {NAMES[h['agent']]} - {h['summary'] if owner else h['status']}"
         if h.get("commit"):
             head += f" - commit {h['commit']}"
         lines.append(head)
@@ -395,7 +415,7 @@ def render_history(history):
             lines.append(f"The agent failed: {h['error']}")
         for key, label in (("summary", "Summary"), ("could_not_do", "Could not do"),
                            ("checks", "Checks"), ("handoff", "Handoff")):
-            if h.get(key):
+            if h.get(key) and not (owner and key == "summary"):
                 lines.append(f"{label}: {h[key]}")
         lines.append("")
     return "\n".join(lines)
@@ -404,7 +424,7 @@ def render_history(history):
 # ---------- turn cards and the board ----------
 
 AGENT_COLORS = {"claude": 208, "codex": 75}  # the banner logo's two ends
-STATUS_COLORS = {"continue": "36", "done": "32", "blocked": "33", "error": "31"}
+STATUS_COLORS = {"continue": "36", "done": "32", "blocked": "33", "error": "31", "interrupted": "35"}
 CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 MIN_CARD_WIDTH = 20  # the narrowest box that still closes with a title and a few words
 
@@ -575,11 +595,23 @@ def build_prompt(state, agent, human_msgs, check_feedback):
                      f"in the next; do not keep taking turns just to wait. Record anything that still needs an independent "
                      f"review in the repository (an open item in the relevant README or review notes), so the next "
                      f"goal picks it up.\n")
+    human = owner_block(state.get("owner_messages", []), bool(human_msgs))
+    last = state["history"][-1] if state["history"] else None
+    if last and last["status"] == "interrupted" and last["agent"] == agent:
+        edits = f"its partial edits are in commit {last['commit']}" if last.get("commit") else "it changed nothing"
+        # Only a message read for this turn came with the interruption; an older one above is not
+        # what the owner stopped the turn for (Ctrl+C leaving the session stops it with none).
+        if human_msgs:
+            human += (f"\nYour previous turn was interrupted by the owner; {edits}. Check them against the "
+                      f"message above before you go on.\n")
+        else:
+            human += (f"\nYour previous turn was interrupted by the owner without a message; {edits}. "
+                      f"Check them before you go on.\n")
     return TURN_PROMPT.read_text().format(
         me=NAMES[agent], other=NAMES[OTHER[agent]], goal=state["goal"].strip(),
         turn=state["turn"], max_turns=state["max_turns"], branch=state["branch"],
         base=state["base"][:10], log=commits, transcript=render_history(state["history"]),
-        human=owner_block(state.get("owner_messages", []), bool(human_msgs)), check_feedback=feedback,
+        human=human, check_feedback=feedback,
     )
 
 
@@ -696,7 +728,7 @@ def run_check(state):
     cmd = state["config"].get("check")
     if not cmd:
         return True, ""
-    proc = run_child(cmd, shell=True, cwd=state["worktree"], timeout=state["config"]["timeout"])
+    proc = run_child(cmd, shell=True, cwd=state["worktree"], timeout=state["config"]["timeout"], kind="check")
     return proc.returncode == 0, tail(proc.stdout + proc.stderr, 2000)
 
 
@@ -715,6 +747,33 @@ def take_inbox(paths):
                 msgs.append(text)
                 p.write_text("")
     return "\n\n".join(msgs)
+
+
+def interrupt_turn(run_dir, quiet=False):
+    """Stop the agent working on run_dir now; loop records the turn as interrupted, not failed.
+
+    Callable at any time. Only agents are stopped, never the check: the turn it checks has already
+    ended, so it finishes and the next turn reads the owner's message.
+    """
+    procs = [p for p in tracked("agent") if p.returncode is None]
+    if not procs:
+        # No flag then: nothing would handle it, and a real error later in the turn (a usage limit)
+        # would pass for an interruption.
+        if not quiet:
+            emit("no agent is working right now; the next turn reads it")
+        return
+    flag = pathlib.Path(run_dir) / "INTERRUPT"
+    flag.write_text(now())  # before the signal: the agent's exit must already read as interrupted
+    signal_children(procs=procs)
+    if not quiet:
+        emit("stopping the turn; its edits are kept and the same agent goes on with your message")
+
+    def insist():
+        # Only the agents stopped here: by now a planner or the next goal's agent may be running.
+        signal_children(hard=True, procs=procs)
+    timer = threading.Timer(KILL_GRACE, insist)
+    timer.daemon = True
+    timer.start()
 
 
 def stop_requested(state):
@@ -775,6 +834,9 @@ def loop(run_dir):
         if changes:
             save(run_dir, state)
 
+        # Cleared before the inbox is read: an interruption from a crash, or one that arrived while
+        # nothing could be stopped (the check), must not kill this turn; its message is read now.
+        (run_dir / "INTERRUPT").unlink(missing_ok=True)
         human = take_inbox(inboxes)
         if human:
             state.setdefault("owner_messages", []).append({"at": now(), "text": human})
@@ -792,7 +854,7 @@ def loop(run_dir):
         entry = {"turn": turn, "agent": agent, "started": now()}
         try:
             result, cost = call_agent(agent, cfg, state["worktree"], prompt, out_base, TURN_SCHEMA, "status",
-                                      False, state.get("stop_file"))
+                                      False, state.get("stop_file"), run_dir)
             if not result:
                 raise RuntimeError("no structured result in the agent's reply")
             entry.update({k: str(result.get(k, "")).strip() for k in
@@ -800,26 +862,36 @@ def loop(run_dir):
             state["cost_usd"] += cost
             state["failures"][agent] = 0
         except (RuntimeError, subprocess.TimeoutExpired, FileNotFoundError) as e:
-            err = f"timed out after {cfg['timeout']}s" if isinstance(e, subprocess.TimeoutExpired) else str(e)
-            limited = unavailable_until(agent)
-            if limited:
-                handoff = (f"{NAMES[agent]} hit its usage limit and is out until {limited:%H:%M}. "
-                           f"Work alone until then; you may finish the goal alone if the check passes.")
+            if isinstance(e, TurnInterrupted) or interrupted(run_dir):
+                # The owner's call, not the agent's failure, and not a turn of the budget: the same
+                # agent goes on with the correction and its partial edits.
+                state["max_turns"] += 1
+                entry.update({"status": "interrupted", "summary": "interrupted by the owner", "handoff": ""})
             else:
-                state["failures"][agent] += 1
-                handoff = f"{NAMES[agent]} failed this turn; continue the goal yourself."
-            entry.update({"status": "error", "error": err, "summary": "", "handoff": handoff})
+                err = f"timed out after {cfg['timeout']}s" if isinstance(e, subprocess.TimeoutExpired) else str(e)
+                limited = unavailable_until(agent)
+                if limited:
+                    handoff = (f"{NAMES[agent]} hit its usage limit and is out until {limited:%H:%M}. "
+                               f"Work alone until then; you may finish the goal alone if the check passes.")
+                else:
+                    state["failures"][agent] += 1
+                    handoff = f"{NAMES[agent]} failed this turn; continue the goal yourself."
+                entry.update({"status": "error", "error": err, "summary": "", "handoff": handoff})
         entry["seconds"] = round(time.time() - started)
         entry["commit"] = commit_turn(state, agent, turn, entry.get("summary") or entry.get("error"),
                                       entry["status"] == "error")
         state["history"].append(entry)
         state["turn"] += 1
-        if reviewer_mode(cfg) and entry["status"] != "error":
+        if entry["status"] == "interrupted":
+            state["next"] = agent
+        elif reviewer_mode(cfg) and entry["status"] != "error":
             # Claude builds until it says done; then Codex reviews; findings go back to Claude.
             state["next"] = ("codex" if entry["status"] == "done" else "claude") if agent == "claude" else "claude"
         else:
             state["next"] = OTHER[agent]
         save(run_dir, state)
+        if entry["status"] == "interrupted":
+            (run_dir / "INTERRUPT").unlink(missing_ok=True)
 
         append_transcript(run_dir, render_history([entry]) + f"_{entry['seconds']}s_\n")
         report_turn(entry)
@@ -1274,15 +1346,18 @@ def cmd_resume(args):
     loop(run_dir)
 
 
-def cmd_say(args):
-    target = run_path(args.run)
+def leave_message(target, message):
     with INBOX_LOCK:
         with open(target / "inbox.md", "a") as f:
-            f.write(args.message.strip() + "\n\n")
+            f.write(message.strip() + "\n\n")
         if (target / "campaign.json").exists():
             # The next turn consumes the inbox; the planner keeps reading notes.md for every later goal.
             with open(target / "notes.md", "a") as f:
-                f.write(f"- ({now()}) {args.message.strip()}\n")
+                f.write(f"- ({now()}) {message.strip()}\n")
+
+
+def cmd_say(args):
+    leave_message(run_path(args.run), args.message)
     emit("queued for the next turn")
 
 
@@ -1556,6 +1631,7 @@ SLASH = [
     ("say", "TEXT", "leave a message the next turn reads"),
     ("paste", "", "attach the clipboard's image to your next goal or /say"),
     ("stop", "", "stop after the current turn"),
+    ("now", "TEXT", "stop the current turn and hand it your message"),
     ("resume", "[TURNS]", "continue the last run, optionally allowing TURNS more"),
     ("goal", "FILE", "start a run from a goal file"),
     ("campaign", "ARGS...", "same as `tandem campaign ARGS...` (start, resume, stop, status, say)"),
@@ -1571,7 +1647,7 @@ HELP_MORE = {"models": " (saved as the default;\na running run takes it from its
 
 
 def slash_help():
-    lines = ["type a goal to start a run in this repo; while it runs, type /say to talk to the agents"]
+    lines = ["type a goal to start a run in this repo; while it runs, type a correction to step in"]
     for name, args, text in SLASH:
         if name == "paste":
             lines.append(f"  {'Ctrl+V':<21}paste the clipboard's image into the line as [image #N]")
@@ -2108,11 +2184,15 @@ class LineEditor:
         """More keys already waiting (typed fast, or a paste without brackets): draw once after them."""
         return self.keys is None and bool(select.select([self.fd], [], [], 0)[0])
 
-    def read(self, prompt):
+    def read(self, prompt, history=True):
         """One line, like input(): EOFError on Ctrl+D on an empty line, KeyboardInterrupt on Ctrl+C."""
-        saved = raw_keys(self.fd) if self.keys is None else None
+        # Saved outside the try and changed inside it, as in run_picker: a SIGINT landing right after
+        # the switch to raw mode must still put the owner's terminal back.
+        saved = termios.tcgetattr(self.fd) if self.keys is None else None
         line = None
         try:
+            if saved is not None:
+                raw_keys(self.fd)
             with OUT_LOCK:
                 self.prompt, self.buffer, self.cursor, self.scroll = prompt, "", 0, 0
                 self.selected, self.menu_closed = 0, False
@@ -2145,7 +2225,8 @@ class LineEditor:
             if saved is not None:
                 with contextlib.suppress(OSError, termios.error):
                     termios.tcsetattr(self.fd, termios.TCSADRAIN, saved)
-        self.remember(line)
+        if history:
+            self.remember(line)
         return line
 
     def matches(self):
@@ -2362,10 +2443,10 @@ class Console:
                 sys.stdout.write("\x1b7\x1b[1A\r\x1b[K" + self.status_text() + "\x1b8")
                 sys.stdout.flush()
 
-    def ask(self, prompt):
+    def ask(self, prompt, history=True):
         if self.editor:
             self.prompt = prompt
-            return self.editor.read(prompt)
+            return self.editor.read(prompt, history)
         # Print the prompt under the same lock as logs. input(prompt) prints outside Python's
         # lock, and macOS libedit does not call readline's pre-input hook to release it safely.
         # input() still provides line editing; history redraws may omit the prefix until a log.
@@ -2524,6 +2605,44 @@ class Session:
             except (ValueError, OSError) as exc:
                 emit(str(exc))
 
+    def typed(self, text):
+        """A plain line: a goal when nothing runs, a correction to the run when one does."""
+        if not self.busy():
+            return self.start_goal(text)
+        target = self.target()
+        if target:
+            self.correct(target, text, ask=True)
+
+    def correct(self, target, text, ask):
+        """Save the message first, so nothing the owner answers next (or a crash) can lose it."""
+        if not self.guarded(lambda _: leave_message(target, self.with_images(text)), None):
+            return
+        self.images.clear()
+        emit("\u2713 saved for the next turn")
+        if not self.busy():
+            return emit("no turn is running; the next turn reads it")
+        if ask:
+            # The worker keeps going while the owner decides, so the turn asked about may end meanwhile.
+            since = PROGRESS.get("since")
+            try:
+                # A y/N answer is not worth recalling with the up arrow.
+                answer = self.console.ask("  stop the current turn now and hand it over? its edits are kept [y/N] ",
+                                          history=False)
+            except (KeyboardInterrupt, EOFError):
+                answer = ""
+            answer = answer.strip()
+            if answer.lower() not in ("y", "yes", "t", "tak"):
+                if answer.lower() not in ("", "n", "no", "nie"):
+                    # More of the correction, typed where the question was: kept, never dropped.
+                    self.guarded(lambda _: leave_message(target, answer), None)
+                return emit("the next turn reads it")
+            if PROGRESS.get("since") != since:
+                return emit("that turn has ended; the next turn reads it")
+        run, camp = self.current_run(target)
+        if not run or (camp is not None and not camp.get("current")):
+            return emit("nothing to interrupt; the next goal reads it")
+        self.guarded(lambda _: interrupt_turn(run), None)
+
     def start_goal(self, text=None, goal_file=None):
         # Refuse before creating files or changing CURRENT: /say and /stop must keep targeting
         # the live run even when the user accidentally types another goal.
@@ -2598,6 +2717,11 @@ class Session:
                     emit("usage: /say TEXT")
                 elif self.guarded(cmd_say, argparse.Namespace(run=str(target), message=self.with_images(rest))):
                     self.images.clear()
+            elif name == "now":
+                if not rest and not self.images:
+                    emit("usage: /now TEXT")
+                else:
+                    self.correct(target, rest, ask=False)
             elif name == "status":
                 fn = cmd_campaign_status if (target / "campaign.json").exists() else cmd_status
                 self.guarded(fn, argparse.Namespace(run=str(target), dir=str(target)))
@@ -2751,6 +2875,12 @@ def cmd_interactive(args):
         bind_paste_key(session.complete)
     CHILD_POPEN["start_new_session"] = True
     CONSOLE = console
+    # The terminal as the owner's shell left it, put back on the way out whatever happened in
+    # between (the line editor and the picker restore their own changes; this is the last resort).
+    terminal = None
+    if termios is not None and sys.stdin.isatty():
+        with contextlib.suppress(OSError, termios.error):
+            terminal = termios.tcgetattr(sys.stdin.fileno())
 
     # Agents run in their own session, out of reach of the terminal's hangup, so the session has to
     # stop them itself when the window closes or someone sends SIGTERM.
@@ -2792,7 +2922,7 @@ def cmd_interactive(args):
                 session.attach(dropped)
                 kind, name, rest = parse_input(line)
                 if kind == "goal":
-                    session.start_goal(name)
+                    session.typed(name)
                 elif kind == "unknown":
                     emit(f"unknown command /{name}; valid: " + " ".join("/" + c for c in SLASH_COMMANDS))
                 elif kind == "command" and not session.handle(name, rest):
@@ -2814,6 +2944,9 @@ def cmd_interactive(args):
         CHILD_POPEN.clear()
         for name, handler in previous.items():
             signal.signal(getattr(signal, name), handler)
+        if terminal is not None:
+            with contextlib.suppress(OSError, termios.error):
+                termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, terminal)
     if ended_by:
         sys.exit(128 + ended_by[0])
 

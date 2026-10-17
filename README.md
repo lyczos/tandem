@@ -163,7 +163,8 @@ terminal the session uses Python's `input()` with readline instead, without the 
   `~/.tandem/config.json`, and a running run takes it from its next turn. Codex models and the
   efforts each supports come from `~/.codex/models_cache.json`; `default` leaves the setting to
   the CLI's own config. Without a terminal, or with `NO_COLOR`, it prints the current settings instead
-- `/say TEXT` leaves a message the next turn reads
+- `/say TEXT` leaves a message the next turn reads; `/now TEXT` also stops the current turn
+  (see below)
 - Ctrl+V pastes the image on the clipboard (a screenshot) into the line as `[image #1]`, as in
   Claude Code. `/paste` attaches it to your next goal or `/say` instead, and so does dragging
   image files onto the terminal; `/paste clear` drops what is waiting. Cmd+V stays the
@@ -173,12 +174,22 @@ terminal the session uses Python's `input()` with readline instead, without the 
 - `/goal FILE` starts a run from a goal file; `/campaign ARGS...` is `tandem campaign ARGS...`
 - `/quit` or Ctrl+D leaves after the current turn finishes
 
-Only one run or campaign runs in a session at a time. Another goal or `/resume` while it is busy
+Only one run or campaign runs in a session at a time. `/goal FILE` or `/resume` while it is busy
 leaves the current run and any pending `/stop` unchanged. Ctrl+C at the prompt clears the line
 and during a slow command (such as `/doctor`) cancels that command; neither touches the run.
 While `/quit` waits for the turn to finish, Ctrl+C stops the agent instead: the turn is recorded
 as failed and `/resume` or `tandem resume` continues from there. Closing the terminal or sending
 the session SIGTERM does the same without asking, so no agent keeps working unsupervised.
+
+### Correcting a turn in progress
+
+When you see a turn going wrong, type the correction at the prompt. It is saved for the next turn
+before anything else happens, so whatever you answer next, it is not lost. Then tandem asks whether
+to stop the current turn now: `y` stops the agent, commits what it changed so far, and gives the
+same agent the turn again with your message and a note to check its partial edits; Enter, `n` (or
+Ctrl+C) lets the turn finish and the next one reads it. Anything else typed there is taken as more
+of the correction and saved with it. An interrupted turn is not a failure and does not use up a
+turn; `/now TEXT` does the same without asking.
 
 Images are copied to `~/.tandem/images` and named in the message as `[image: PATH]`, so every
 later turn sees them too. Codex gets them attached with `--image`; Claude Code gets the folder

@@ -115,6 +115,12 @@ Never write `state.json` from the session: the loop holds a copy in memory and w
   (pause that agent until `parse_reset()`'s time, let the other carry on), `transient` (retry the
   same turn in `call_agent`) or `other` (count against `MAX_FAILURES_PER_AGENT`, bench the agent at
   three). The tuning constants are the block near the top of the file; change them there, not inline.
+- **An owner interruption is not a failure.** `interrupt_turn()` writes `INTERRUPT` in the run dir
+  and stops only agents, never the check. `call_agent` and `loop` look for that file before
+  classifying an error, so the killed agent is recorded as `interrupted`: no failure counted, no
+  transient retry, `max_turns` raised by one, and the same agent goes next with the correction and
+  its partial edits committed. `loop` clears the file before each turn reads the inbox, so a stale
+  one never kills a fresh turn.
 
 ### Agents, prompts and schemas
 

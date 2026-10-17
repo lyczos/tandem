@@ -868,7 +868,7 @@ class Interactive(unittest.TestCase):
         self.assertEqual(parse("/"), ("unknown", "", ""))
 
     def test_every_documented_command_is_known(self):
-        for name in ("help", "status", "say", "paste", "stop", "resume", "goal", "campaign", "runs", "transcript",
+        for name in ("help", "status", "say", "now", "paste", "stop", "resume", "goal", "campaign", "runs", "transcript",
                      "doctor", "board", "models", "quit"):
             self.assertEqual(tandem.parse_input("/" + name)[0], "command")
             self.assertIn("/" + name, tandem.SLASH_HELP)
@@ -1096,6 +1096,324 @@ class Interactive(unittest.TestCase):
             fake = mock.Mock(backend=backend, __doc__=doc, get_line_buffer=lambda: "typed")
             with self.subTest(backend=backend), mock.patch.dict(sys.modules, {"readline": fake}):
                 self.assertEqual(console._buffer(), expected)
+
+
+class Correction(unittest.TestCase):
+    setUp = Headless.setUp  # same throwaway repo and RUNS patches
+    run_dir_with = Tuning.run_dir_with  # first agent codex, 3 turns
+
+    def runners(self, reply):
+        """Stub RUNNERS that record (agent, prompt) and answer with reply(call number, worktree).
+
+        Each call is tracked like a real agent process, so interrupt_turn has something to stop."""
+        calls = []
+
+        def make(name):
+            def run(cfg, worktree, prompt, *rest):
+                calls.append((name, prompt))
+                with self.agent_running():
+                    return reply(len(calls), worktree)
+            return run
+        return calls, mock.patch.dict(tandem.RUNNERS, {n: make(n) for n in tandem.NAMES})
+
+    @contextlib.contextmanager
+    def agent_running(self):
+        """A fake agent process in CHILDREN for the block; stopping it only records the call."""
+        proc = mock.Mock(returncode=None, tandem_group=False, tandem_kind="agent")
+        with tandem.CHILDREN_LOCK:
+            tandem.CHILDREN.add(proc)
+        try:
+            yield proc
+        finally:
+            with tandem.CHILDREN_LOCK:
+                tandem.CHILDREN.discard(proc)
+
+    def test_interrupted_turn_keeps_edits_and_turn_budget(self):
+        run_dir = self.run_dir_with()
+
+        def reply(n, worktree):
+            if n == 1:
+                (pathlib.Path(worktree) / "half.txt").write_text("half done")
+                tandem.cmd_say(argparse.Namespace(run=str(run_dir), message="use tabs not spaces"))
+                tandem.interrupt_turn(run_dir)
+                raise RuntimeError("exit -15, no JSON output: ")  # what a killed agent looks like
+            return {"status": "continue", "summary": "went on"}, 0
+
+        calls, patch = self.runners(reply)
+        with patch, mock.patch.object(tandem, "log"), mock.patch.object(tandem, "emit"):
+            tandem.loop(run_dir)
+        state = tandem.load(run_dir)
+        first = state["history"][0]
+        self.assertEqual((first["status"], first["summary"], first["agent"]),
+                         ("interrupted", "interrupted by the owner", "codex"))
+        self.assertIn("half.txt", tandem.git(self.repo, "show", "--name-only", "--format=%s", first["commit"]))
+        self.assertIn("interrupted", tandem.git(self.repo, "log", "-1", "--format=%s", first["commit"]))
+        self.assertEqual(state["failures"], {"claude": 0, "codex": 0})
+        self.assertEqual(state["max_turns"], 4)
+        self.assertEqual(len(calls), 4)
+        agent, prompt = calls[1]
+        self.assertEqual(agent, "codex")
+        self.assertIn("use tabs not spaces", prompt)
+        self.assertIn("NEW, read first", prompt)
+        self.assertIn(f"Your previous turn was interrupted by the owner; its partial edits are in commit "
+                      f"{first['commit']}. Check them against the message above before you go on.", prompt)
+        self.assertNotIn("interrupted by the owner;", calls[2][1])  # only the turn right after
+        self.assertIn(f"### Turn 1 - Codex - interrupted by the owner - commit {first['commit']}",
+                      (run_dir / "transcript.md").read_text())
+        self.assertFalse((run_dir / "INTERRUPT").exists())
+
+    def test_interrupt_is_never_retried_or_counted(self):
+        run_dir = self.run_dir_with()
+
+        def flaky(*args):
+            (run_dir / "INTERRUPT").write_text("now")
+            raise RuntimeError("ECONNRESET")  # would otherwise be a transient error and wait
+
+        with mock.patch.dict(tandem.RUNNERS, {"codex": flaky}), \
+                mock.patch.object(tandem, "wait_until", side_effect=AssertionError("waited")), \
+                self.assertRaises(tandem.TurnInterrupted):
+            tandem.call_agent("codex", {}, ".", "p", run_dir / "t", None, "status", False, None, run_dir)
+
+    def test_nothing_changed_is_said_so(self):
+        run_dir = self.run_dir_with()
+
+        def reply(n, worktree):
+            if n == 1:
+                tandem.interrupt_turn(run_dir)
+                raise RuntimeError("exit -15, no JSON output: ")
+            return {"status": "continue"}, 0
+
+        calls, patch = self.runners(reply)
+        with patch, mock.patch.object(tandem, "log"), mock.patch.object(tandem, "emit"):
+            tandem.loop(run_dir)
+        self.assertIsNone(tandem.load(run_dir)["history"][0]["commit"])
+        self.assertIn("interrupted by the owner without a message; it changed nothing. Check", calls[1][1])
+
+    def test_interrupt_without_a_message_does_not_point_at_an_old_one(self):
+        run_dir = self.run_dir_with()
+        tandem.cmd_say(argparse.Namespace(run=str(run_dir), message="use tabs not spaces"))
+
+        def reply(n, worktree):
+            if n == 2:
+                tandem.interrupt_turn(run_dir)
+                raise RuntimeError("exit -15, no JSON output: ")
+            return {"status": "continue"}, 0
+
+        calls, patch = self.runners(reply)
+        with patch, mock.patch.object(tandem, "log"), mock.patch.object(tandem, "emit"):
+            tandem.loop(run_dir)
+        prompt = calls[2][1]
+        self.assertIn("use tabs not spaces", prompt)  # the old message is still there, as every owner message is
+        self.assertIn("Your previous turn was interrupted by the owner without a message; it changed nothing. "
+                      "Check them before you go on.", prompt)
+        self.assertNotIn("message above", prompt)
+
+    def test_interrupt_without_an_agent_leaves_no_flag(self):
+        # A flag nobody handles would turn a real error later in the same turn, even a usage limit,
+        # into an interruption.
+        run_dir = self.run_dir_with()
+        with self.agent_running() as done, mock.patch.object(tandem, "emit") as emit:
+            done.returncode = 0  # exited, not yet collected by run_child
+            tandem.interrupt_turn(run_dir)
+        self.assertFalse((run_dir / "INTERRUPT").exists())
+        self.assertEqual([c.args[0] for c in emit.call_args_list], ["no agent is working right now; the next turn reads it"])
+
+        def limited(*args):
+            raise RuntimeError("You've hit your usage limit. Try again at 5:45 PM")
+
+        with mock.patch.dict(tandem.RUNNERS, {"codex": limited}), mock.patch.object(tandem, "log"), \
+                self.assertRaises(RuntimeError) as raised:
+            tandem.call_agent("codex", {}, ".", "p", run_dir / "t", None, "status", False, None, run_dir)
+        self.assertNotIsInstance(raised.exception, tandem.TurnInterrupted)
+        self.assertIsNotNone(tandem.unavailable_until("codex"))
+
+    def test_hard_kill_reaches_only_the_interrupted_agent(self):
+        # The agent that ignored the polite request, not a planner or the next goal's agent that
+        # started in the meantime.
+        run_dir = self.run_dir_with()
+        with mock.patch.object(tandem, "KILL_GRACE", 0.2), mock.patch.object(tandem, "emit"):
+            with self.agent_running() as first:
+                tandem.interrupt_turn(run_dir)
+            first.terminate.assert_called_once_with()
+            with self.agent_running() as later:
+                time.sleep(0.6)
+        first.kill.assert_called_once_with()
+        later.kill.assert_not_called()
+        later.terminate.assert_not_called()
+
+    def test_stale_interrupt_is_ignored(self):
+        run_dir = self.run_dir_with()
+        (run_dir / "INTERRUPT").write_text("left by a crash")
+        calls, patch = self.runners(lambda n, w: ({"status": "continue"}, 0))
+        with patch, mock.patch.object(tandem, "log"), mock.patch.object(tandem, "emit"):
+            tandem.loop(run_dir)
+        state = tandem.load(run_dir)
+        self.assertEqual([h["status"] for h in state["history"]], ["continue"] * 3)
+        self.assertEqual(state["max_turns"], 3)
+        self.assertFalse((run_dir / "INTERRUPT").exists())
+
+    def test_interrupt_during_the_check_lets_it_finish(self):
+        # The turn has already ended when the check runs: the check is not an agent and is not
+        # stopped, and the next turn starts normally with the correction.
+        marker, script = self.base / "check-done", self.base / "check.py"
+        script.write_text(f"import pathlib, time\ntime.sleep(1)\npathlib.Path({str(marker)!r}).write_text('x')\n"
+                          f"raise SystemExit(1)\n")
+        run_dir = self.run_dir_with(check=f"{shlex.quote(sys.executable)} {shlex.quote(str(script))}")
+
+        def interrupt_when_the_check_runs():
+            deadline = time.monotonic() + 10
+            while not tandem.CHILDREN and time.monotonic() < deadline:
+                time.sleep(.01)
+            tandem.cmd_say(argparse.Namespace(run=str(run_dir), message="rename it"))
+            tandem.interrupt_turn(run_dir)
+
+        watcher = threading.Thread(target=interrupt_when_the_check_runs)
+        calls, patch = self.runners(lambda n, w: ({"status": "done" if n < 3 else "continue"}, 0))
+        with patch, mock.patch.object(tandem, "log"), mock.patch.object(tandem, "emit") as emit:
+            watcher.start()
+            tandem.loop(run_dir)
+            watcher.join(10)
+        state = tandem.load(run_dir)
+        self.assertTrue(marker.exists())
+        self.assertEqual([h["status"] for h in state["history"]], ["done", "done", "continue"])
+        self.assertEqual(state["max_turns"], 3)
+        self.assertIn("failed", calls[2][1])  # the check's verdict still counts
+        self.assertIn("rename it", calls[2][1])
+        self.assertNotIn("Your previous turn was interrupted", calls[2][1])
+        self.assertIn("no agent is working right now; the next turn reads it", [c.args[0] for c in emit.call_args_list])
+        self.assertFalse((run_dir / "INTERRUPT").exists())
+
+    def busy_session(self):
+        session = tandem.Session(argparse.Namespace(), tandem.Console(fancy=False))
+        session.thread = mock.Mock()
+        session.thread.is_alive.return_value = True
+        return session
+
+    def run_target(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        run = pathlib.Path(temp.name)
+        (run / "state.json").write_text("{}")
+        return run
+
+    def test_busy_plain_text_is_saved_before_asking(self):
+        run = self.run_target()
+        session = self.busy_session()
+        session.images = [pathlib.Path("/tmp/shot.png")]
+        seen = []
+        for error in (KeyboardInterrupt, EOFError, "", "n", " No ", "nie"):
+            def ask(prompt, history=True):
+                self.assertEqual(prompt, "  stop the current turn now and hand it over? its edits are kept [y/N] ")
+                self.assertFalse(history)
+                seen.append((run / "inbox.md").read_text())
+                self.assertIn("use tabs not spaces", seen[-1])
+                if isinstance(error, str):
+                    return error
+                raise error
+            (run / "inbox.md").write_text("")
+            with self.subTest(answer=error), mock.patch.dict(tandem.CURRENT, {"target": run}), \
+                    mock.patch.object(session.console, "ask", side_effect=ask) as asked, \
+                    mock.patch.object(tandem, "signal_children") as signal_children, \
+                    mock.patch.object(tandem, "emit") as emit:
+                session.typed("use tabs not spaces")
+            asked.assert_called_once()
+            signal_children.assert_not_called()
+            self.assertFalse((run / "INTERRUPT").exists())
+            lines = [c.args[0] for c in emit.call_args_list]
+            self.assertEqual(lines, ["✓ saved for the next turn", "the next turn reads it"])
+        self.assertIn("[image: /tmp/shot.png]", seen[0])  # pending images go with it, as with /say
+        self.assertEqual(session.images, [])
+
+    def test_any_other_answer_is_kept_as_another_message(self):
+        # The owner may answer the question with more of the correction; nothing typed is dropped.
+        run = self.run_target()
+        session = self.busy_session()
+        with mock.patch.dict(tandem.CURRENT, {"target": run}), \
+                mock.patch.object(session.console, "ask", return_value=" and rename the file "), \
+                mock.patch.object(tandem, "signal_children") as signal_children, \
+                mock.patch.object(tandem, "emit") as emit:
+            session.typed("use tabs not spaces")
+        signal_children.assert_not_called()
+        self.assertFalse((run / "INTERRUPT").exists())
+        self.assertEqual((run / "inbox.md").read_text(), "use tabs not spaces\n\nand rename the file\n\n")
+        self.assertEqual([c.args[0] for c in emit.call_args_list],
+                         ["✓ saved for the next turn", "the next turn reads it"])
+
+    def test_yes_interrupts(self):
+        run = self.run_target()
+        session = self.busy_session()
+        for answer in ("y", "Y", "yes", "t", " TAK "):
+            (run / "INTERRUPT").unlink(missing_ok=True)
+            with self.subTest(answer=answer), mock.patch.dict(tandem.CURRENT, {"target": run}), \
+                    mock.patch.object(session.console, "ask", return_value=answer), \
+                    self.agent_running() as agent, mock.patch.object(tandem, "emit"):
+                session.typed("use tabs not spaces")
+            self.assertTrue((run / "INTERRUPT").exists())
+            agent.terminate.assert_called_once_with()
+
+    def test_turn_that_ended_while_asking_is_left_alone(self):
+        run = self.run_target()
+        session = self.busy_session()
+
+        def ask(prompt, history=True):
+            tandem.PROGRESS.update(turn=2, agent="codex", since=2.0)  # the next turn began meanwhile
+            return "y"
+
+        with mock.patch.dict(tandem.CURRENT, {"target": run}), mock.patch.dict(tandem.PROGRESS, since=1.0), \
+                mock.patch.object(session.console, "ask", side_effect=ask), \
+                mock.patch.object(tandem, "signal_children") as signal_children, \
+                mock.patch.object(tandem, "emit") as emit:
+            session.typed("use tabs not spaces")
+        signal_children.assert_not_called()
+        self.assertFalse((run / "INTERRUPT").exists())
+        self.assertEqual(emit.call_args[0][0], "that turn has ended; the next turn reads it")
+
+    def test_now_skips_the_question(self):
+        run = self.run_target()
+        session = self.busy_session()
+        with mock.patch.dict(tandem.CURRENT, {"target": run}), \
+                mock.patch.object(session.console, "ask") as asked, \
+                self.agent_running() as agent, mock.patch.object(tandem, "emit") as emit:
+            session.handle("now", "use tabs not spaces")
+            session.handle("now", "")
+        asked.assert_not_called()
+        agent.terminate.assert_called_once_with()
+        self.assertTrue((run / "INTERRUPT").exists())
+        self.assertEqual((run / "inbox.md").read_text(), "use tabs not spaces\n\n")
+        self.assertEqual(emit.call_args[0][0], "usage: /now TEXT")
+
+    def test_now_in_a_campaign_interrupts_its_current_run(self):
+        camp, run = self.run_target(), self.run_target()
+        (camp / "state.json").unlink()
+        session = self.busy_session()
+        for current, expect in ((None, "nothing to interrupt; the next goal reads it"), (str(run), None)):
+            (camp / "campaign.json").write_text(json.dumps({"current": current, "runs": [{"dir": str(run)}]}))
+            with self.subTest(current=current), mock.patch.dict(tandem.CURRENT, {"target": camp}), \
+                    self.agent_running() as agent, mock.patch.object(tandem, "emit") as emit:
+                session.handle("now", "rename it")
+            self.assertEqual((run / "INTERRUPT").exists(), current is not None)
+            self.assertFalse((camp / "INTERRUPT").exists())
+            self.assertEqual(agent.terminate.called, current is not None)
+            if expect:
+                self.assertEqual(emit.call_args[0][0], expect)
+        self.assertIn("rename it", (camp / "notes.md").read_text())
+
+    def test_not_busy_now_only_saves(self):
+        run = self.run_target()
+        session = tandem.Session(argparse.Namespace(), tandem.Console(fancy=False))
+        with mock.patch.dict(tandem.CURRENT, {"target": run}), \
+                mock.patch.object(tandem, "signal_children") as signal_children, \
+                mock.patch.object(tandem, "emit") as emit:
+            session.handle("now", "rename it")
+        signal_children.assert_not_called()
+        self.assertFalse((run / "INTERRUPT").exists())
+        self.assertEqual(emit.call_args[0][0], "no turn is running; the next turn reads it")
+
+    def test_interrupted_card_is_magenta(self):
+        entry = dict(Cards.ENTRY, status="interrupted", summary="interrupted by the owner", handoff="")
+        card = tandem.turn_card(entry, True, 60)
+        self.assertIn("\x1b[35minterrupted", card)
+        self.assertIn("interrupted by the owner", plain(card))
 
 
 CODEX_CACHE = {"models": [
@@ -1408,6 +1726,11 @@ class Editor(unittest.TestCase):
             self.read("ab", "ctrl-c")
         self.assertTrue(screen(self.out.getvalue())[-1].startswith("tandem> ab"))  # the line stays, no menu
 
+    def test_answers_can_stay_out_of_history(self):
+        editor = self.editor("y", "enter")
+        self.assertEqual(editor.read("[y/N] ", history=False), "y")
+        self.assertEqual(editor.history, [])
+
     def test_empty_enter_does_nothing(self):
         editor = self.editor("enter", " ", "enter", "x", "enter")
         self.assertEqual([editor.read("tandem> ") for _ in range(3)], ["", " ", "x"])
@@ -1568,6 +1891,34 @@ class Editor(unittest.TestCase):
                     with self.assertRaises(failure):
                         editor.read("> ")
                 self.assertEqual(attrs(), before)
+
+    def test_signal_right_after_raw_mode_restores_the_terminal(self):
+        # A Ctrl+C sent as a signal (kill, or the terminal before raw mode is on) can land the moment
+        # raw mode is set; the owner's shell must not be left without echo.
+        import pty
+        master, slave = pty.openpty()
+        self.addCleanup(os.close, master)
+        self.addCleanup(os.close, slave)
+        termios = tandem.termios
+
+        def attrs():
+            a = termios.tcgetattr(slave)
+            a[3] &= ~getattr(termios, "PENDIN", 0)
+            return a
+
+        before = attrs()
+        real = tandem.raw_keys
+
+        def raw_then_sigint(fd):
+            saved = real(fd)
+            os.kill(os.getpid(), signal.SIGINT)
+            return saved
+
+        editor = tandem.LineEditor(slave, io.StringIO(), self.history)
+        with mock.patch.object(tandem, "raw_keys", raw_then_sigint), self.assertRaises(KeyboardInterrupt):
+            editor.read("> ")
+            time.sleep(1)  # where the signal lands without the fix: after read returned
+        self.assertEqual(attrs(), before)
 
 
 PNG = b"\x89PNG\r\n\x1a\n" + b"\0" * 16
@@ -2093,7 +2444,7 @@ class SessionProcess(unittest.TestCase):
         seen = len(self.text())
         self.wait_for(lambda: self.text()[seen:].count("working...") >= 2, "the status ticking while typing")
         os.write(self.master, b"\r")
-        self.wait_for(lambda: "a run is already going" in self.text(), "the typed line arriving")
+        self.wait_for(lambda: "saved for the next turn" in self.text(), "the typed line arriving")
         self.assertIn("tandem> abc", [plain(r) for r in screen(self.text())])
 
     def test_typing_survives_a_log_line(self):
@@ -2101,6 +2452,26 @@ class SessionProcess(unittest.TestCase):
 
     def test_typing_survives_a_log_line_in_color(self):
         self.check_typing_survives_a_log_line(NO_COLOR=None)
+
+    def test_correction_interrupts_a_slow_turn(self):
+        agent = self.start_slow_turn(NO_COLOR=None)
+        self.type("use tabs not spaces")
+        self.wait_for(lambda: "[y/N]" in self.text(), "the question")
+        self.assertTrue(self.alive(agent))  # asking stops nothing
+        self.type("y")
+        self.wait_for(lambda: not self.alive(agent), "the agent stopping", timeout=10)
+        self.wait_for(lambda: self.log_text().count("claude start") == 2, "the same agent taking the turn again")
+        run = next(d for d in self.runs.iterdir() if (d / "state.json").exists())
+        self.wait_for((run / "turn-02-claude.prompt.md").exists, "the next prompt")
+        prompt = (run / "turn-02-claude.prompt.md").read_text()
+        self.assertIn("use tabs not spaces", prompt)
+        self.assertIn("Your previous turn was interrupted by the owner; it changed nothing.", prompt)
+        self.wait_for(lambda: "interrupted by the owner" in plain(self.text()), "the interrupted card")
+        self.assertNotIn("claude end", self.log_text())
+        first = self.state()["history"][0]
+        self.assertEqual((first["status"], self.state()["failures"]["claude"]), ("interrupted", 0))
+        if os.environ.get("TANDEM_SHOW_SCREEN"):
+            print("\n".join(plain(r) for r in screen(self.text())))
 
     def test_sigterm_in_headless_mode_stops_the_agent(self):
         log = self.base / "headless.txt"

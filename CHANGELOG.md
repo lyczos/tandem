@@ -2,6 +2,10 @@
 
 ## 0.1.0
 
+- Step in during a turn: plain text typed while a run is going is saved for the next turn, and
+  `y` to the question that follows stops the turn, keeps its edits in a commit and hands the same
+  agent your correction. `/now TEXT` does it without the question. Interrupted turns show as
+  `interrupted` and neither count as a failure nor use up a turn.
 - Each turn of an interactive session shows as a card, and `/board` summarizes what the agents agree
   on, what is open, the models and the cost. Plain output (pipes, `NO_COLOR`) keeps the one-line log.
 - The session's prompt has its own line editor: typing `/` shows the matching slash commands with
