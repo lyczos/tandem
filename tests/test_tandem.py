@@ -1745,14 +1745,16 @@ class Editor(unittest.TestCase):
         self.assertEqual(self.read("/m", "esc", "enter"), "/m")  # Esc closed the menu
         self.assertEqual(self.read("/say", "enter"), "/say")  # an exact command runs as typed
         self.assertEqual(self.read("/st", "tab", "hi", "enter"), "/status hi")
+        self.assertEqual(self.read("/go", "right", "x", "enter"), "/goal x")  # → at the end completes too
+        self.assertEqual(self.read("/go", "left", "right", "enter"), "/goal")  # mid-line → only moves
 
     def test_menu_lines(self):
         editor = self.editor()
         editor.prompt, editor.buffer, editor.cursor = "tandem> ", "/mo", 3
         lines = editor.menu_lines(80)
         self.assertEqual(lines, ["▸ /models   pick Claude and Codex model and effort",
-                                 "  ↑↓ select · Tab complete · Enter run · Esc close"])
-        self.assertEqual(lines[-1], "  ↑↓ select · Tab complete · Enter run · Esc close")
+                                 "  ↑↓ select · Tab or → complete · Enter run · Esc close"])
+        self.assertEqual(lines[-1], "  ↑↓ select · Tab or → complete · Enter run · Esc close")
         self.assertNotIn("\x1b", "".join(lines))
         editor.buffer, editor.cursor = "/", 1
         lines = editor.menu_lines(30)

@@ -149,8 +149,8 @@ it shows the security warning and asks you to type `yes`; the answer is saved in
 Plain text is a goal and starts a run in the current repo. The run goes on in the background, so
 you can keep typing and talk to the agents while they work. Typing `/` opens a menu of the slash
 commands under the prompt, narrowed with every key, each with a short description: ↑↓ select,
-Tab completes, Enter runs the highlighted one, Esc closes the menu. When the menu is closed, ↑↓ go
-through earlier lines, kept in `~/.tandem/history` (the last 500). The usual editing keys work:
+Tab or → at the end of the line completes, Enter runs the highlighted one, Esc closes the menu.
+When the menu is closed, ↑↓ go through earlier lines, kept in `~/.tandem/history` (the last 500). The usual editing keys work:
 ←→, Home/End or Ctrl+A/Ctrl+E, Ctrl+U and Ctrl+K delete to the start or end, Ctrl+W the word
 before the cursor. A paste of several lines arrives as one line. With `TERM=dumb` or without a
 terminal the session uses Python's `input()` with readline instead, without the menu. Slash commands:

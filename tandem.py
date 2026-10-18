@@ -2088,7 +2088,7 @@ def models_line(values):
 # ---------- the prompt line ----------
 
 MENU_SIZE = 8
-MENU_HINT = "↑↓ select · Tab complete · Enter run · Esc close"
+MENU_HINT = "↑↓ select · Tab or → complete · Enter run · Esc close"
 HISTORY_SIZE = 500
 EXIT_ARM_SECONDS = 2  # a second Ctrl+C on an empty prompt within this many seconds leaves, as in Claude Code
 EXIT_WORDS = ("exit", "quit", "q")  # typed alone, they leave like /quit instead of becoming a goal
@@ -2280,8 +2280,8 @@ class LineEditor:
             if matches and b[1:].lower() not in SLASH_COMMANDS:
                 self.edit("/" + matches[self.selected][0], len(matches[self.selected][0]) + 1)
             return self.buffer
-        elif key == "tab":
-            if matches:
+        elif key == "tab" or (key == "right" and matches and c == len(b)):
+            if matches:  # → at the end of the line accepts the suggestion, as in fish and zsh
                 name = matches[self.selected][0]
                 self.edit(f"/{name} ", len(name) + 2)
         elif key == "esc":
