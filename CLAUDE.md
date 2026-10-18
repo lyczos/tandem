@@ -95,6 +95,18 @@ Users moving existing runs from `../tandem-runs` to an npm install can set `TAND
 the old directory's absolute path to keep their run ids reachable. Interactive consent stays
 in `~/.tandem/config.json`, independently of run storage.
 
+While an agent works, `run_child(on_line=...)` hands its output over line by line: Claude runs with
+`--output-format stream-json` (`claude_payload()` picks the final result event, the same object the
+plain `json` format returns) and Codex's plain log goes through `CodexActivity`. Each action becomes
+one line of `activity.log` in the directory of the call's `out_base` (`note_activity()`), and the
+loop adds the turn's end and the check. `tandem watch` follows the newest of those files; the
+session's `/watch` opens it in a tmux or iTerm2 pane, because the session's own screen belongs to
+the prompt. The log is for people only: nothing reads it back.
+
+Owner messages wait in `inbox.md`, one per blank-line-separated block (`queued()`). `leave_message()`
+refuses past `MAX_QUEUED` unless forced (`/now` and the answer to the stop question are), because
+the next agent reads the whole backlog at once.
+
 `tuning.json` (in a run or campaign directory) is how the session changes the models and effort of
 a running run: `write_tuning()` merges into it, and `loop` re-reads it at the start of every turn
 (`apply_tuning()`, later file wins, `null` means default). A campaign run reads the campaign's file.

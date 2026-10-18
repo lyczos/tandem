@@ -117,6 +117,8 @@ Each run lives in `<runs directory>/<id>/`. Commands accept the directory as a p
 
 - `work/` - a git worktree on branch `tandem/<id>`; your own checkout is never touched
 - `transcript.md` - the conversation, readable while it runs (`tail -f`)
+- `activity.log` - one line per thing an agent does during its turn: a command, a file read or
+  edited, a line of what it says; `tandem watch` follows it
 - `turn-NN-<agent>.*` - the exact prompt and raw output of every turn
 - `state.json` - what `resume` continues from
 
@@ -125,8 +127,12 @@ Talk to them while they work; the next agent reads it first:
 ```bash
 tandem say <id> "Use SQLAlchemy 2.0 async, not psycopg directly."
 tandem status <id>
+tandem watch                          # follow what the agents do; Ctrl+C closes it
 tandem resume <id> --more-turns 6     # after Ctrl+C, a limit, or a blocked run
 ```
+
+`tandem watch` with no id follows whichever run acted last, so one left open in a side pane keeps
+up with every new goal and every run of a campaign.
 
 When a run is done, review and take the branch:
 
@@ -164,7 +170,9 @@ terminal the session uses Python's `input()` with readline instead, without the 
   efforts each supports come from `~/.codex/models_cache.json`; `default` leaves the setting to
   the CLI's own config. Without a terminal, or with `NO_COLOR`, it prints the current settings instead
 - `/say TEXT` leaves a message the next turn reads; `/now TEXT` also stops the current turn
-  (see below)
+  (see below). `/queue` lists the messages waiting for the next turn, `/queue clear` drops them
+- `/watch` opens `tandem watch` in a pane to the right of the session, in tmux or iTerm2, to see what
+  the agents do while a turn runs. Elsewhere it prints the command to run in a pane of your own
 - Ctrl+V pastes the image on the clipboard (a screenshot) into the line as `[image #1]`, as in
   Claude Code. `/paste` attaches it to your next goal or `/say` instead, and so does dragging
   image files onto the terminal; `/paste clear` drops what is waiting. Cmd+V stays the
@@ -196,6 +204,11 @@ same agent the turn again with your message and a note to check its partial edit
 Ctrl+C) lets the turn finish and the next one reads it. Anything else typed there is taken as more
 of the correction and saved with it. An interrupted turn is not a failure and does not use up a
 turn; `/now TEXT` does the same without asking.
+
+After a no, tandem does not ask again during that turn: more lines just join the queue, and each
+shows how many wait. The next agent reads them all at once, in order, so at most five wait at a
+time; a sixth is refused rather than buried (↑ brings it back). Look at them with `/queue`, drop
+them with `/queue clear`, or use `/now`, which always goes through and hands them over at once.
 
 Images are copied to `~/.tandem/images` and named in the message as `[image: PATH]`, so every
 later turn sees them too. Codex gets them attached with `--image`; Claude Code gets the folder

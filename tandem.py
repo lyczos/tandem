@@ -99,6 +99,7 @@ TRANSIENT_WAIT = 150            # network or API hiccup: retry the same turn aft
 MAX_TRANSIENT_RETRIES = 6
 LIMIT_FALLBACK_WAIT = 3600      # usage limit without a readable reset time
 PLAN_RETRY_WAIT = 600
+MAX_QUEUED = 5                  # owner messages waiting for one turn; the agent reads them all at once
 
 # Accounts are shared by every run on this machine, so availability is too: it lives beside the
 # user's config, not in RUNS, so a source checkout and an npm install see the same usage limits.
@@ -148,8 +149,10 @@ CHILDREN_LOCK = threading.Lock()
 KILL_GRACE = 5  # seconds between asking those processes to stop and killing them
 
 
-def run_child(cmd, input=None, timeout=None, kind="agent", **kwargs):
-    """subprocess.run for the long calls (agents, the check), tracked in CHILDREN while they run."""
+def run_child(cmd, input=None, timeout=None, kind="agent", on_line=None, **kwargs):
+    """subprocess.run for the long calls (agents, the check), tracked in CHILDREN while they run.
+
+    on_line(stream, line), when given, sees each line of stdout and stderr as it arrives."""
     with subprocess.Popen(cmd, stdin=subprocess.PIPE if input is not None else subprocess.DEVNULL,
                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                           **CHILD_POPEN, **kwargs) as proc:
@@ -159,7 +162,10 @@ def run_child(cmd, input=None, timeout=None, kind="agent", **kwargs):
         with CHILDREN_LOCK:
             CHILDREN.add(proc)
         try:
-            out, err = proc.communicate(input, timeout=timeout)
+            if on_line is None:
+                out, err = proc.communicate(input, timeout=timeout)
+            else:
+                out, err = follow_output(proc, input, timeout, on_line)
         except BaseException:
             signal_child(proc, hard=True)
             proc.wait()
@@ -168,6 +174,38 @@ def run_child(cmd, input=None, timeout=None, kind="agent", **kwargs):
             with CHILDREN_LOCK:
                 CHILDREN.discard(proc)
     return subprocess.CompletedProcess(cmd, proc.returncode, out, err)
+
+
+def follow_output(proc, input, timeout, on_line):
+    """communicate() that also hands every line to on_line while the process runs."""
+    deadline = None if timeout is None else time.monotonic() + timeout
+    lines = {"stdout": [], "stderr": []}
+
+    def pump(name):
+        # A killed agent's pipe can close under the reader; a traceback here would garble the session.
+        with contextlib.suppress(ValueError, OSError):
+            for line in getattr(proc, name):
+                lines[name].append(line)
+                try:
+                    on_line(name, line.rstrip("\n"))
+                except Exception:  # a broken activity log must never cost the agent's output
+                    pass
+
+    readers = [threading.Thread(target=pump, args=(name,), daemon=True) for name in lines]
+    for reader in readers:
+        reader.start()
+    if proc.stdin:
+        with contextlib.suppress(BrokenPipeError, OSError):
+            proc.stdin.write(input)
+        with contextlib.suppress(BrokenPipeError, OSError):
+            proc.stdin.close()
+    # Like communicate(): done when the process has exited and both pipes are closed, within timeout.
+    proc.wait(None if deadline is None else max(deadline - time.monotonic(), 0))
+    for reader in readers:
+        reader.join(None if deadline is None else max(deadline - time.monotonic(), 0))
+        if reader.is_alive():
+            raise subprocess.TimeoutExpired(proc.args, timeout)
+    return "".join(lines["stdout"]), "".join(lines["stderr"])
 
 
 def signal_child(proc, hard=False):
@@ -646,6 +684,124 @@ def prompt_images(prompt):
     return found
 
 
+# ---------- what the agents are doing ----------
+
+# A turn prints nothing until it ends, often many minutes later. While an agent works, each action
+# it takes becomes one line of <run dir>/activity.log, which `tandem watch` follows in a pane of its
+# own: the session's prompt keeps the screen it has, and the log outlives the session.
+ACTIVITY = "activity.log"
+# The headers of codex exec's plain log, each alone on its line before what it introduces.
+CODEX_SECTIONS = ("user", "codex", "thinking", "exec", "apply patch", "tokens used")
+TOOL_VERBS = {"Read": "read", "Edit": "edit", "MultiEdit": "edit", "Write": "write", "NotebookEdit": "edit",
+              "Grep": "grep", "Glob": "glob", "WebFetch": "fetch", "WebSearch": "search"}
+
+
+def note_activity(run_dir, who, text):
+    text = " ".join(str(text).split())[:300]  # one line, whatever the agent wrote
+    if text:
+        with open(pathlib.Path(run_dir) / ACTIVITY, "a") as f:
+            f.write(f"{datetime.datetime.now():%H:%M:%S}\t{who}\t{text}\n")
+
+
+def start_activity(out_base, agent):
+    """Head the call's lines with what it is (turn 3, plan 2) and return a writer for the rest."""
+    name = re.match(r"([a-z]+)-0*(\d+)-", out_base.name)
+    note_activity(out_base.parent, agent, f"── {' '.join(name.groups()) if name else out_base.name} ──")
+    return lambda text: note_activity(out_base.parent, agent, text)
+
+
+def first_line(text):
+    return next((line.strip() for line in str(text or "").splitlines() if line.strip()), "")
+
+
+def short_path(path, worktree):
+    try:
+        return str(pathlib.Path(path).relative_to(worktree))
+    except ValueError:
+        return str(path)
+
+
+def describe_tool(name, args, worktree):
+    if name == "StructuredOutput":
+        return ""  # the reply itself; the turn card shows it
+    if name == "Bash":
+        return "$ " + first_line(args.get("command"))
+    if name in ("Task", "Agent"):
+        return "agent " + first_line(args.get("description"))
+    if name in TOOL_VERBS:
+        target = args.get("file_path") or args.get("notebook_path")
+        target = short_path(target, worktree) if target else args.get("pattern") or args.get("url") or args.get("query")
+        return f"{TOOL_VERBS[name]} {target or ''}".strip()
+    return name
+
+
+def claude_actions(event, worktree):
+    """The lines worth showing from one event of Claude's stream-json output."""
+    message = event.get("message") if event.get("type") in ("assistant", "user") else None
+    content = message.get("content") if isinstance(message, dict) else None
+    found = []
+    for part in content if isinstance(content, list) else []:
+        kind = part.get("type") if isinstance(part, dict) else None
+        if kind == "text":
+            found.append("» " + first_line(part.get("text")) if first_line(part.get("text")) else "")
+        elif kind == "tool_use":
+            found.append(describe_tool(part.get("name", ""), part.get("input") or {}, worktree))
+        elif kind == "tool_result" and part.get("is_error"):
+            body = part.get("content")
+            if isinstance(body, list):
+                body = " ".join(b.get("text", "") for b in body if isinstance(b, dict))
+            found.append("✗ " + first_line(body))
+    return [line for line in found if line]
+
+
+class CodexActivity:
+    """Reads codex exec's plain log (its stderr) a line at a time; feed() returns a line to show, or None."""
+
+    def __init__(self, worktree):
+        self.worktree, self.section, self.fresh = worktree, None, False
+
+    def feed(self, line):
+        if line in CODEX_SECTIONS:
+            self.section, self.fresh = line, True
+            return None
+        if not line.strip():
+            return None
+        fresh, self.fresh = self.fresh, False
+        if self.section == "codex" and fresh:
+            return "» " + line.strip()
+        if self.section == "exec" and fresh:
+            # "/bin/zsh -lc 'pytest' in /work/dir"; a command of several lines shows its first only,
+            # so the directory and the closing quote never arrive.
+            end = line.rfind(" in /")
+            command = re.sub(r"^\S*sh -lc ", "", line[:end] if end > 0 else line)
+            if command[:1] in ("'", '"'):
+                command = command[1:-1] if len(command) > 1 and command[-1] == command[0] else command[1:]
+            return "$ " + command
+        exited = re.match(r"\s*exited (-?\d+) in ", line) if self.section == "exec" else None
+        if exited:
+            return f"✗ exited {exited.group(1)}"
+        if self.section == "apply patch" and line.startswith("/"):
+            return "edit " + short_path(line.strip(), self.worktree)
+        return None
+
+
+def claude_payload(stdout):
+    """Claude's result object: the last "result" event of stream-json, or a whole --output-format json reply."""
+    for line in reversed(stdout.splitlines()):
+        if line.startswith("{"):
+            try:
+                event = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(event, dict) and event.get("type") == "result":
+                return event
+    try:
+        payload = json.loads(stdout)
+    except ValueError:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
 def run_claude(cfg, worktree, prompt, out_base, schema, key, readonly):
     cmd = ["claude", "-p"]
     images = prompt_images(prompt)
@@ -654,7 +810,7 @@ def run_claude(cfg, worktree, prompt, out_base, schema, key, readonly):
         # so it goes before the next flag, never last.
         cmd += ["--add-dir", *dict.fromkeys(str(p.parent) for p in images)]
         prompt += "\n\nEach [image: PATH] above is an image from the owner. Open it with Read before you start.\n"
-    cmd += ["--output-format", "json", "--json-schema", schema.read_text(),
+    cmd += ["--output-format", "stream-json", "--verbose", "--json-schema", schema.read_text(),
             "--setting-sources", "project,local"]
     if readonly:
         cmd += ["--permission-mode", "dontAsk", "--allowedTools", *CLAUDE_READ]
@@ -667,12 +823,21 @@ def run_claude(cfg, worktree, prompt, out_base, schema, key, readonly):
         cmd += ["--effort", cfg["claude_effort"]]
     if cfg.get("claude_budget"):
         cmd += ["--max-budget-usd", str(cfg["claude_budget"])]
-    proc = run_child(cmd, input=prompt, cwd=worktree, timeout=cfg["timeout"])
-    out_base.with_suffix(".json").write_text(proc.stdout)
+    say = start_activity(out_base, "claude")
+
+    def on_line(stream, line):
+        try:
+            event = json.loads(line) if stream == "stdout" else None
+        except ValueError:
+            return  # not an event: a warning, or output from a CLI without stream-json
+        for text in claude_actions(event, worktree) if isinstance(event, dict) else []:
+            say(text)
+
+    proc = run_child(cmd, input=prompt, cwd=worktree, timeout=cfg["timeout"], on_line=on_line)
+    payload = claude_payload(proc.stdout)
+    out_base.with_suffix(".json").write_text(json.dumps(payload) if payload else proc.stdout)
     out_base.with_suffix(".stderr").write_text(proc.stderr)
-    try:
-        payload = json.loads(proc.stdout)
-    except json.JSONDecodeError:
+    if payload is None:
         raise RuntimeError(f"exit {proc.returncode}, no JSON output: {tail(proc.stderr or proc.stdout)}")
     if payload.get("is_error"):
         raise RuntimeError(f"{payload.get('subtype')}: {tail(str(payload.get('result')))}")
@@ -699,7 +864,14 @@ def run_codex(cfg, worktree, prompt, out_base, schema, key, readonly):
     if cfg.get("codex_effort"):
         cmd += ["-c", f'model_reasoning_effort="{cfg["codex_effort"]}"']
     cmd.append("-")
-    proc = run_child(cmd, input=prompt, cwd=worktree, timeout=cfg["timeout"])
+    say, reader = start_activity(out_base, "codex"), CodexActivity(worktree)
+
+    def on_line(stream, line):
+        text = reader.feed(line) if stream == "stderr" else None
+        if text:
+            say(text)
+
+    proc = run_child(cmd, input=prompt, cwd=worktree, timeout=cfg["timeout"], on_line=on_line)
     out_base.with_suffix(".log").write_text(proc.stdout + "\n--- stderr ---\n" + proc.stderr)
     if proc.returncode != 0:
         errors = [l for l in (proc.stderr + "\n" + proc.stdout).splitlines() if l.startswith("ERROR")]
@@ -895,6 +1067,8 @@ def loop(run_dir):
 
         append_transcript(run_dir, render_history([entry]) + f"_{entry['seconds']}s_\n")
         report_turn(entry)
+        note_activity(run_dir, agent, f"= {entry['status']} ({entry['seconds']}s) "
+                                      f"{first_line(entry.get('summary') or entry.get('error'))}")
 
         status = entry["status"]
         prev = state["history"][-2] if len(state["history"]) > 1 else None
@@ -907,7 +1081,11 @@ def loop(run_dir):
                 peer_agreed = True  # the reviewer approving unchanged work closes the goal
             # Alone, the agent still needs one fresh-eyes turn that changes nothing before done counts.
             if peer_agreed or (solo and not entry["commit"]):
+                if cfg.get("check"):
+                    note_activity(run_dir, "check", "$ " + cfg["check"])
                 ok, output = run_check(state)
+                if cfg.get("check"):
+                    note_activity(run_dir, "check", "= passed" if ok else "\u2717 failed")
                 if ok:
                     if not peer_agreed:
                         state["needs_review"] = True
@@ -1346,19 +1524,109 @@ def cmd_resume(args):
     loop(run_dir)
 
 
-def leave_message(target, message):
+def queued(target):
+    """The messages waiting in target's inbox for the next turn, oldest first."""
+    try:
+        text = (target / "inbox.md").read_text()
+    except OSError:
+        return []
+    return [m.strip() for m in text.split("\n\n") if m.strip()]
+
+
+def leave_message(target, message, force=False):
+    """Queue a message for the next turn. Past MAX_QUEUED waiting ones it refuses, unless forced: the
+    agent reads them all at once, and a long backlog of notes it cannot answer one by one is more
+    likely to contradict itself than to help. /now (forced) ends the wait instead."""
+    # Blank lines separate the messages in the inbox, so a message keeps none of its own.
+    message = re.sub(r"\n\s*\n", "\n", message.strip())
     with INBOX_LOCK:
+        if not force and len(queued(target)) >= MAX_QUEUED:
+            raise ValueError(f"{MAX_QUEUED} messages already wait for the next turn; /queue shows them, "
+                             f"/queue clear drops them, /now hands them over now (\u2191 brings your line back)")
         with open(target / "inbox.md", "a") as f:
-            f.write(message.strip() + "\n\n")
+            f.write(message + "\n\n")
         if (target / "campaign.json").exists():
             # The next turn consumes the inbox; the planner keeps reading notes.md for every later goal.
             with open(target / "notes.md", "a") as f:
-                f.write(f"- ({now()}) {message.strip()}\n")
+                f.write(f"- ({now()}) {message}\n")
+        return len(queued(target))
+
+
+def clear_queue(target):
+    with INBOX_LOCK:
+        dropped = len(queued(target))
+        if dropped:
+            (target / "inbox.md").write_text("")
+    return dropped
 
 
 def cmd_say(args):
-    leave_message(run_path(args.run), args.message)
-    emit("queued for the next turn")
+    waiting = leave_message(run_path(args.run), args.message)
+    emit(f"queued for the next turn ({waiting} waiting)")
+
+
+def activity_files(root):
+    """The activity logs under root: a run's own, a campaign's and its runs', or every run's in RUNS."""
+    return [*root.glob(ACTIVITY), *root.glob("*/" + ACTIVITY), *root.glob("*/*/" + ACTIVITY)]
+
+
+def watch_line(line, width, fancy):
+    stamp, _, rest = line.partition("\t")
+    who, _, text = rest.partition("\t")
+    text = fit_width(text, max(width - 17, 10))
+    if not fancy:
+        return f"{stamp} {who:<6} {text}"
+    color = f"38;5;{AGENT_COLORS[who]}" if who in AGENT_COLORS else "2"
+    if text.startswith("\u2500"):
+        return f"\x1b[2m{stamp}\x1b[0m \x1b[1;{color}m{who:<6} {text}\x1b[0m"
+    if text.startswith(("=", "\u2717")):
+        text = f"\x1b[1m{text}\x1b[0m"
+    return f"\x1b[2m{stamp}\x1b[0m \x1b[{color}m{who:<6}\x1b[0m {text}"
+
+
+def cmd_watch(args):
+    """Follow what the agents do, as it happens. Meant for a pane beside the session (/watch opens one):
+    without a run it follows whichever run in RUNS acted last, so it keeps up with every new goal."""
+    root = run_path(args.run) if args.run else RUNS
+    fancy = fancy_terminal()
+    print(f"tandem watch \u00b7 {root} \u00b7 Ctrl+C closes", flush=True)
+    offsets, current, scanned = {}, None, float("-inf")  # monotonic() may start near 0
+    try:
+        while True:
+            if time.monotonic() - scanned >= 1:
+                scanned = time.monotonic()
+                try:
+                    newest = max(activity_files(root), key=lambda f: f.stat().st_mtime, default=None)
+                except OSError:
+                    newest = None  # a run directory removed mid-scan; the next scan settles it
+                if newest and newest != current:
+                    current = newest
+                    print(f"\n{current.parent.name}", flush=True)
+                    if current not in offsets:  # first sight: the last few lines, then everything new
+                        size = current.stat().st_size
+                        start = max(size - 4096, 0)
+                        with open(current, "rb") as f:
+                            f.seek(start)
+                            head = f.read(size - start)
+                        offsets[current] = start + (head.find(b"\n") + 1 if start else 0)
+                elif newest is None and current is None and not offsets:
+                    offsets[None] = 0
+                    print("waiting for a turn to start", flush=True)
+            if current:
+                try:
+                    with open(current, "rb") as f:
+                        f.seek(offsets[current])
+                        chunk = f.read()
+                except OSError:
+                    current, chunk = None, b""  # its run was removed; the next scan finds another
+                complete = chunk[:chunk.rfind(b"\n") + 1]  # a line still being written waits
+                offsets[current] += len(complete)
+                width = term_width()
+                for line in complete.decode("utf-8", "replace").splitlines()[-200:]:
+                    print(watch_line(line, width, fancy), flush=True)
+            time.sleep(0.3)
+    except KeyboardInterrupt:
+        print()
 
 
 def cmd_status(args):
@@ -1572,6 +1840,10 @@ def build_parser():
     m.add_argument("message")
     m.set_defaults(fn=cmd_say)
 
+    w = sub.add_parser("watch", help="follow what the agents do as they work (a pane beside the session)")
+    w.add_argument("run", nargs="?", help="a run or campaign; default: whichever run acted last")
+    w.set_defaults(fn=cmd_watch)
+
     t = sub.add_parser("status", help="one line per turn")
     t.add_argument("run")
     t.set_defaults(fn=cmd_status)
@@ -1632,6 +1904,8 @@ SLASH = [
     ("paste", "", "attach the clipboard's image to your next goal or /say"),
     ("stop", "", "stop after the current turn"),
     ("now", "TEXT", "stop the current turn and hand it your message"),
+    ("queue", "[clear]", "the messages waiting for the next turn; clear drops them"),
+    ("watch", "", "follow what the agents do, in a pane on the right"),
     ("resume", "[TURNS]", "continue the last run, optionally allowing TURNS more"),
     ("goal", "FILE", "start a run from a goal file"),
     ("campaign", "ARGS...", "same as `tandem campaign ARGS...` (start, resume, stop, status, say)"),
@@ -2485,6 +2759,7 @@ class Session:
         self.images = []  # pasted or dropped, waiting for the next goal or /say
         self.inline = {}  # N -> path for each [image #N] Ctrl+V put in the line
         self.image_count = 0
+        self.declined = None  # the turn (its start time) the owner chose not to stop; asked once per turn
 
     def busy(self):
         return self.thread is not None and self.thread.is_alive()
@@ -2634,13 +2909,20 @@ class Session:
             self.correct(target, text, ask=True)
 
     def correct(self, target, text, ask):
-        """Save the message first, so nothing the owner answers next (or a crash) can lose it."""
-        if not self.guarded(lambda _: leave_message(target, self.with_images(text)), None):
+        """Save the message first, so nothing the owner answers next (or a crash) can lose it.
+
+        ask: offer to stop the turn now (once per turn: after a no, later lines just queue); without
+        it the turn stops at once (/now)."""
+        waiting = []
+        if not self.guarded(lambda _: waiting.append(leave_message(target, self.with_images(text), force=not ask)),
+                            None):
             return
         self.images.clear()
-        emit("\u2713 saved for the next turn")
+        emit(f"\u2713 queued for the next turn ({waiting[0]} waiting)")
         if not self.busy():
             return emit("no turn is running; the next turn reads it")
+        if ask and self.declined is not None and self.declined == PROGRESS.get("since"):
+            return  # already asked during this turn; /now still steps in
         if ask:
             # The worker keeps going while the owner decides, so the turn asked about may end meanwhile.
             since = PROGRESS.get("since")
@@ -2654,8 +2936,9 @@ class Session:
             if answer.lower() not in ("y", "yes", "t", "tak"):
                 if answer.lower() not in ("", "n", "no", "nie"):
                     # More of the correction, typed where the question was: kept, never dropped.
-                    self.guarded(lambda _: leave_message(target, answer), None)
-                return emit("the next turn reads it")
+                    self.guarded(lambda _: leave_message(target, answer, force=True), None)
+                self.declined = since
+                return emit("the next turn reads it; until then more lines queue without asking, /now steps in")
             if PROGRESS.get("since") != since:
                 return emit("that turn has ended; the next turn reads it")
         run, camp = self.current_run(target)
@@ -2728,6 +3011,8 @@ class Session:
             self.guarded(lambda _: self.request_stop(), None)
         elif name == "models":
             self.models()
+        elif name == "watch":
+            self.watch()
         else:
             target = self.target(latest=name in ("resume", "status", "transcript", "board"))
             if not target:
@@ -2737,6 +3022,8 @@ class Session:
                     emit("usage: /say TEXT")
                 elif self.guarded(cmd_say, argparse.Namespace(run=str(target), message=self.with_images(rest))):
                     self.images.clear()
+            elif name == "queue":
+                self.queue(target, rest)
             elif name == "now":
                 if not rest and not self.images:
                     emit("usage: /now TEXT")
@@ -2796,6 +3083,27 @@ class Session:
         if target:
             write_tuning(target, choice)
         emit("saved: " + models_line(choice) + (" (applies from the next turn)" if self.busy() else ""))
+
+    def queue(self, target, rest):
+        if rest == "clear":
+            dropped = []
+            if self.guarded(lambda _: dropped.append(clear_queue(target)), None):
+                emit(f"dropped {dropped[0]} message(s)")
+            return
+        if rest:
+            return emit("usage: /queue [clear]")
+        waiting = queued(target)
+        if not waiting:
+            return emit("nothing waits for the next turn")
+        width = term_width()
+        emit("\n".join([f"{len(waiting)} of {MAX_QUEUED} waiting for the next turn:"] +
+                        [fit_width(f"  {i}. {' '.join(m.split())}", width - 1) for i, m in enumerate(waiting, 1)]))
+
+    def watch(self):
+        cmd = watch_command()
+        if open_watch_pane(cmd):
+            return emit("watching in the pane on the right; Ctrl+C there closes it")
+        emit("to see what the agents do, run this in a pane beside this one:\n  " + shlex.join(cmd))
 
     def show_board(self, target):
         run, camp = self.current_run(target)
@@ -2869,6 +3177,37 @@ class Session:
             self.launch("campaign", lambda: campaign_loop(target))
         else:
             self.guarded(parsed.fn, parsed)
+
+
+# AppleScript for iTerm2: split the session typing /watch, then give it back the keyboard.
+ITERM_SPLIT = """tell application "iTerm2"
+    set here to current session of current window
+    tell here to split vertically with default profile command "%s"
+    tell here to select
+end tell"""
+
+
+def watch_command():
+    """`tandem watch` for another pane: same Python, same tandem.py, same RUNS as this session."""
+    return [shutil.which("env") or "/usr/bin/env", f"TANDEM_RUNS={RUNS}", sys.executable,
+            str(ROOT / "tandem.py"), "watch"]
+
+
+def open_watch_pane(cmd):
+    """Run cmd in a new pane to the right, in tmux or iTerm2. False when neither is here or it failed."""
+    line = shlex.join(cmd)
+    try:
+        if os.environ.get("TMUX") and shutil.which("tmux"):
+            done = subprocess.run(["tmux", "split-window", "-h", "-d", "-l", "40%", line],
+                                  capture_output=True, timeout=10)
+        elif os.environ.get("TERM_PROGRAM") == "iTerm.app" and shutil.which("osascript"):
+            quoted = line.replace("\\", "\\\\").replace('"', '\\"')
+            done = subprocess.run(["osascript", "-e", ITERM_SPLIT % quoted], capture_output=True, timeout=10)
+        else:
+            return False
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return done.returncode == 0
 
 
 class SessionEnd(BaseException):

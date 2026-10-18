@@ -1161,6 +1161,9 @@ class Correction(unittest.TestCase):
         self.assertIn(f"### Turn 1 - Codex - interrupted by the owner - commit {first['commit']}",
                       (run_dir / "transcript.md").read_text())
         self.assertFalse((run_dir / "INTERRUPT").exists())
+        activity = (run_dir / "activity.log").read_text()
+        self.assertIn("\tcodex\t= interrupted (", activity)  # `tandem watch` sees each turn end
+        self.assertIn("\tcodex\t= continue (", activity)
 
     def test_interrupt_is_never_retried_or_counted(self):
         run_dir = self.run_dir_with()
@@ -1311,6 +1314,7 @@ class Correction(unittest.TestCase):
                     return error
                 raise error
             (run / "inbox.md").write_text("")
+            session.declined = None  # asked once per turn; each answer here stands for a fresh turn
             with self.subTest(answer=error), mock.patch.dict(tandem.CURRENT, {"target": run}), \
                     mock.patch.object(session.console, "ask", side_effect=ask) as asked, \
                     mock.patch.object(tandem, "signal_children") as signal_children, \
@@ -1320,7 +1324,8 @@ class Correction(unittest.TestCase):
             signal_children.assert_not_called()
             self.assertFalse((run / "INTERRUPT").exists())
             lines = [c.args[0] for c in emit.call_args_list]
-            self.assertEqual(lines, ["✓ saved for the next turn", "the next turn reads it"])
+            self.assertEqual(lines, ["✓ queued for the next turn (1 waiting)",
+                                     "the next turn reads it; until then more lines queue without asking, /now steps in"])
         self.assertIn("[image: /tmp/shot.png]", seen[0])  # pending images go with it, as with /say
         self.assertEqual(session.images, [])
 
@@ -1337,7 +1342,7 @@ class Correction(unittest.TestCase):
         self.assertFalse((run / "INTERRUPT").exists())
         self.assertEqual((run / "inbox.md").read_text(), "use tabs not spaces\n\nand rename the file\n\n")
         self.assertEqual([c.args[0] for c in emit.call_args_list],
-                         ["✓ saved for the next turn", "the next turn reads it"])
+                         ["✓ queued for the next turn (1 waiting)", "the next turn reads it; until then more lines queue without asking, /now steps in"])
 
     def test_yes_interrupts(self):
         run = self.run_target()
@@ -2552,7 +2557,7 @@ class SessionProcess(unittest.TestCase):
         seen = len(self.text())
         self.wait_for(lambda: self.text()[seen:].count("working...") >= 2, "the status ticking while typing")
         os.write(self.master, b"\r")
-        self.wait_for(lambda: "saved for the next turn" in self.text(), "the typed line arriving")
+        self.wait_for(lambda: "queued for the next turn" in self.text(), "the typed line arriving")
         self.assertIn("tandem> abc", [plain(r) for r in screen(self.text())])
 
     def test_typing_survives_a_log_line(self):
@@ -2594,6 +2599,204 @@ class SessionProcess(unittest.TestCase):
             self.assertEqual(proc.wait(timeout=20), 4)
         self.assertFalse(self.alive(self.agent_pids()[0]))
         self.assertEqual(json.loads(log.read_text())["outcome"], "stopped")
+
+
+class Queue(unittest.TestCase):
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.run = pathlib.Path(temp.name)
+        (self.run / "state.json").write_text("{}")
+
+    def test_messages_queue_up_to_the_limit(self):
+        for n in range(1, tandem.MAX_QUEUED + 1):
+            self.assertEqual(tandem.leave_message(self.run, f"note {n}\n\n\nsecond line"), n)
+        self.assertEqual(tandem.queued(self.run)[0], "note 1\nsecond line")  # blank lines separate messages
+        with self.assertRaisesRegex(ValueError, "already wait for the next turn"):
+            tandem.leave_message(self.run, "one too many")
+        self.assertEqual(len(tandem.queued(self.run)), tandem.MAX_QUEUED)
+        self.assertEqual(tandem.leave_message(self.run, "now", force=True), tandem.MAX_QUEUED + 1)
+        self.assertEqual(tandem.clear_queue(self.run), tandem.MAX_QUEUED + 1)
+        self.assertEqual(tandem.queued(self.run), [])
+        self.assertEqual(tandem.take_inbox([self.run / "inbox.md"]), "")
+
+    def session(self):
+        session = tandem.Session(argparse.Namespace(), tandem.Console(fancy=False))
+        session.thread = mock.Mock()
+        session.thread.is_alive.return_value = True
+        return session
+
+    def test_asked_once_per_turn(self):
+        session = self.session()
+        with mock.patch.dict(tandem.CURRENT, {"target": self.run}), \
+                mock.patch.dict(tandem.PROGRESS, {"since": 1.0}), \
+                mock.patch.object(session.console, "ask", return_value="") as ask, \
+                mock.patch.object(tandem, "emit") as emit:
+            session.typed("first")
+            session.typed("second")
+            self.assertEqual(ask.call_count, 1)
+            self.assertEqual(emit.call_args[0][0], "\u2713 queued for the next turn (2 waiting)")
+            tandem.PROGRESS["since"] = 2.0  # the next turn asks again
+            session.typed("third")
+            self.assertEqual(ask.call_count, 2)
+
+    def test_full_queue_refuses_but_now_goes_through(self):
+        session = self.session()
+        for n in range(tandem.MAX_QUEUED):
+            tandem.leave_message(self.run, f"note {n}")
+        with mock.patch.dict(tandem.CURRENT, {"target": self.run}), \
+                mock.patch.object(session.console, "ask") as ask, \
+                mock.patch.object(tandem, "interrupt_turn") as interrupt, \
+                mock.patch.object(tandem, "emit") as emit:
+            session.typed("more")
+            ask.assert_not_called()
+            self.assertIn("/queue clear drops them", emit.call_args[0][0])
+            session.handle("now", "stop and read these")
+            interrupt.assert_called_once_with(self.run)
+        self.assertEqual(tandem.queued(self.run)[-1], "stop and read these")
+
+    def test_queue_command_lists_and_clears(self):
+        session = self.session()
+        tandem.leave_message(self.run, "use tabs\nnot spaces")
+        with mock.patch.dict(tandem.CURRENT, {"target": self.run}), mock.patch.object(tandem, "emit") as emit:
+            session.handle("queue", "")
+            self.assertEqual(emit.call_args[0][0].splitlines(),
+                             [f"1 of {tandem.MAX_QUEUED} waiting for the next turn:", "  1. use tabs not spaces"])
+            session.handle("queue", "clear")
+            self.assertEqual(emit.call_args[0][0], "dropped 1 message(s)")
+            session.handle("queue", "")
+            self.assertEqual(emit.call_args[0][0], "nothing waits for the next turn")
+
+
+class Activity(unittest.TestCase):
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.dir = pathlib.Path(temp.name)
+        self.work = self.dir / "work"
+
+    def test_claude_events_become_short_lines(self):
+        def event(kind, *parts):
+            return {"type": kind, "message": {"content": list(parts)}}
+        tool = lambda name, **args: {"type": "tool_use", "name": name, "input": args}
+        seen = [
+            event("assistant", {"type": "text", "text": "\nI'll read the tests first.\nThen fix."}),
+            event("assistant", tool("Bash", command="python3 -m unittest\necho done", description="x")),
+            event("assistant", tool("Edit", file_path=str(self.work / "tandem.py")), tool("Grep", pattern="def loop")),
+            event("user", {"type": "tool_result", "is_error": True, "content": "Exit code 1\nboom"}),
+            event("user", {"type": "tool_result", "content": "fine"}),
+            event("assistant", tool("StructuredOutput", status="done"), {"type": "thinking", "thinking": "hm"}),
+            {"type": "system", "subtype": "init"},
+            event("assistant", tool("mcp__x__y")),
+        ]
+        lines = [line for e in seen for line in tandem.claude_actions(e, self.work)]
+        self.assertEqual(lines, ["\u00bb I'll read the tests first.", "$ python3 -m unittest", "edit tandem.py",
+                                 "grep def loop", "\u2717 Exit code 1", "mcp__x__y"])
+
+    def test_codex_log_becomes_short_lines(self):
+        log = ["OpenAI Codex v0.163.0", "user", "Goal: codex", "exec", "the prompt", "codex",
+               "I'll review the last commit.", "more of that message", "",
+               "exec", f"/bin/zsh -lc 'git show HEAD --stat' in {self.work}", " succeeded in 12ms:",
+               "exec", "exec", f'/bin/zsh -lc "rg -n \'x\' tandem.py" in {self.work}', " exited 1 in 30ms:",
+               "exec", "/bin/zsh -lc 'cat CLAUDE.md", "if [ -f AGENTS.md ]; then cat AGENTS.md; fi' in /w",
+               "apply patch", "patch: completed", f"{self.work}/README.md", f"{self.work}/tandem.py",
+               "tokens used", "51,292"]
+        reader = tandem.CodexActivity(str(self.work))
+        lines = [text for text in map(reader.feed, log) if text]
+        self.assertEqual(lines, ["$ the prompt", "\u00bb I'll review the last commit.", "$ git show HEAD --stat",
+                                 "$ rg -n 'x' tandem.py", "\u2717 exited 1", "$ cat CLAUDE.md",
+                                 "edit README.md", "edit tandem.py"])
+
+    def test_claude_payload_from_stream_or_plain_json(self):
+        result = {"type": "result", "structured_output": {"status": "done"}, "total_cost_usd": .5}
+        stream = "\n".join([json.dumps({"type": "system"}), "not json", json.dumps(result), ""])
+        self.assertEqual(tandem.claude_payload(stream), result)
+        self.assertEqual(tandem.claude_payload('{\n "result": "x"\n}'), {"result": "x"})
+        self.assertIsNone(tandem.claude_payload("[1]"))
+        self.assertIsNone(tandem.claude_payload("crashed"))
+
+    def test_run_claude_streams_into_the_activity_log(self):
+        schema = self.dir / "schema.json"
+        schema.write_text("{}")
+        result = {"type": "result", "structured_output": {"status": "done"}, "total_cost_usd": .5}
+        stream = [json.dumps({"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "name": "Read", "input": {"file_path": str(self.work / "a.py")}}]}}),
+            "{broken", json.dumps(result)]
+
+        def fake(cmd, **kwargs):
+            for line in stream:
+                kwargs["on_line"]("stdout", line)
+            kwargs["on_line"]("stderr", "a warning")
+            return subprocess.CompletedProcess(cmd, 0, "\n".join(stream) + "\n", "a warning\n")
+
+        cfg = {"timeout": 5, "claude_permission_mode": "acceptEdits"}
+        with mock.patch.object(tandem, "run_child", side_effect=fake) as run:
+            self.assertEqual(tandem.run_claude(cfg, self.work, "goal", self.dir / "turn-03-claude", schema,
+                                               "status", False), ({"status": "done"}, .5))
+        cmd = run.call_args[0][0]
+        self.assertEqual(cmd[cmd.index("--output-format") + 1:cmd.index("--output-format") + 3],
+                         ["stream-json", "--verbose"])
+        lines = [line.split("\t", 1)[1] for line in (self.dir / "activity.log").read_text().splitlines()]
+        self.assertEqual(lines, ["claude\t\u2500\u2500 turn 3 \u2500\u2500", "claude\tread a.py"])
+        self.assertEqual(json.loads((self.dir / "turn-03-claude.json").read_text()), result)
+
+    def test_follow_output_hands_over_lines_as_they_come(self):
+        seen = []
+        script = "import sys, time\nprint('one', flush=True)\nprint('oops', file=sys.stderr)\nprint(sys.stdin.read())"
+        proc = tandem.run_child([sys.executable, "-c", script], input="from stdin",
+                                on_line=lambda stream, line: seen.append((stream, line)))
+        self.assertEqual((proc.returncode, proc.stdout, proc.stderr), (0, "one\nfrom stdin\n", "oops\n"))
+        self.assertEqual(sorted(seen), [("stderr", "oops"), ("stdout", "from stdin"), ("stdout", "one")])
+        with self.assertRaises(subprocess.TimeoutExpired):
+            tandem.run_child([sys.executable, "-c", "import time; time.sleep(30)"], timeout=.5,
+                             on_line=lambda *_: None)
+        self.assertFalse(tandem.CHILDREN)
+
+    def test_watch_follows_the_run_that_acted_last(self):
+        old, new = self.dir / "20261001-old", self.dir / "20261002-camp" / "01-goal"
+        for run in (old, new):
+            run.mkdir(parents=True)
+        tandem.note_activity(old, "claude", "$ ls")
+        os.utime(old / tandem.ACTIVITY, (1, 1))
+        tandem.note_activity(new, "codex", "\u2500\u2500 turn 1 \u2500\u2500")
+        out = io.StringIO()
+        ticks = iter([None, KeyboardInterrupt])
+
+        def sleep(_):
+            step = next(ticks)
+            if step:
+                raise step
+            tandem.note_activity(new, "check", "= passed")  # arrives while watching
+
+        with mock.patch.object(tandem, "RUNS", self.dir), mock.patch("sys.stdout", out), \
+                mock.patch.object(tandem.time, "sleep", side_effect=sleep), \
+                mock.patch.object(tandem, "term_width", return_value=60):
+            tandem.cmd_watch(argparse.Namespace(run=None))
+        lines = out.getvalue().splitlines()
+        self.assertEqual(lines[2], "01-goal")
+        self.assertRegex(lines[3], r"^\d\d:\d\d:\d\d codex  \u2500\u2500 turn 1 \u2500\u2500$")
+        self.assertRegex(lines[4], r"^\d\d:\d\d:\d\d check  = passed$")
+        self.assertNotIn("$ ls", out.getvalue())
+
+    def test_watch_pane_opens_in_tmux_or_iterm_or_not_at_all(self):
+        cmd = tandem.watch_command()
+        self.assertEqual(cmd[1:], [f"TANDEM_RUNS={tandem.RUNS}", sys.executable, str(ROOT / "tandem.py"), "watch"])
+        done = subprocess.CompletedProcess([], 0)
+        for env, program in (({"TMUX": "/tmp/tmux-1/default"}, "tmux"), ({"TERM_PROGRAM": "iTerm.app"}, "osascript")):
+            with self.subTest(program=program), mock.patch.dict(os.environ, env), \
+                    mock.patch.object(tandem.shutil, "which", return_value="/bin/x"), \
+                    mock.patch.object(tandem.subprocess, "run", return_value=done) as run:
+                os.environ.pop("TMUX", None) if program == "osascript" else None
+                self.assertTrue(tandem.open_watch_pane(['/a b/python3', 'say "hi"']))
+            args = run.call_args[0][0]
+            self.assertEqual(args[0], program)
+            if program == "osascript":
+                self.assertIn('command "\'/a b/python3\' \'say \\"hi\\"\'"', args[2])
+        with mock.patch.dict(os.environ, {"TERM_PROGRAM": "Apple_Terminal"}), \
+                mock.patch.object(tandem.subprocess, "run") as run:
+            os.environ.pop("TMUX", None)
+            self.assertFalse(tandem.open_watch_pane(cmd))
+        run.assert_not_called()
 
 
 if __name__ == "__main__":
