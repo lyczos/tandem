@@ -46,7 +46,7 @@ The interactive session (`cmd_interactive`, `Session`, `Console`) runs `loop()` 
 while the main thread reads input. All output must go through `emit()`/`log()` (one `OUT_LOCK`),
 never bare `print` from code that can run during a run, or the prompt redraw breaks. On a POSIX
 terminal `LineEditor` owns the prompt row and the rows around it (status line above, slash-command
-menu below); `Console.write` must erase and redraw both around every line it prints. While it
+menu and status bar below); `Console.write` must erase and redraw them around every line it prints. While it
 runs, every child the worker starts (agents, the check, git) gets its own session and `/dev/null`
 on stdin (`CHILD_POPEN`) so Ctrl+C at the prompt cannot kill a turn or fail a check. Being out of
 the terminal's reach, agents and checks go through `run_child()`, which tracks them in `CHILDREN`:
@@ -137,7 +137,9 @@ Never write `state.json` from the session: the loop holds a copy in memory and w
 ### Agents, prompts and schemas
 
 `run_claude` and `run_codex` are the only places that know a CLI's flags; `RUNNERS` dispatches by
-agent name, and both return `(result_dict, cost_usd)` — Codex cost is always 0.0. Both pass a JSON
+agent name, and both return `(result_dict, cost_usd, usage)` — Codex cost is always 0.0, and `usage`
+holds only the tokens and model the CLI reported (`claude_usage()`, `codex_usage()`), never a guess.
+Callers unpack `result, cost, *more` so test stubs returning two values still work. Both pass a JSON
 schema to the CLI and fall back to `parse_result()`, which accepts a bare JSON object or the last
 fenced ```json block in free text.
 

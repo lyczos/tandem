@@ -573,6 +573,88 @@ def board(state, fancy, width, campaign=None):
     return draw_box(title, rows, AGENT_COLORS[last["agent"]] if last else AGENT_COLORS["claude"], fancy, width)
 
 
+def usage_tokens(usage):
+    """Tokens one turn used: Codex reports a total, Claude Code input and output apart."""
+    return usage.get("total", usage.get("input", 0) + usage.get("output", 0))
+
+
+def short_count(n):
+    return f"{n}" if n < 1000 else f"{n / 1000:.0f}k" if n < 999500 else f"{n / 1e6:.1f}M"
+
+
+def short_span(secs):
+    secs = int(secs)
+    return f"{secs // 3600}h{secs // 60 % 60:02d}m" if secs >= 3600 else f"{secs // 60}m{secs % 60:02d}s"
+
+
+def fit_segments(segments, width, fancy):
+    """Join (text, style) pairs cut to width columns with an ellipsis, colored only after the cut:
+    escape codes take no columns, so fitting the colored string would cut it short."""
+    out, used, total = [], 0, sum(display_width(t) for t, _ in segments)
+    room = width if total <= width else max(width - 1, 0)
+    for text, style in segments:
+        text = fit_width(text, room - used)
+        used += display_width(text)
+        if text:
+            out.append(f"\x1b[{style}m{text}\x1b[0m" if fancy and style else text)
+        if used >= room:
+            break
+    return "".join(out) + ("\u2026" if total > width and width else "")
+
+
+def status_bar(state, now, width, fancy, progress=None, session_start=None, defaults=None):
+    """The rows under the prompt: what each agent runs and does, then the run's numbers.
+
+    state is the run's state.json, or None before the first run (defaults then name the models).
+    progress is PROGRESS while a turn runs, else empty; session_start is when the session began."""
+    cfg = dict(defaults or {}, **(state or {}).get("config", {})) if state else dict(defaults or {})
+    history = (state or {}).get("history", [])
+    progress = PROGRESS if progress is None else progress
+    dim, sep = "2", (" \u00b7 ", "2")
+
+    def model(agent):
+        ran = next((h["model"] for h in reversed(history) if h["agent"] == agent and h.get("model")), None)
+        return f"{cfg.get(agent + '_model') or ran or 'default'}/{cfg.get(agent + '_effort') or 'default'}"
+
+    def doing(agent):
+        if progress.get("agent") == agent and progress.get("since"):
+            return f"working {short_span(now - progress['since'])}", STATUS_COLORS["continue"]
+        if state and state.get("failures", {}).get(agent, 0) >= MAX_FAILURES_PER_AGENT:
+            return "benched", STATUS_COLORS["error"]
+        away = unavailable_until(agent)
+        if away:
+            return f"away until {away:%H:%M}", STATUS_COLORS["blocked"]
+        return ("next", None) if state.get("next") == agent and not state.get("outcome") else ("waiting", dim)
+
+    first = []
+    for agent in NAMES:
+        if first:
+            first.append(("   ", None))
+        first += [(agent, f"38;5;{AGENT_COLORS[agent]}"), (" " + model(agent), None)]
+        if state:
+            first += [sep, doing(agent)]
+    if not state:
+        return [fit_segments(first + [sep, ("/models to change", dim)], width, fancy)]
+
+    second = [("turn ", dim), (f"{min(state['turn'], state['max_turns'])}/{state['max_turns']}", None),
+              sep, (f"${state.get('cost_usd', 0):.2f}", None)]
+    tokens = sum(usage_tokens(h["usage"]) for h in history if h.get("usage"))  # only what was reported
+    if tokens:
+        second += [sep, (short_count(tokens), None), (" tok", dim)]
+    if session_start is not None:
+        second += [sep, ("session ", dim), (short_span(now - session_start), None)]
+    stat = state.get("diffstat")
+    if stat:
+        second += [sep, (f"+{stat['added']}", "32"), (" ", None), (f"\u2212{stat['removed']}", "31")]
+    if cfg.get("check"):
+        passed = state.get("check_passed")
+        mark = ("\u2013", None) if passed is None else ("\u2713", "32") if passed else ("\u2717", "31")
+    else:
+        mark = ("\u2013", None)
+    second += [sep, ("check ", dim), mark]
+    return [fit_segments(first, width, fancy), fit_segments(second, width, fancy)]
+
+
 def report_turn(entry):
     """One finished turn: a card in a fancy session, the single log line everywhere else (logs, pipes, NO_COLOR)."""
     if CONSOLE and CONSOLE.fancy:
@@ -842,7 +924,39 @@ def run_claude(cfg, worktree, prompt, out_base, schema, key, readonly):
     if payload.get("is_error"):
         raise RuntimeError(f"{payload.get('subtype')}: {tail(str(payload.get('result')))}")
     result = payload.get("structured_output") or parse_result(payload.get("result"), key)
-    return result, payload.get("total_cost_usd") or 0.0
+    return result, payload.get("total_cost_usd") or 0.0, claude_usage(payload)
+
+
+def claude_usage(payload):
+    """Tokens and the model the turn actually ran on, from what the payload reports; nothing is guessed."""
+    found, usage = {}, payload.get("usage")
+    if isinstance(usage, dict):
+        counts = [usage.get(k) for k in ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens")]
+        if any(isinstance(n, int) for n in counts):
+            found["input"] = sum(n for n in counts if isinstance(n, int))
+        if isinstance(usage.get("output_tokens"), int):
+            found["output"] = usage["output_tokens"]
+    models = payload.get("modelUsage")
+    if isinstance(models, dict) and models:
+        # Claude Code calls a small model on the side; the one that cost the most did the turn.
+        found["model"] = max(models, key=lambda m: (models[m].get("costUSD") or 0)
+                             if isinstance(models[m], dict) else 0)
+    return found
+
+
+def codex_usage(text):
+    """codex exec prints `model: NAME` in its header and `tokens used` (with or without a colon, the
+    count on the same line or the next) at the end; only the total is known."""
+    found = {}
+    # The log also holds the output of commands the agent ran, which may say the same words;
+    # codex's own count is the last one.
+    counts = re.findall(r"^tokens used:?\s*([\d,]+)\s*$", text, re.M | re.I)
+    if counts:
+        found["total"] = int(counts[-1].replace(",", ""))
+    m = re.search(r"^model:\s*(\S+)\s*$", text, re.M)
+    if m:
+        found["model"] = m.group(1)
+    return found
 
 
 def run_codex(cfg, worktree, prompt, out_base, schema, key, readonly):
@@ -876,7 +990,8 @@ def run_codex(cfg, worktree, prompt, out_base, schema, key, readonly):
     if proc.returncode != 0:
         errors = [l for l in (proc.stderr + "\n" + proc.stdout).splitlines() if l.startswith("ERROR")]
         raise RuntimeError(f"exit {proc.returncode}: {tail(errors[-1] if errors else proc.stderr or proc.stdout)}")
-    return parse_result(last.read_text() if last.exists() else proc.stdout, key), 0.0
+    return (parse_result(last.read_text() if last.exists() else proc.stdout, key), 0.0,
+            codex_usage(proc.stdout + "\n" + proc.stderr))
 
 
 RUNNERS = {"claude": run_claude, "codex": run_codex}
@@ -894,6 +1009,16 @@ def commit_turn(state, agent, turn, summary, failed):
     msg = f"tandem({agent}): {label}turn {turn}{' (failed)' if failed else ''} - {title}"
     git(work, "commit", "-q", "--no-verify", "-m", msg)
     return git(work, "rev-parse", "--short", "HEAD")
+
+
+def diffstat(worktree, base):
+    """{"added": N, "removed": N} for the branch so far, from git's own summary line."""
+    try:
+        line = git(worktree, "diff", "--shortstat", f"{base}..HEAD")
+    except GitError:
+        return None
+    counts = {kind: int(n) for n, kind in re.findall(r"(\d+) (insertion|deletion)", line)}
+    return {"added": counts.get("insertion", 0), "removed": counts.get("deletion", 0)}
 
 
 def run_check(state):
@@ -1025,8 +1150,15 @@ def loop(run_dir):
             PROGRESS.update(turn=turn, agent=agent, since=started)
         entry = {"turn": turn, "agent": agent, "started": now()}
         try:
-            result, cost = call_agent(agent, cfg, state["worktree"], prompt, out_base, TURN_SCHEMA, "status",
-                                      False, state.get("stop_file"), run_dir)
+            result, cost, *more = call_agent(agent, cfg, state["worktree"], prompt, out_base, TURN_SCHEMA,
+                                             "status", False, state.get("stop_file"), run_dir)
+            usage = dict(more[0]) if more and more[0] else {}
+            if usage.get("model"):
+                entry["model"] = usage.pop("model")
+            if usage:
+                entry["usage"] = usage
+                totals = state.setdefault("tokens", {"claude": 0, "codex": 0})
+                totals[agent] = totals.get(agent, 0) + usage_tokens(usage)
             if not result:
                 raise RuntimeError("no structured result in the agent's reply")
             entry.update({k: str(result.get(k, "")).strip() for k in
@@ -1052,6 +1184,9 @@ def loop(run_dir):
         entry["seconds"] = round(time.time() - started)
         entry["commit"] = commit_turn(state, agent, turn, entry.get("summary") or entry.get("error"),
                                       entry["status"] == "error")
+        if entry["commit"]:
+            # Once per commit, here, so the status bar never runs git on its own every second.
+            state["diffstat"] = diffstat(state["worktree"], state["base"])
         state["history"].append(entry)
         state["turn"] += 1
         if entry["status"] == "interrupted":
@@ -1085,6 +1220,7 @@ def loop(run_dir):
                     note_activity(run_dir, "check", "$ " + cfg["check"])
                 ok, output = run_check(state)
                 if cfg.get("check"):
+                    state["check_passed"] = ok
                     note_activity(run_dir, "check", "= passed" if ok else "\u2717 failed")
                 if ok:
                     if not peer_agreed:
@@ -1094,6 +1230,7 @@ def loop(run_dir):
                                   f"{who} the goal is met" + (" and the check passed." if cfg.get("check") else "."))
                 state["check_feedback"] = (f"The agents said done, but `{cfg['check']}` failed. "
                                            f"Fix it before saying done again.\n\n```\n{output}\n```")
+                save(run_dir, state)  # the status bar reads the check's verdict from disk
                 log("check failed, continuing")
         elif status == "blocked" and prev and prev["status"] == "blocked":
             return finish(run_dir, state, "blocked", "Both agents need the owner:\n\n" + entry["handoff"])
@@ -1157,7 +1294,7 @@ def plan_next(camp_dir, camp):
         out_base.with_suffix(".prompt.md").write_text(prompt)
         log(f"planning the next goal: {NAMES[planner]}")
         try:
-            result, cost = call_agent(planner, camp["config"], camp["worktree"], prompt, out_base,
+            result, cost, *_ = call_agent(planner, camp["config"], camp["worktree"], prompt, out_base,
                                       PLAN_SCHEMA, "finished", True, camp_dir / "STOP")
             camp["cost_usd"] += cost
             if result:
@@ -2373,19 +2510,32 @@ def history_path():
     return pathlib.Path.home() / ".tandem" / "history"
 
 
+ESCAPE_CODE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+
+
+def char_width(c):
+    return 0 if unicodedata.combining(c) else 2 if unicodedata.east_asian_width(c) in ("W", "F") else 1
+
+
 def display_width(text):
-    """Columns text takes on a terminal: wide East Asian characters take two, combining marks none."""
-    return sum(0 if unicodedata.combining(c) else 2 if unicodedata.east_asian_width(c) in ("W", "F") else 1
-               for c in text)
+    """Columns text takes on a terminal: wide East Asian characters take two, combining marks and
+    escape codes none."""
+    return sum(map(char_width, ESCAPE_CODE.sub("", text)))
 
 
 def fit_width(text, width):
-    """The longest start of text that takes at most width columns."""
-    used = 0
-    for i, c in enumerate(text):
-        used += display_width(c)
+    """The longest start of text that takes at most width columns. Escape codes are kept whole and
+    take no room; a colored line cut short gets a reset, so its color cannot run into the next row."""
+    used, i = 0, 0
+    while i < len(text):
+        code = ESCAPE_CODE.match(text, i)
+        if code:
+            i = code.end()
+            continue
+        used += char_width(text[i])
         if used > width:
-            return text[:i]
+            return text[:i] + ("\x1b[0m" if "\x1b[" in text[:i] else "")
+        i += 1
     return text
 
 
@@ -2424,6 +2574,7 @@ class LineEditor:
         self.touched = False   # a key other than Ctrl+C came during the last read
         self.mid_line = False  # the last read left its line without a newline (Ctrl+C, Ctrl+D)
         self.kept = False      # the last read was an empty Enter: its rows are still on screen, as drawn
+        self.resized = False  # SIGWINCH only sets this; output stays under OUT_LOCK
         self.above = 0         # rows drawn above the prompt row, where the cursor is
         self.history = self.load_history()
         self.hist_pos, self.draft = len(self.history), ""
@@ -2616,6 +2767,12 @@ class LineEditor:
         return lines + [f"\x1b[2m{hint}\x1b[0m" if self.color else hint]
 
     def to_top(self):
+        if self.resized:
+            self.resized = False
+            self.above = 0
+            # Terminals reflow and clamp the cursor differently on resize. Relative movement can
+            # leave wrapped rows behind, so rebuild the visible screen from a known position.
+            return "\x1b[H\x1b[J"
         return "\r" + (f"\x1b[{self.above}A" if self.above else "")
 
     def erase(self):
@@ -2648,10 +2805,37 @@ class Console:
         self.running = False
         self.held = None  # log lines kept back while the /models picker owns the screen
         self.editor = None  # the LineEditor when the terminal allows one, else input() with readline
+        self.started = time.time()  # the bar's session time counts from here, not from the run
+        self.cached = (None, None, None)  # (state.json, its mtime, its contents): read again only when it changes
 
     def attach(self, editor):
         self.editor = editor
-        editor.header = lambda: [self.status_text()] if self.running else []
+        # The bar already says who is working and for how long; the line above the prompt is only
+        # for work the bar cannot show yet, such as a campaign planning its first goal.
+        editor.header = lambda: [self.status_text()] if self.running and not self.bar_state() else []
+        editor.footer_lines = self.bar
+
+    def bar_state(self):
+        """The state of the run the session works on, as last saved; None before there is one."""
+        target = CURRENT.get("target")
+        run = Session.current_run(target)[0] if target else None
+        path = run / "state.json" if run else None
+        try:
+            mtime = path.stat().st_mtime_ns if path else None
+            if path and self.cached[:2] != (path, mtime):
+                self.cached = (path, mtime, json.loads(path.read_text()))
+        except (OSError, ValueError):
+            pass  # gone, or caught mid-write: the last copy read stays good enough for a second
+        return self.cached[2] if path and self.cached[0] == path else None
+
+    def bar(self, width):
+        """The status bar under the prompt. Fit one column short: a full row would wrap on some terminals."""
+        try:
+            state = self.bar_state()
+            return status_bar(state, time.time(), width - 1, self.fancy, PROGRESS if self.running else {},
+                              self.started, None if state else load_defaults())
+        except (KeyError, TypeError, ValueError, AttributeError):
+            return []  # a state.json from an older tandem, or edited by hand: no bar rather than no prompt
 
     def status_text(self):
         if not PROGRESS:
@@ -2722,7 +2906,7 @@ class Console:
         """Redraw the status line in place, without moving the cursor the user is typing at."""
         with OUT_LOCK:
             if self.editor:
-                if self.editor.reading and self.running:
+                if self.editor.reading:  # the bar's clocks move even with no run going
                     self.editor.write(self.editor.redraw())
             elif self.fancy and self.running and self.prompt_active and self.status_shown:
                 sys.stdout.write("\x1b7\x1b[1A\r\x1b[K" + self.status_text() + "\x1b8")
@@ -3257,6 +3441,11 @@ def cmd_interactive(args):
     for name in ("SIGHUP", "SIGTERM"):
         if hasattr(signal, name):
             previous[name] = signal.signal(getattr(signal, name), on_signal)
+
+    if console.editor and hasattr(signal, "SIGWINCH"):
+        def on_resize(signum, frame):
+            console.editor.resized = True
+        previous["SIGWINCH"] = signal.signal(signal.SIGWINCH, on_resize)
 
     ticker_stop = threading.Event()
 

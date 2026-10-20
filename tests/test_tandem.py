@@ -853,6 +853,139 @@ class Cards(unittest.TestCase):
             self.assertIn("turn 3", plain(text))
 
 
+class StatusBar(unittest.TestCase):
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.dir = pathlib.Path(temp.name)
+        patcher = mock.patch.object(tandem, "AVAILABILITY", self.dir / "availability.json")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def state(self, **extra):
+        state = {"turn": 3, "max_turns": 12, "next": "claude", "cost_usd": 0.84,
+                 "failures": {"claude": 0, "codex": 0}, "diffstat": {"added": 477, "removed": 7},
+                 "config": {"claude_model": "opus", "claude_effort": "high", "codex_model": None,
+                            "codex_effort": "low", "check": "make test"},
+                 "history": [{"turn": 1, "agent": "claude", "status": "continue",
+                              "usage": {"input": 30000, "output": 1000}},
+                             {"turn": 2, "agent": "codex", "status": "continue", "model": "gpt-5-codex",
+                              "usage": {"total": 10000}}]}
+        state.update(extra)
+        return state
+
+    def test_bar_shows_models_doing_cost_and_session(self):
+        now = 1000000.0
+        first, second = tandem.status_bar(self.state(), now, 200, False,
+                                          progress={"turn": 3, "agent": "codex", "since": now - 5},
+                                          session_start=now - 4320)
+        self.assertEqual(first, "claude opus/high · next   codex gpt-5-codex/low · working 0m05s")
+        self.assertEqual(second, "turn 3/12 · $0.84 · 41k tok · session 1h12m · "
+                                 "+477 −7 · check –")
+        _, second = tandem.status_bar(self.state(check_passed=False), now, 200, False, progress={})
+        self.assertTrue(second.endswith("check ✗"))
+        self.assertNotIn("session", second)
+        self.assertNotIn("tok", tandem.status_bar(self.state(history=[]), now, 200, False, progress={})[1])
+        idle = tandem.status_bar(None, now, 200, False, progress={}, defaults={"codex_model": "o3"})
+        self.assertEqual(idle, ["claude default/default   codex o3/default · /models to change"])
+
+    def test_bar_fits_and_degrades(self):
+        state = self.state()
+        for fancy in (True, False):
+            lines = tandem.status_bar(state, 0, 30, fancy, progress={}, session_start=0)
+            self.assertEqual(len(lines), 2)
+            for line in lines:
+                self.assertLessEqual(tandem.display_width(line), 30, line)
+                self.assertTrue(plain(line).endswith("…"), line)
+                self.assertEqual(len(plain(line)), 30)  # colored after the cut, so the codes cost no room
+            self.assertEqual("\x1b" in "".join(lines), fancy)
+        self.assertEqual([plain(line) for line in tandem.status_bar(state, 0, 30, True, progress={})],
+                         tandem.status_bar(state, 0, 30, False, progress={}))
+
+    def test_fit_width_skips_escape_codes(self):
+        colored = "\x1b[32mgreen\x1b[0m and more"
+        self.assertEqual(tandem.display_width(colored), 14)
+        self.assertEqual(tandem.fit_width(colored, 14), colored)
+        self.assertEqual(tandem.fit_width(colored, 3), "\x1b[32mgre\x1b[0m")  # the color cannot run on
+
+    def test_away_and_benched_agents(self):
+        until = datetime.datetime.now().replace(second=0, microsecond=0) + datetime.timedelta(hours=1)
+        tandem.write_json(tandem.AVAILABILITY, {"codex": until.isoformat(timespec="seconds")})
+        state = self.state(failures={"claude": tandem.MAX_FAILURES_PER_AGENT, "codex": 0})
+        first = tandem.status_bar(state, 0, 200, False, progress={})[0]
+        self.assertIn(f"codex gpt-5-codex/low · away until {until:%H:%M}", first)
+        self.assertIn("claude opus/high · benched", first)
+        state = self.state(next="codex", outcome="done", failures={"claude": 0, "codex": 0})
+        tandem.AVAILABILITY.unlink()
+        self.assertNotIn("next", tandem.status_bar(state, 0, 200, False, progress={})[0])
+
+    def test_console_bar_follows_the_saved_state(self):
+        console = tandem.Console(fancy=False)
+        with mock.patch.dict(tandem.CURRENT, clear=True), \
+                mock.patch.object(tandem, "load_defaults", return_value={"claude_model": "sonnet"}):
+            self.assertEqual(console.bar(80), ["claude sonnet/default   codex default/default · /models to change"])
+            self.assertTrue(console.bar(40)[0].endswith("…"))
+            self.assertEqual(tandem.display_width(console.bar(40)[0]), 39)  # a column short of a wrap
+            tandem.save(self.dir, self.state())
+            tandem.CURRENT["target"] = self.dir
+            first, second = console.bar(200)
+            self.assertIn("claude opus/high · next", first)
+            self.assertIn("session 0m0", second)
+            (self.dir / "state.json").write_text("{broken")  # caught mid-write: the last copy read stays
+            self.assertEqual(console.bar(200)[0], first)
+
+    def test_usage_is_recorded_from_claude_json_and_codex_log(self):
+        schema = self.dir / "schema.json"
+        schema.write_text("{}")
+        cfg = {"timeout": 5, "claude_permission_mode": "acceptEdits"}
+        payload = {"structured_output": {"status": "done"}, "total_cost_usd": 0.5,
+                   "usage": {"input_tokens": 10, "cache_read_input_tokens": 2000,
+                             "cache_creation_input_tokens": 300, "output_tokens": 45},
+                   "modelUsage": {"claude-haiku-4-5": {"costUSD": 0.01}, "claude-opus-5-5": {"costUSD": 0.49}}}
+        reply = subprocess.CompletedProcess([], 0, json.dumps(payload), "")
+        with mock.patch.object(tandem, "run_child", return_value=reply):
+            self.assertEqual(tandem.run_claude(cfg, self.dir, "goal", self.dir / "c", schema, "status", False),
+                             ({"status": "done"}, 0.5, {"input": 2310, "output": 45, "model": "claude-opus-5-5"}))
+        log = "OpenAI Codex v0.50\n--------\nmodel: gpt-5-codex\nprovider: openai\n--------\ndone\ntokens used: 12,345\n"
+        (self.dir / "x.last.json").write_text('{"status": "continue"}')
+        with mock.patch.object(tandem, "run_child", return_value=subprocess.CompletedProcess([], 0, "", log)):
+            self.assertEqual(tandem.run_codex(cfg, self.dir, "goal", self.dir / "x", schema, "status", False),
+                             ({"status": "continue"}, 0.0, {"total": 12345, "model": "gpt-5-codex"}))
+        self.assertEqual(tandem.codex_usage("tokens used\n9,876\n"), {"total": 9876})
+        self.assertEqual(tandem.codex_usage("no numbers here"), {})
+        # A command the agent ran may print the same words; codex's own count comes last.
+        self.assertEqual(tandem.codex_usage("exec\ntokens used: 5\nexited 0\ntokens used\n50,881\n"), {"total": 50881})
+        self.assertEqual(tandem.claude_usage({"result": "x"}), {})
+
+    def test_loop_keeps_usage_on_entries_and_totals_in_state(self):
+        repo = self.dir / "repo"
+        env = {"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.com",
+               "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.com"}
+        with mock.patch.dict(os.environ, env), mock.patch.object(tandem, "log"):
+            subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            (repo / "a.txt").write_text("one\n")
+            subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True)
+            subprocess.run(["git", "-C", str(repo), "commit", "-qm", "init"], check=True)
+            cfg = {"check": None, "timeout": 5, "claude_permission_mode": "acceptEdits"}
+            run_dir = tandem.create_run(self.dir / "run", repo, "goal", "g", cfg, 2, "claude")
+            work = pathlib.Path(tandem.load(run_dir)["worktree"])
+
+            def agent(name, *args, **kwargs):
+                if name == "claude":
+                    (work / "a.txt").write_text("two\nthree\n")
+                    return {"status": "done"}, 0.1, {"input": 100, "output": 5, "model": "claude-opus-5-5"}
+                return {"status": "done"}, 0.0, {}
+
+            with mock.patch.object(tandem, "call_agent", side_effect=agent):
+                tandem.loop(run_dir)
+        state = tandem.load(run_dir)
+        self.assertEqual(state["history"][0]["usage"], {"input": 100, "output": 5})
+        self.assertEqual(state["history"][0]["model"], "claude-opus-5-5")
+        self.assertNotIn("usage", state["history"][1])  # Codex reported nothing: nothing is guessed
+        self.assertEqual(state["tokens"], {"claude": 105, "codex": 0})
+        self.assertEqual(state["diffstat"], {"added": 2, "removed": 1})
+
+
 class Interactive(unittest.TestCase):
     def test_slash_parser(self):
         parse = tandem.parse_input
@@ -1659,6 +1792,8 @@ def screen(text):
                 c += n
             elif final == "D":
                 c = max(c - n, 0)
+            elif final == "H":
+                r, c = 0, 0
             elif final == "G":
                 c = n - 1
             elif final in "KJ":
@@ -1674,6 +1809,17 @@ def screen(text):
     return rows
 
 
+BAR_ROW = re.compile(r"^(claude \S+/\S+ |turn \d+/\d+ \u00b7 )")
+
+
+def without_bar(rows):
+    """The rows above the status bar, which the session draws under the prompt and its menu."""
+    end = len(rows)
+    while end and BAR_ROW.match(rows[end - 1]):
+        end -= 1
+    return rows[:end]
+
+
 class Editor(unittest.TestCase):
     def setUp(self):
         temp = tempfile.TemporaryDirectory()
@@ -1686,6 +1832,28 @@ class Editor(unittest.TestCase):
 
     def read(self, *keys, **kw):
         return self.editor(*keys, **kw).read("tandem> ")
+
+    def test_resize_clears_reflowed_rows_before_redrawing(self):
+        editor = self.editor(color=True)
+        editor.prompt = "tandem> "
+        editor.buffer, editor.cursor = "x" * 65, 65
+        editor.header = lambda: ["turn 3: Codex working... 0m05s"]
+        editor.footer_lines = lambda width: tandem.status_bar(None, 0, width - 1, True)
+        with mock.patch.object(tandem, "term_width", return_value=100):
+            editor.redraw()
+        # Reflow differs between terminals. Start from arbitrary wrapped rows and cursor position.
+        wrapped = "old header\nwrapped header\nold prompt\nwrapped prompt\nold bar\n"
+        editor.resized = True
+        with mock.patch.object(tandem, "term_width", return_value=30):
+            update = editor.redraw()
+            self.assertTrue(update.startswith("\x1b[H\x1b[J"))
+            rows = screen(wrapped + update)
+            self.assertEqual(len(rows), 3)
+            self.assertTrue(rows[1].startswith("tandem> "))
+            self.assertTrue(rows[2].startswith("claude "))
+            self.assertTrue(all(tandem.display_width(row) < 30 for row in rows))
+            self.assertFalse(editor.resized)
+            self.assertFalse(editor.redraw().startswith("\x1b[H"))
 
     def test_slash_matches(self):
         def names(buffer):
@@ -1859,7 +2027,7 @@ class Editor(unittest.TestCase):
             with self.assertRaises(EOFError):
                 console.ask("tandem> ")
             self.assertNotIn("\x1b7", self.out.getvalue())  # never save/restore cursor
-            self.assertEqual(seen[0][-3:], ["a log line", "turn 2: Codex working... 0m05s", "tandem> abc"])
+            self.assertEqual(without_bar(seen[0])[-3:], ["a log line", "turn 2: Codex working... 0m05s", "tandem> abc"])
             self.assertEqual(sum("working..." in r for r in seen[0]), 1)
             tandem.emit("")  # what the session prints after Ctrl+C or Ctrl+D: it only ends the line
             tandem.emit("after")
@@ -2485,14 +2653,36 @@ class SessionProcess(unittest.TestCase):
         self.assertEqual(self.proc.wait(timeout=10), 0, self.text())
 
     def screen_ends_with_prompt(self, text="tandem> "):
-        return lambda: screen(self.text())[-1] == text
+        return lambda: without_bar(screen(self.text()))[-1:] == [text]
+
+    def test_status_bar_is_drawn_below_the_prompt(self):
+        self.start_slow_turn(NO_COLOR=None)
+        self.wait_for(lambda: any("claude " in row and "working" in row
+                                 for row in screen(self.text())[-2:]), "the live status bar")
+        os.write(self.master, b"draft")
+        self.wait_for(self.screen_ends_with_prompt("tandem> draft"), "text above the bar")
+        import fcntl
+        import struct
+        import termios
+        fcntl.ioctl(self.master, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 40, 0, 0))
+        seen = len(self.text())
+        os.kill(self.proc.pid, signal.SIGWINCH)
+        self.wait_for(lambda: "\x1b[H\x1b[J" in self.text()[seen:], "resize clearing old rows")
+        self.wait_for(self.screen_ends_with_prompt("tandem> draft"), "draft kept after resize")
+        rows = screen(self.text())
+        self.assertTrue(all(tandem.display_width(row) < 40 for row in rows))
+        self.assertIn("working", rows[-2])
+        os.write(self.master, b"\x7f!")
+        self.wait_for(self.screen_ends_with_prompt("tandem> draf!"), "editing after resize")
+        os.write(self.master, b"\x03\x03\x03")
+        self.assertEqual(self.proc.wait(timeout=20), 0, self.text())
 
     def test_slash_menu_shows_descriptions(self):
         self.start(NO_COLOR=None)
         self.wait_for(lambda: "tandem> " in self.text(), "the prompt")
         os.write(self.master, b"/m")
         self.wait_for(lambda: "pick Claude and Codex model" in self.text(), "the menu")
-        rows = screen(self.text())
+        rows = without_bar(screen(self.text()))
         at = rows.index("tandem> /m")
         self.assertRegex(rows[at + 1], r"/models +pick Claude and Codex model and effort")
         self.assertIn("/campaign", rows[-2])  # it has an m too, after the names that start with one
@@ -2513,7 +2703,7 @@ class SessionProcess(unittest.TestCase):
         os.write(self.master, b"\x1b")
         self.wait_for(lambda: "models unchanged" in self.text(), "the picker closing")
         self.wait_for(self.screen_ends_with_prompt(), "a fresh prompt")
-        self.assertEqual(screen(self.text())[-2], "models unchanged")
+        self.assertEqual(without_bar(screen(self.text()))[-2], "models unchanged")
 
     def test_prompt_cannot_be_erased(self):
         # Owner report: Backspace on macOS libedit erased `tandem> ` and it never came back after /board.
@@ -2531,19 +2721,19 @@ class SessionProcess(unittest.TestCase):
     def test_empty_enter_during_a_turn_prints_nothing(self):
         # Owner report (iTerm2): each empty Enter during a turn printed another status line and prompt.
         self.start_slow_turn(NO_COLOR=None)
-        self.wait_for(lambda: "working..." in self.text(), "the status line")
+        self.wait_for(lambda: "working 0m" in plain(self.text()), "the status bar")
 
         def count():
-            rows = screen(self.text())
-            return sum("tandem> " in r for r in rows), sum(r.startswith("turn 1: ") for r in rows)
+            rows = [plain(r) for r in screen(self.text())]
+            return sum("tandem> " in r for r in rows), sum(r.startswith("claude ") and "working" in r for r in rows)
 
-        self.wait_for(lambda: count() == (2, 1), "the goal line, the status and the prompt")
+        self.wait_for(lambda: count() == (2, 1), "the goal line, the prompt and the bar")
         for _ in range(3):
             os.write(self.master, b"\r")
             time.sleep(.2)
         os.write(self.master, b"/status")
         self.wait_for(lambda: any(r.startswith("tandem> /status") for r in screen(self.text())), "the typed command")
-        self.wait_for(lambda: count() == (2, 1), "no new prompt or status line", timeout=3)
+        self.wait_for(lambda: count() == (2, 1), "no new prompt or bar", timeout=3)
         os.write(self.master, b"\r")
         self.wait_for(lambda: "outcome running" in self.text(), "the status answer")
 
@@ -2552,10 +2742,10 @@ class SessionProcess(unittest.TestCase):
         self.wait_for(lambda: "tandem> " in self.text(), "the prompt")
         self.type("make a file")
         self.wait_for(lambda: "claude start" in self.log_text(), "the agent starting")
-        self.wait_for(lambda: "working..." in self.text(), "the status line")
+        self.wait_for(lambda: "working 0m" in plain(self.text()), "the status bar")
         os.write(self.master, b"abc")
         seen = len(self.text())
-        self.wait_for(lambda: self.text()[seen:].count("working...") >= 2, "the status ticking while typing")
+        self.wait_for(lambda: plain(self.text()[seen:]).count("working 0m") >= 2, "the bar ticking while typing")
         os.write(self.master, b"\r")
         self.wait_for(lambda: "queued for the next turn" in self.text(), "the typed line arriving")
         self.assertIn("tandem> abc", [plain(r) for r in screen(self.text())])
@@ -2732,7 +2922,7 @@ class Activity(unittest.TestCase):
         cfg = {"timeout": 5, "claude_permission_mode": "acceptEdits"}
         with mock.patch.object(tandem, "run_child", side_effect=fake) as run:
             self.assertEqual(tandem.run_claude(cfg, self.work, "goal", self.dir / "turn-03-claude", schema,
-                                               "status", False), ({"status": "done"}, .5))
+                                               "status", False), ({"status": "done"}, .5, {}))
         cmd = run.call_args[0][0]
         self.assertEqual(cmd[cmd.index("--output-format") + 1:cmd.index("--output-format") + 3],
                          ["stream-json", "--verbose"])

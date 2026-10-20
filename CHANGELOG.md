@@ -2,6 +2,18 @@
 
 ## 0.1.0
 
+- `tandem watch` follows what the agents do during a turn, one line per command, file or
+  message, from the run's new `activity.log`; `/watch` opens it in a pane on the right in tmux
+  or iTerm2. Claude Code now runs with `--output-format stream-json`.
+- Messages typed during a turn ask about stopping it once per turn and then queue, showing how
+  many wait. At most five wait at a time; `/queue` lists them and `/queue clear` drops them.
+- → at the end of the line accepts the highlighted slash command, like Tab.
+
+- Add a live bar below the interactive prompt with agent models, effort and activity, reported
+  cost and tokens, session time, committed branch changes and check state. Record reported usage
+  and model on each turn. Narrow terminals truncate colored rows correctly; resizing redraws
+  the visible screen without losing the text being edited.
+
 - Ctrl+C twice on an empty prompt leaves the session, as in Claude Code; a turn in flight is
   stopped and recorded as interrupted, with its edits committed. `exit`, `quit` or `q` alone on
   the line leaves like `/quit` instead of starting a run with that goal. Further Ctrl+C presses

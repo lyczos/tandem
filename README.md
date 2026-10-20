@@ -215,9 +215,19 @@ later turn sees them too. Codex gets them attached with `--image`; Claude Code g
 with `--add-dir` and is told to open them. `/paste` reads the clipboard with `osascript` on
 macOS and `wl-paste` or `xclip` on Linux; elsewhere, drag the file in.
 
-On a terminal without `NO_COLOR`, an updating
-"turn 3: Claude Code working... 2m14s" line shows above the prompt. Set `NO_COLOR` to disable
-terminal escape codes and the status line; redirected stdout uses plain text too.
+The line editor shows a live status bar under the prompt and slash menu. It lists each agent's
+model, effort and activity: working with elapsed time, next, waiting, away until a reset time,
+or benched after repeated failures. Before a run, it shows the models and a `/models` hint.
+A second row shows the turn budget, reported dollar cost and tokens, elapsed session time,
+committed branch additions and deletions, and the check result (✓ passed, ✗ failed, – not run).
+Cost and tokens update after turns; Codex reports tokens but no dollar cost. Missing usage is
+not estimated. Branch counts refresh after commits, so uncommitted edits are not included.
+Session time starts when the interactive session opens, including time between runs.
+
+The bar truncates to the terminal width. Resizing clears the visible screen and redraws the
+prompt and bar, keeping the text being edited. `NO_COLOR` removes colors; the line editor still
+uses cursor movement to draw the plain bar. The readline fallback and redirected output have
+no bar.
 
 ## Headless runs
 
@@ -347,7 +357,7 @@ bad output) is benched and the other one finishes alone. `/models` choices are s
 | --- | --- |
 | `TANDEM_PYTHON` | The interpreter the npm launcher uses; give a Python executable name or path, without flags. If it is not Python 3.9+, the launcher stops with an error instead of searching further. |
 | `TANDEM_RUNS` | Run storage directory. Relative paths resolve from the directory where tandem starts; use an absolute path to find the same runs from any repo. |
-| `NO_COLOR` | When present, disables escape codes and the updating status line. |
+| `NO_COLOR` | When present, disables colors. The line editor keeps its plain status bar. |
 
 Without `TANDEM_PYTHON`, the launcher tries `python3`, then `python3.15` through `python3.9`,
 then `python` (and `py -3` on Windows). Each candidate must pass a version check. If none
