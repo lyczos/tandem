@@ -1820,6 +1820,180 @@ def without_bar(rows):
     return rows[:end]
 
 
+class BarModels(unittest.TestCase):
+    """Tab on an empty prompt edits the models on the status bar."""
+
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.dir = pathlib.Path(temp.name)
+        cache = self.dir / "models_cache.json"
+        cache.write_text(json.dumps(CODEX_CACHE))
+        for patch in (mock.patch.object(tandem, "CODEX_MODELS_CACHE", cache),
+                      mock.patch.object(tandem, "AVAILABILITY", self.dir / "availability.json")):
+            patch.start()
+            self.addCleanup(patch.stop)
+        self.saved = []
+
+    def editor(self, current=None, keys=()):
+        editor = tandem.LineEditor(None, io.StringIO(), self.dir / "history", keys=iter(keys))
+        editor.models = lambda: tandem.model_choices(dict(current or {}))
+        editor.save_models = lambda changed, values: self.saved.append((changed, values))
+        return editor
+
+    def keys(self, editor, *keys):
+        for key in keys:
+            self.assertIsNone(editor.apply(key))
+
+    def test_tab_on_an_empty_line_enters_and_tab_with_text_completes(self):
+        editor = self.editor()
+        self.keys(editor, "tab")
+        self.assertEqual(editor.editing(), (dict.fromkeys(tandem.TUNABLE), "claude_model"))
+        editor = self.editor()
+        self.keys(editor, "/mo", "tab")
+        self.assertEqual((editor.buffer, editor.fields), ("/models ", None))
+        editor = self.editor()
+        self.keys(editor, "fix", "tab")
+        self.assertEqual((editor.buffer, editor.fields), ("fix", None))
+        editor = self.editor()
+        editor.models = lambda: None  # no bar to edit: Tab stays a no-op
+        self.keys(editor, "tab")
+        self.assertIsNone(editor.editing())
+
+    def test_tab_and_shift_tab_wrap_through_the_fields(self):
+        editor = self.editor()
+        self.keys(editor, "tab")
+        seen = []
+        for _ in range(5):
+            seen.append(editor.editing()[1])
+            self.keys(editor, "tab")
+        self.assertEqual(seen, list(tandem.TUNABLE) + ["claude_model"])
+        self.keys(editor, "shift-tab", "shift-tab")
+        self.assertEqual(editor.editing()[1], "codex_effort")
+
+    def test_up_and_down_wrap_through_the_values(self):
+        editor = self.editor({"claude_model": "opus"})
+        self.keys(editor, "tab")
+
+        def shown():
+            return editor.editing()[0]["claude_model"]
+        self.keys(editor, "up")
+        self.assertEqual(shown(), "sonnet")
+        self.keys(editor, "up", "up")
+        self.assertIsNone(shown())  # past haiku back to default
+        self.keys(editor, "down")
+        self.assertEqual(shown(), "haiku")
+        self.keys(editor, "tab", "down")
+        self.assertEqual(editor.editing()[0]["claude_effort"], tandem.CLAUDE_EFFORTS[-1])
+
+    def test_codex_model_keeps_a_supported_effort_and_resets_another(self):
+        editor = self.editor({"codex_model": "gpt-big", "codex_effort": "low"})
+        self.keys(editor, "tab", "tab", "tab", "up")
+        self.assertEqual(editor.editing(), (dict(claude_model=None, claude_effort=None, codex_model="gpt-small",
+                                                 codex_effort="low"), "codex_model"))
+        editor = self.editor({"codex_model": "gpt-big", "codex_effort": "high"})
+        self.keys(editor, "tab", "tab", "tab", "up")
+        self.assertEqual(editor.editing()[0]["codex_effort"], None)  # gpt-small has no high
+        self.keys(editor, "tab", "up")
+        self.assertEqual(editor.editing()[0]["codex_effort"], "low")  # only gpt-small's levels on offer
+
+    def test_enter_saves_only_what_changed(self):
+        current = {"claude_model": "opus", "codex_effort": "high"}  # say the run's own, not the defaults
+        editor = self.editor(current, ["tab", "enter", "enter"])
+        self.assertEqual(editor.read("tandem> "), "")  # the second Enter submits the empty line
+        self.assertEqual(self.saved, [])
+        editor = self.editor(current, ["tab", "tab", "up", "enter", "enter"])
+        editor.read("tandem> ")
+        values = dict(current, claude_effort=tandem.CLAUDE_EFFORTS[0], codex_model=None)
+        self.assertEqual(self.saved, [({"claude_effort": tandem.CLAUDE_EFFORTS[0]}, values)])
+        self.assertIsNone(editor.editing())
+
+    def test_session_save_passes_the_change_on(self):
+        session = mock.Mock(busy=lambda: True)
+        changed, values = {"claude_effort": "high"}, dict.fromkeys(tandem.TUNABLE, None)
+        values["claude_effort"] = "high"
+        with mock.patch.object(tandem, "save_defaults") as defaults, \
+                mock.patch.object(tandem, "write_tuning") as tuning, \
+                mock.patch.object(tandem, "emit") as emit, \
+                mock.patch.dict(tandem.CURRENT, {"target": self.dir}):
+            tandem.Session.save_models(session, changed, values)
+        defaults.assert_called_once_with({"claude_effort": "high"})
+        tuning.assert_called_once_with(self.dir, {"claude_effort": "high"})
+        emit.assert_called_once_with("saved: claude default/high · codex default/default (applies from the next turn)")
+
+    def test_esc_restores_and_other_keys_leave_then_act(self):
+        editor = self.editor({"claude_model": "opus"}, ["tab", "up", "esc", "enter"])
+        self.assertEqual(editor.read("tandem> "), "")
+        self.assertEqual(self.saved, [])
+        self.assertIsNone(editor.editing())
+        editor = self.editor({}, ["tab", "up", "f", "i", "x", "enter"])
+        self.assertEqual(editor.read("tandem> "), "fix")  # the first character is not lost
+        self.assertEqual(self.saved, [])
+        editor = self.editor({}, ["tab", "up", ("paste", "a goal"), "enter"])
+        self.assertEqual(editor.read("tandem> "), "a goal")
+        for key, error in (("ctrl-c", KeyboardInterrupt), ("ctrl-d", EOFError)):
+            with self.assertRaises(error):
+                self.editor({}, ["tab", "up", key]).read("tandem> ")
+        self.assertEqual(self.saved, [])
+
+    def test_bar_shows_the_focus_without_color(self):
+        values = {"claude_model": "opus", "claude_effort": "high", "codex_model": None, "codex_effort": None}
+        idle = tandem.status_bar(None, 0, 200, False, progress={}, editing=(values, "claude_effort"),
+                                 hint=tandem.BAR_EDIT_HINT)
+        self.assertEqual(idle, ["claude opus/[high]   codex default/default", tandem.BAR_EDIT_HINT])
+        colored = tandem.status_bar(None, 0, 200, True, progress={}, editing=(values, "codex_model"))[0]
+        self.assertIn("\x1b[7mdefault\x1b[0m", colored)
+        self.assertNotIn("[", plain(colored).replace("\x1b", ""))
+        state = StatusBar.state(self)
+        rows = tandem.status_bar(state, 0, 200, False, progress={}, editing=(values, "codex_model"),
+                                 hint=tandem.BAR_EDIT_HINT)
+        self.assertEqual(len(rows), 3)  # the run's two rows, and the keys on their own
+        self.assertIn("codex [default]/default", rows[0])
+        self.assertEqual(rows[2], tandem.BAR_EDIT_HINT)
+        self.assertEqual(len(tandem.status_bar(state, 0, 200, False, progress={})), 2)
+
+    def test_narrow_bar_keeps_each_edit_field_visible_during_a_turn(self):
+        values = dict(claude_model="opus", claude_effort="medium",
+                      codex_model="gpt-6-astra", codex_effort="medium")
+        state = StatusBar.state(self)
+        for width in (79, 39):
+            for key in tandem.TUNABLE:
+                with self.subTest(width=width, key=key):
+                    rows = tandem.status_bar(state, 10, width, False,
+                                             progress={"agent": "claude", "since": 1},
+                                             editing=(values, key), hint=tandem.BAR_EDIT_HINT)
+                    self.assertTrue(any("[" + values[key] + "]" in row for row in rows))
+                    self.assertTrue(all(tandem.display_width(row) <= width for row in rows))
+                    self.assertTrue(any("working" in row for row in rows))
+
+    def test_console_bar_keeps_the_mode_across_redraws(self):
+        console = tandem.Console(fancy=False)
+        editor = self.editor({"claude_model": "opus"})
+        console.attach(editor)
+        editor.models = lambda: tandem.model_choices({"claude_model": "opus"})
+        with mock.patch.dict(tandem.CURRENT, clear=True), \
+                mock.patch.object(tandem, "load_defaults", return_value={"claude_model": "opus"}), \
+                mock.patch.object(tandem, "term_width", return_value=120):
+            self.assertTrue(console.bar(120)[0].endswith("· Tab or /models to change"))
+            self.keys(editor, "tab", "tab", "up")
+            for _ in range(2):  # the ticker redraws the bar; the unsaved value and focus stay
+                editor.resized = True
+                rows = screen(editor.redraw())
+                self.assertIn("claude opus/[low]", rows[-2])
+                self.assertEqual(rows[-1], tandem.BAR_EDIT_HINT)
+            self.keys(editor, "esc")
+            self.assertTrue(console.bar(120)[0].startswith("claude opus/default "))
+            self.keys(editor, "x")
+            self.assertTrue(console.bar(120)[0].endswith("· /models to change"))
+            tandem.save(self.dir, StatusBar.state(self))
+            tandem.CURRENT["target"] = self.dir
+            self.assertNotIn("change", "".join(console.bar(200)))  # typing: Tab completes, no hint
+            editor.buffer = ""
+            first, second = console.bar(200)
+            self.assertTrue(second.endswith("check – · Tab or /models to change"), second)
+            self.assertNotIn("change", first)
+
+
 class Editor(unittest.TestCase):
     def setUp(self):
         temp = tempfile.TemporaryDirectory()
@@ -1872,7 +2046,8 @@ class Editor(unittest.TestCase):
         self.assertTrue(help_text.startswith("type a goal to start a run in this repo; while it runs"))
         for line in ("  /help                show this list",
                      "  /models              pick Claude and Codex model and effort (saved as the default;\n"
-                     "                       a running run takes it from its next turn)",
+                     "                       a running run takes it from its next turn)\n"
+                     "  Tab                  on an empty line: change them on the status bar, ↑↓ and Enter",
                      "  /say TEXT            leave a message the next turn reads\n"
                      "  Ctrl+V               paste the clipboard's image into the line as [image #N]\n"
                      "  /paste               attach the clipboard's image to your next goal or /say\n"
@@ -2651,6 +2826,48 @@ class SessionProcess(unittest.TestCase):
         self.wait_for(lambda: "/transcript" in self.text()[seen:], "the session answering")
         self.type("/quit")
         self.assertEqual(self.proc.wait(timeout=10), 0, self.text())
+
+    def test_tab_changes_models_on_the_bar(self):
+        self.start(NO_COLOR="1")
+        self.wait_for(lambda: "Tab or /models to change" in self.text(), "the bar's hint")
+        os.write(self.master, b"\t")
+        self.wait_for(lambda: screen(self.text())[-1] == tandem.BAR_EDIT_HINT, "the mode's keys")
+        self.assertIn("claude [default]/default", screen(self.text())[-2])
+        os.write(self.master, b"\x1b[A")
+        self.wait_for(lambda: "claude [fable]/default" in screen(self.text())[-2], "the changed value")
+        os.write(self.master, b"\r")
+        self.wait_for(lambda: "saved: claude fable/default" in self.text(), "the choice being saved")
+        config = json.loads((self.base / "home" / ".tandem" / "config.json").read_text())
+        self.assertEqual(config["defaults"], {"claude_model": "fable"})
+        self.type("/quit")
+        self.assertEqual(self.proc.wait(timeout=10), 0, self.text())
+
+    def test_bar_edit_survives_running_turn_and_resize(self):
+        self.start_slow_turn(NO_COLOR="1")
+        self.wait_for(self.screen_ends_with_prompt(), "the prompt during the turn")
+        os.write(self.master, b"\t\x1b[Z\x1b[A")  # Codex effort, default to low
+        self.wait_for(lambda: "[low]" in "\n".join(screen(self.text())), "the unsaved effort")
+        frames = self.text().count(tandem.BAR_EDIT_HINT)
+        self.wait_for(lambda: self.text().count(tandem.BAR_EDIT_HINT) > frames, "ticker redraw")
+        self.assertIn("[low]", "\n".join(screen(self.text())))
+        import fcntl
+        import struct
+        import termios
+        fcntl.ioctl(self.master, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 40, 0, 0))
+        seen = len(self.text())
+        os.kill(self.proc.pid, signal.SIGWINCH)
+        self.wait_for(lambda: "\x1b[H\x1b[J" in self.text()[seen:], "resize redraw")
+        self.wait_for(lambda: any("codex effort [low]" in row for row in screen(self.text())),
+                      "focus after resize")
+        self.assertTrue(all(tandem.display_width(row) < 40 for row in screen(self.text())))
+        os.write(self.master, b"\r")
+        self.wait_for(lambda: "(applies from the next turn)" in self.text(), "saved tuning")
+        run = self.run_dirs()[0]
+        self.assertEqual(tandem.read_tuning(run / "tuning.json"), {"codex_effort": "low"})
+        config = json.loads((self.base / "home" / ".tandem" / "config.json").read_text())
+        self.assertEqual(config["defaults"], {"codex_effort": "low"})
+        os.write(self.master, b"\x03\x03\x03")
+        self.assertEqual(self.proc.wait(timeout=20), 0, self.text())
 
     def screen_ends_with_prompt(self, text="tandem> "):
         return lambda: without_bar(screen(self.text()))[-1:] == [text]

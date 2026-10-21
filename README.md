@@ -156,6 +156,7 @@ Plain text is a goal and starts a run in the current repo. The run goes on in th
 you can keep typing and talk to the agents while they work. Typing `/` opens a menu of the slash
 commands under the prompt, narrowed with every key, each with a short description: ↑↓ select,
 Tab or → at the end of the line completes, Enter runs the highlighted one, Esc closes the menu.
+Tab on an empty line edits the models on the status bar instead (see below).
 When the menu is closed, ↑↓ go through earlier lines, kept in `~/.tandem/history` (the last 500). The usual editing keys work:
 ←→, Home/End or Ctrl+A/Ctrl+E, Ctrl+U and Ctrl+K delete to the start or end, Ctrl+W the word
 before the cursor. A paste of several lines arrives as one line. With `TERM=dumb` or without a
@@ -217,7 +218,21 @@ macOS and `wl-paste` or `xclip` on Linux; elsewhere, drag the file in.
 
 The line editor shows a live status bar under the prompt and slash menu. It lists each agent's
 model, effort and activity: working with elapsed time, next, waiting, away until a reset time,
-or benched after repeated failures. Before a run, it shows the models and a `/models` hint.
+or benched after repeated failures. During a run, a second row shows the turn, cost, tokens,
+session time, diff size and check. On an empty line the bar ends with the hint `Tab or /models to
+change`; while you type, Tab completes instead, so the hint drops the Tab (and during a run,
+goes away).
+
+Tab on an empty line (no slash menu open) changes the models and effort right on the bar, without
+opening `/models`. One of the four values (Claude model, Claude effort, Codex model, Codex effort)
+is highlighted, or shown in brackets like `[high]` with `NO_COLOR`. Tab and Shift+Tab move to the
+next or previous one, ↑↓ go through the same values `/models` offers, including `default`, and a
+Codex model keeps its effort only if it supports it. Enter saves like `/models` does; if nothing
+changed, it saves nothing. Esc puts back what was shown before. Any other key leaves the mode
+without saving and then does what it would normally do, so typing a goal right away loses nothing.
+This works while a turn runs, and the change applies from the next turn. If the bar is too wide
+for the terminal, each editable field gets its own row so the selected value stays visible.
+
 A second row shows the turn budget, reported dollar cost and tokens, elapsed session time,
 committed branch additions and deletions, and the check result (✓ passed, ✗ failed, – not run).
 Cost and tokens update after turns; Codex reports tokens but no dollar cost. Missing usage is

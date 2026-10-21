@@ -2,6 +2,9 @@
 
 ## 0.1.0
 
+- Tab on an empty prompt line edits the models and effort on the status bar: Tab and Shift+Tab
+  pick a field, ↑↓ change it through the values `/models` offers, Enter saves only what changed,
+  Esc cancels, and any other key leaves the mode and is then handled as usual.
 - `tandem watch` follows what the agents do during a turn, one line per command, file or
   message, from the run's new `activity.log`; `/watch` opens it in a pane on the right in tmux
   or iTerm2. Claude Code now runs with `--output-format stream-json`.

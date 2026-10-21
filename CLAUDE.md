@@ -46,7 +46,10 @@ The interactive session (`cmd_interactive`, `Session`, `Console`) runs `loop()` 
 while the main thread reads input. All output must go through `emit()`/`log()` (one `OUT_LOCK`),
 never bare `print` from code that can run during a run, or the prompt redraw breaks. On a POSIX
 terminal `LineEditor` owns the prompt row and the rows around it (status line above, slash-command
-menu and status bar below); `Console.write` must erase and redraw them around every line it prints. While it
+menu and status bar below); `Console.write` must erase and redraw them around every line it prints.
+Tab on an empty line edits the models on that bar: the unsaved values live in the editor
+(`LineEditor.fields`), so redraws keep them, and Enter saves outside `OUT_LOCK` through
+`Session.save_models()`, the same path `/models` takes, with `step_choice()` shared by both. While it
 runs, every child the worker starts (agents, the check, git) gets its own session and `/dev/null`
 on stdin (`CHILD_POPEN`) so Ctrl+C at the prompt cannot kill a turn or fail a check. Being out of
 the terminal's reach, agents and checks go through `run_child()`, which tracks them in `CHILDREN`:

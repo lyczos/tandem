@@ -602,19 +602,37 @@ def fit_segments(segments, width, fancy):
     return "".join(out) + ("\u2026" if total > width and width else "")
 
 
-def status_bar(state, now, width, fancy, progress=None, session_start=None, defaults=None):
+def status_bar(state, now, width, fancy, progress=None, session_start=None, defaults=None,
+               editing=None, hint=None):
     """The rows under the prompt: what each agent runs and does, then the run's numbers.
 
     state is the run's state.json, or None before the first run (defaults then name the models).
-    progress is PROGRESS while a turn runs, else empty; session_start is when the session began."""
+    progress is PROGRESS while a turn runs, else empty; session_start is when the session began.
+    editing is (values, focused key) while the owner changes the models on the bar itself.
+    hint ends the bar; with a run it is left out unless given, because the run's numbers come first."""
     cfg = dict(defaults or {}, **(state or {}).get("config", {})) if state else dict(defaults or {})
     history = (state or {}).get("history", [])
     progress = PROGRESS if progress is None else progress
     dim, sep = "2", (" \u00b7 ", "2")
 
+    def value(key, text):
+        if editing and key == editing[1]:
+            # Brackets keep focus visible under NO_COLOR too.
+            return (text, "7") if fancy else (f"[{text}]", None)
+        return text, None
+
     def model(agent):
-        ran = next((h["model"] for h in reversed(history) if h["agent"] == agent and h.get("model")), None)
-        return f"{cfg.get(agent + '_model') or ran or 'default'}/{cfg.get(agent + '_effort') or 'default'}"
+        if editing:
+            shown = [(k, editing[0].get(k) or "default") for k in (agent + "_model", agent + "_effort")]
+        else:
+            ran = next((h["model"] for h in reversed(history) if h["agent"] == agent and h.get("model")), None)
+            shown = [(agent + "_model", cfg.get(agent + "_model") or ran or "default"),
+                     (agent + "_effort", cfg.get(agent + "_effort") or "default")]
+        out = []
+        for key, text in shown:
+            out.append(("/" if out else " ", None))
+            out.append(value(key, text))
+        return out
 
     def doing(agent):
         if progress.get("agent") == agent and progress.get("since"):
@@ -630,11 +648,24 @@ def status_bar(state, now, width, fancy, progress=None, session_start=None, defa
     for agent in NAMES:
         if first:
             first.append(("   ", None))
-        first += [(agent, f"38;5;{AGENT_COLORS[agent]}"), (" " + model(agent), None)]
+        first += [(agent, f"38;5;{AGENT_COLORS[agent]}")] + model(agent)
         if state:
             first += [sep, doing(agent)]
+    # The keys of the mode would not fit beside the models on 80 columns: they get a row of their own.
+    keys = [fit_segments([(hint or BAR_EDIT_HINT, dim)], width, fancy)] if editing else []
+    models = [fit_segments(first, width, fancy)]
+    if editing and sum(display_width(text) for text, _ in first) > width:
+        # A clipped bar can hide the selected Codex field entirely, especially during a turn.
+        # Give each field a row when the combined bar no longer fits after a resize.
+        models = []
+        for key in TUNABLE:
+            row = [(key.replace("_", " ") + " ", dim), value(key, editing[0].get(key) or "default")]
+            if state and key.endswith("_effort"):
+                row += [sep, doing(key.split("_")[0])]
+            models.append(fit_segments(row, width, fancy))
     if not state:
-        return [fit_segments(first + [sep, ("/models to change", dim)], width, fancy)]
+        return models + keys if editing else \
+            [fit_segments(first + [sep, (hint or "/models to change", dim)], width, fancy)]
 
     second = [("turn ", dim), (f"{min(state['turn'], state['max_turns'])}/{state['max_turns']}", None),
               sep, (f"${state.get('cost_usd', 0):.2f}", None)]
@@ -652,7 +683,9 @@ def status_bar(state, now, width, fancy, progress=None, session_start=None, defa
     else:
         mark = ("\u2013", None)
     second += [sep, ("check ", dim), mark]
-    return [fit_segments(first, width, fancy), fit_segments(second, width, fancy)]
+    if hint and not editing:
+        second += [sep, (hint, dim)]  # last, so a narrow terminal cuts it before the numbers
+    return models + [fit_segments(second, width, fancy)] + keys
 
 
 def report_turn(entry):
@@ -2065,6 +2098,8 @@ def slash_help():
         first, *more = (text + HELP_MORE.get(name, "")).split("\n")
         lines.append(f"  {('/' + name + ' ' + args).strip():<21}{first}")
         lines += [" " * 23 + line for line in more]
+        if name == "models":
+            lines.append(f"  {'Tab':<21}on an empty line: change them on the status bar, ↑↓ and Enter")
     return "\n".join(lines)
 
 
@@ -2381,16 +2416,26 @@ def picker_step(rows, focus, key):
     if key in PICKER_MOVES:
         return (focus + PICKER_MOVES[key]) % len(rows), None
     if key in PICKER_CHANGES:
-        row = rows[focus]
-        row["index"] = (row["index"] + PICKER_CHANGES[key]) % len(row["values"])
-        if row["key"] == "codex_model":
-            efforts = next(r for r in rows if r["key"] == "codex_effort")
-            kept = efforts["values"][efforts["index"]]
-            fresh = codex_effort_row(row.get("levels", {}), row["values"][row["index"]], None)
-            if kept in fresh["values"]:
-                fresh["index"] = fresh["values"].index(kept)
-            efforts.update(fresh)
+        step_choice(rows, focus, PICKER_CHANGES[key])
     return focus, None
+
+
+def step_choice(rows, focus, step):
+    """Move rows[focus] step values on, wrapping around. Shared by the picker and the status bar."""
+    row = rows[focus]
+    row["index"] = (row["index"] + step) % len(row["values"])
+    if row["key"] == "codex_model":
+        efforts = next(r for r in rows if r["key"] == "codex_effort")
+        kept = efforts["values"][efforts["index"]]
+        fresh = codex_effort_row(row.get("levels", {}), row["values"][row["index"]], None)
+        if kept in fresh["values"]:
+            fresh["index"] = fresh["values"].index(kept)
+        efforts.update(fresh)
+
+
+def chosen(rows):
+    """{key: value} the picker rows select, None for default."""
+    return {r["key"]: (None if r["values"][r["index"]] == "default" else r["values"][r["index"]]) for r in rows}
 
 
 def render_picker(rows, focus, width):
@@ -2486,9 +2531,7 @@ def run_picker(rows):
         with contextlib.suppress(OSError), OUT_LOCK:
             sys.stdout.write((f"\x1b[{drawn}A\r\x1b[J" if drawn else "") + "\x1b[?25h")
             sys.stdout.flush()
-    if action != "save":
-        return None
-    return {r["key"]: (None if r["values"][r["index"]] == "default" else r["values"][r["index"]]) for r in rows}
+    return chosen(rows) if action == "save" else None
 
 
 def models_line(values):
@@ -2500,6 +2543,8 @@ def models_line(values):
 
 MENU_SIZE = 8
 MENU_HINT = "↑↓ select · Tab or → complete · Enter run · Esc close"
+BAR_HINT = "Tab or /models to change"
+BAR_EDIT_HINT = "Tab next · ↑↓ change · Enter save · Esc cancel"
 HISTORY_SIZE = 500
 EXIT_ARM_SECONDS = 2  # a second Ctrl+C on an empty prompt within this many seconds leaves, as in Claude Code
 EXIT_WORDS = ("exit", "quit", "q")  # typed alone, they leave like /quit instead of becoming a goal
@@ -2576,6 +2621,11 @@ class LineEditor:
         self.kept = False      # the last read was an empty Enter: its rows are still on screen, as drawn
         self.resized = False  # SIGWINCH only sets this; output stays under OUT_LOCK
         self.above = 0         # rows drawn above the prompt row, where the cursor is
+        # Tab on an empty line edits the models on the status bar: models() gives the picker's rows
+        # (None turns the mode off), save_models(changed, values) gets the choice after Enter.
+        self.models = lambda: None
+        self.save_models = lambda changed, values: None
+        self.fields, self.field, self.fields_before, self.saving = None, 0, {}, None
         self.history = self.load_history()
         self.hist_pos, self.draft = len(self.history), ""
 
@@ -2625,6 +2675,7 @@ class LineEditor:
                 self.prompt, self.buffer, self.cursor, self.scroll = prompt, "", 0, 0
                 self.selected, self.menu_closed = 0, False
                 self.hist_pos, self.draft = len(self.history), ""
+                self.fields, self.saving = None, None
                 fresh = "\n" if self.mid_line else ""
                 if not self.kept:
                     self.above = 0
@@ -2637,8 +2688,11 @@ class LineEditor:
                     key = ("image", self.paste())  # outside OUT_LOCK: the clipboard tool may take seconds
                 with OUT_LOCK:
                     line = self.apply(key)
+                    saving, self.saving = self.saving, None
                     if line is None and not self.pending():
                         self.write(self.redraw())
+                if saving:
+                    self.save_models(*saving)  # outside OUT_LOCK: it writes files and prints
         finally:
             with OUT_LOCK:
                 self.reading = False
@@ -2684,6 +2738,8 @@ class LineEditor:
 
     def apply(self, key):
         """Apply one key. Returns the line when it is submitted, else None."""
+        if self.fields is not None and self.field_key(key):
+            return None
         b, c, matches = self.buffer, self.cursor, self.matches()
         if isinstance(key, tuple):
             kind, text = key
@@ -2709,6 +2765,10 @@ class LineEditor:
             if matches:  # → at the end of the line accepts the suggestion, as in fish and zsh
                 name = matches[self.selected][0]
                 self.edit(f"/{name} ", len(name) + 2)
+            elif key == "tab" and not b:
+                rows = self.models()
+                if rows:
+                    self.fields, self.field, self.fields_before = rows, 0, chosen(rows)
         elif key == "esc":
             self.menu_closed = True
         elif key in ("up", "down"):
@@ -2739,6 +2799,26 @@ class LineEditor:
         elif key not in NAMED_KEYS and key.isprintable():
             self.insert(key)  # escape sequences and control keys we do not use type nothing
         return None
+
+    def field_key(self, key):
+        """A key while the status bar's models are being edited. False when it left the mode and
+        still has to do what it does on the prompt, so typing right after never loses a character."""
+        if key in ("tab", "shift-tab"):
+            self.field = (self.field + (1 if key == "tab" else -1)) % len(self.fields)
+        elif key in ("up", "down"):
+            step_choice(self.fields, self.field, 1 if key == "up" else -1)
+        else:
+            values, self.fields = chosen(self.fields), None
+            if key == "enter":
+                # Only what the owner changed: the values shown may be the run's own, not defaults.
+                changed = {k: v for k, v in values.items() if v != self.fields_before.get(k)}
+                self.saving = (changed, values) if changed else None
+            return key in ("enter", "esc")
+        return True
+
+    def editing(self):
+        """(values, focused key) for the status bar while its models are being edited, else None."""
+        return (chosen(self.fields), self.fields[self.field]["key"]) if self.fields else None
 
     def prompt_line(self, width):
         """(text, cursor column) of the prompt row. The text scrolls sideways so the cursor stays in view
@@ -2814,6 +2894,7 @@ class Console:
         # for work the bar cannot show yet, such as a campaign planning its first goal.
         editor.header = lambda: [self.status_text()] if self.running and not self.bar_state() else []
         editor.footer_lines = self.bar
+        editor.models = lambda: model_choices(Session.current_models())
 
     def bar_state(self):
         """The state of the run the session works on, as last saved; None before there is one."""
@@ -2830,10 +2911,14 @@ class Console:
 
     def bar(self, width):
         """The status bar under the prompt. Fit one column short: a full row would wrap on some terminals."""
+        editing = self.editor.editing() if self.editor else None
         try:
             state = self.bar_state()
+            # Typing hides the Tab hint, since Tab then completes; a run's bar has no room for the rest.
+            hint = BAR_EDIT_HINT if editing else BAR_HINT if self.editor and not self.editor.buffer \
+                else None if state else "/models to change"
             return status_bar(state, time.time(), width - 1, self.fancy, PROGRESS if self.running else {},
-                              self.started, None if state else load_defaults())
+                              self.started, None if state else load_defaults(), editing, hint)
         except (KeyError, TypeError, ValueError, AttributeError):
             return []  # a state.json from an older tandem, or edited by hand: no bar rather than no prompt
 
@@ -3242,18 +3327,25 @@ class Session:
         run = camp.get("current") or (camp["runs"][-1]["dir"] if camp.get("runs") else None)
         return (pathlib.Path(run) if run else None), camp
 
-    def models(self):
-        """Pick models and effort: saved as the default, and handed to the current run or campaign."""
+    @staticmethod
+    def current_models():
+        """The models and effort in force: the saved defaults, then the current run's own, then a
+        choice made earlier that its next turn has not applied yet."""
         current = load_defaults()
         target = CURRENT.get("target")
         if target:
-            run, _ = self.current_run(target)
+            run, _ = Session.current_run(target)
             try:
                 cfg = load(run)["config"] if run else {}
             except (OSError, ValueError, KeyError, TypeError):
                 cfg = {}
             current.update({k: cfg[k] for k in TUNABLE if k in cfg})
-            current.update(read_tuning(target / "tuning.json"))  # chosen earlier, not applied yet
+            current.update(read_tuning(target / "tuning.json"))
+        return current
+
+    def models(self):
+        """Pick models and effort: saved as the default, and handed to the current run or campaign."""
+        current = self.current_models()
         if not (self.console.fancy and termios):
             emit("models: " + models_line(current))
             emit("the picker needs a terminal; use --claude-model, --claude-effort, --codex-model, --codex-effort")
@@ -3263,10 +3355,19 @@ class Session:
         if choice is None:
             emit("models unchanged")
             return
-        save_defaults(choice)
-        if target:
-            write_tuning(target, choice)
-        emit("saved: " + models_line(choice) + (" (applies from the next turn)" if self.busy() else ""))
+        self.save_models(choice, choice)
+
+    def save_models(self, changed, values):
+        """Save changed as the default and hand it to the current run or campaign; values is the
+        whole choice, for the line that confirms it."""
+        target = CURRENT.get("target")
+        try:
+            save_defaults(changed)
+            if target:
+                write_tuning(target, changed)
+        except OSError as exc:
+            return emit(f"could not save the models: {exc}")
+        emit("saved: " + models_line(values) + (" (applies from the next turn)" if self.busy() else ""))
 
     def queue(self, target, rest):
         if rest == "clear":
@@ -3410,6 +3511,7 @@ def cmd_interactive(args):
     if editor_terminal():
         console.attach(LineEditor(sys.stdin.fileno(), None, history_path(), paste=session.paste_inline,
                                   color=console.fancy))
+        console.editor.save_models = session.save_models
     else:
         try:
             import readline  # noqa: F401  # line editing and history for input(); absent on some builds
