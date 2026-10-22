@@ -184,6 +184,18 @@ terminal the session uses Python's `input()` with readline instead, without the 
 - `/quit`, Ctrl+D, or `exit`, `quit` or `q` alone on the line leaves after the current turn finishes;
   Ctrl+C twice leaves at once (see below)
 
+Scrolling back, three kinds of lines are easy to tell apart. What you typed stays as
+`› your line`, bold on a dark band across the row. tandem's own lines are quiet: a dim `HH:MM`
+stamp, a symbol where it helps (`▸` a new goal, `·` a turn starting, `✓` done, `!` a warning,
+`✗` an error, the last two in yellow and red) and paths shortened with `~` or relative to the
+run directory. Long log entries fit on one row with an ellipsis; `/transcript` prints the full
+transcript path when you need it. Each run opens with a rule such as
+`── bar-controls · tandem/20261024-071612-bar-controls ───` and closes with one carrying the
+outcome in its color, and the turn cards sit in between. With `NO_COLOR` the marker, symbols and
+rules stay, without color. Only the session looks like this: `start`, `resume`, `-p` and any
+output that is not a terminal keep the dated `[YYYY-MM-DD HH:MM:SS]` lines, which also print
+the `say` command to talk to the agents.
+
 Only one run or campaign runs in a session at a time. `/goal FILE` or `/resume` while it is busy
 leaves the current run and any pending `/stop` unchanged. Ctrl+C works as in Claude Code: on a
 line with text it clears the line; on an empty line it says `press Ctrl+C again to exit`, and a

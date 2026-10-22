@@ -239,8 +239,33 @@ OUT_LOCK = threading.RLock()  # every line the orchestrator prints goes through 
 CONSOLE = None                # the interactive session's Console, when one is running
 
 
-def log(msg):
+def log(msg, kind=None, brief=None):
+    """One line of the orchestrator's log. Scripts and log files parse the dated form, so it never
+    changes outside the terminal session; there the date is noise, and the line gets a short stamp,
+    a symbol by kind (LOG_MARKS) and brief instead of msg when given ("" prints nothing)."""
+    if in_session():
+        if brief != "":
+            emit(CONSOLE.log_line(msg if brief is None else brief, kind))
+        return
     emit(f"[{now()}] {msg}")
+
+
+def in_session():
+    """The interactive session on a terminal, with or without color: the only place output is restyled."""
+    return bool(CONSOLE and CONSOLE.styled)
+
+
+def show_path(path, base=None):
+    """A path as the session shows it: relative to base when inside it, else ~ for the home directory.
+    Whole everywhere else, because scripts copy it; /transcript prints it whole in the session too."""
+    text = str(path)
+    if not in_session():
+        return text
+    for root, prefix in ((base, ""), (pathlib.Path.home(), "~" + os.sep)):
+        root = str(root).rstrip(os.sep) if root else ""
+        if root and text.startswith(root + os.sep):
+            return prefix + text[len(root) + 1:]
+    return text
 
 
 def emit(text):
@@ -327,7 +352,7 @@ def mark_unavailable(agent, until):
     data[agent] = until.isoformat(timespec="seconds")
     AVAILABILITY.parent.mkdir(parents=True, exist_ok=True)
     write_json(AVAILABILITY, data)
-    log(f"{NAMES[agent]} hit a usage limit; paused until {until:%H:%M}")
+    log(f"{NAMES[agent]} hit a usage limit; paused until {until:%H:%M}", "warn")
 
 
 def wait_until(when, stop_file=None):
@@ -365,7 +390,7 @@ def call_agent(agent, cfg, worktree, prompt, out_base, schema, key, readonly, st
                 raise
             if kind != "transient" or attempt == MAX_TRANSIENT_RETRIES:
                 raise
-            log(f"{NAMES[agent]}: {tail(str(e), 120)}; retrying in {TRANSIENT_WAIT}s ({attempt + 1}/{MAX_TRANSIENT_RETRIES})")
+            log(f"{NAMES[agent]}: {tail(str(e), 120)}; retrying in {TRANSIENT_WAIT}s ({attempt + 1}/{MAX_TRANSIENT_RETRIES})", "warn")
             if not wait_until(datetime.datetime.now() + datetime.timedelta(seconds=TRANSIENT_WAIT), stop_file):
                 raise
 
@@ -463,6 +488,12 @@ def render_history(history):
 
 AGENT_COLORS = {"claude": 208, "codex": 75}  # the banner logo's two ends
 STATUS_COLORS = {"continue": "36", "done": "32", "blocked": "33", "error": "31", "interrupted": "35"}
+OUTCOME_COLORS = {"done": "32", "max_turns": "33", "blocked": "33", "stopped": "35", "parked": "36", "failed": "31"}
+# The session's log lines by kind: (symbol, ASCII symbol, style). Warnings and errors keep their
+# color on the text too, so dimming the rest of the log never hides them.
+LOG_MARKS = {"run": ("▸", ">", "1"), "turn": ("·", ".", "2"), "ok": ("✓", "+", "32"),
+             "warn": ("!", "!", "33"), "error": ("✗", "x", "31")}
+OWNER_STYLE = "1;48;5;236"  # bold on a dark band: no tandem line uses a background
 CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 MIN_CARD_WIDTH = 20  # the narrowest box that still closes with a title and a few words
 
@@ -505,6 +536,19 @@ def draw_box(title, rows, color, fancy, width):
         out.append(paint(edge, v) + " " + paint(style, text) + " " * (width - 4 - len(text)) + " " + paint(edge, v))
     out.append(paint(edge, bl + h * (width - 2) + br))
     return "\n".join(out)
+
+
+def rule_line(title, width, style, fancy, utf):
+    """`── title ─────` across width columns: opens and closes each run in the session. The dashes
+    separate runs without color too; the title is cut with an ellipsis, never wrapped."""
+    h, more = ("─", "…") if utf else ("-", "...")
+    room = max(width - 5, 1)  # at least one dash after the title
+    if display_width(title) > room:
+        title = fit_width(title, max(room - len(more), 0)) + more
+    fill = h * max(width - 4 - display_width(title), 1)
+    if not fancy:
+        return f"{h * 2} {title} {fill}"
+    return f"\x1b[2m{h * 2}\x1b[0m \x1b[{style}m{title}\x1b[0m \x1b[2m{fill}\x1b[0m"
 
 
 def turn_card(entry, fancy, width):
@@ -693,7 +737,8 @@ def report_turn(entry):
     if CONSOLE and CONSOLE.fancy:
         return emit(turn_card(entry, True, card_width()))
     log(f"turn {entry['turn']}: {NAMES[entry['agent']]} -> {entry['status']} ({entry['seconds']}s"
-        f"{', commit ' + entry['commit'] if entry['commit'] else ''}) {entry.get('summary') or entry.get('error', '')}")
+        f"{', commit ' + entry['commit'] if entry['commit'] else ''}) {entry.get('summary') or entry.get('error', '')}",
+        "error" if entry["status"] == "error" else "warn" if entry["status"] == "blocked" else None)
 
 
 def owner_block(messages, fresh):
@@ -1115,8 +1160,11 @@ def finish(run_dir, state, outcome, message):
     state["outcome_message"] = message
     save(run_dir, state)
     append_transcript(run_dir, f"\n## Finished: {outcome}\n\n{message}\n")
-    log(f"FINISHED {state.get('name') or run_dir.name}: {outcome} - {message}")
-    log(f"transcript {run_dir / 'transcript.md'}")
+    log(f"FINISHED {state.get('name') or run_dir.name}: {outcome} - {message}",
+        "error" if outcome == "failed" else "ok" if outcome == "done" else None, brief=message)
+    log(f"transcript {run_dir / 'transcript.md'}", brief=f"transcript {show_path(run_dir / 'transcript.md', run_dir)}")
+    if in_session():
+        emit(CONSOLE.rule(f"{outcome} \u00b7 {state.get('name') or run_dir.name}", OUTCOME_COLORS.get(outcome, "1")))
 
 
 PROGRESS = {}  # turn, agent, since: what the interactive status line shows
@@ -1129,6 +1177,9 @@ def loop(run_dir):
     cfg = state["config"]
     inboxes = state.get("inboxes") or [str(run_dir / "inbox.md")]
     tuning_files = state.get("tuning_files") or [str(run_dir / "tuning.json")]
+    if in_session():
+        resumed = f" \u00b7 turn {state['turn']}" if state["history"] else ""
+        emit(CONSOLE.rule(f"{state.get('name') or run_dir.name} \u00b7 {state['branch']}{resumed}"))
     while True:
         if stop_requested(state):
             return finish(run_dir, state, "stopped", "The owner asked to stop.")
@@ -1141,7 +1192,7 @@ def loop(run_dir):
         ready = [a for a in healthy if not unavailable_until(a)]
         if not ready:
             wake = min(unavailable_until(a) for a in healthy)
-            log(f"no agent available (usage limits); waiting until {wake:%H:%M}")
+            log(f"no agent available (usage limits); waiting until {wake:%H:%M}", "warn")
             wait_until(wake, state.get("stop_file"))
             continue
         if state.get("review_goal") and "codex" in healthy and away_for_long("codex"):
@@ -1177,7 +1228,7 @@ def loop(run_dir):
         out_base = run_dir / f"turn-{turn:02d}-{agent}"
         out_base.with_suffix(".prompt.md").write_text(prompt)
 
-        log(f"turn {turn}: {NAMES[agent]} working...")
+        log(f"turn {turn}: {NAMES[agent]} working...", "turn", brief=f"turn {turn} \u00b7 {NAMES[agent]}")
         started = time.time()
         with OUT_LOCK:
             PROGRESS.update(turn=turn, agent=agent, since=started)
@@ -1264,7 +1315,7 @@ def loop(run_dir):
                 state["check_feedback"] = (f"The agents said done, but `{cfg['check']}` failed. "
                                            f"Fix it before saying done again.\n\n```\n{output}\n```")
                 save(run_dir, state)  # the status bar reads the check's verdict from disk
-                log("check failed, continuing")
+                log("check failed, continuing", "warn")
         elif status == "blocked" and prev and prev["status"] == "blocked":
             return finish(run_dir, state, "blocked", "Both agents need the owner:\n\n" + entry["handoff"])
 
@@ -1287,7 +1338,7 @@ def create_run(run_dir, repo, goal, name, cfg, max_turns, first, worktree=None, 
     (run_dir / "inbox.md").write_text("")
     append_transcript(run_dir, f"# Tandem run {run_dir.name}\n\nRepo: {repo}\nBranch: {branch}\n\n"
                                f"## Goal\n\n{goal.strip()}\n\n## Turns\n")
-    log(f"run {run_dir.name}: {name} on {branch}")
+    log(f"run {run_dir.name}: {name} on {branch}", brief="")  # the session's run rule says it
     return run_dir
 
 
@@ -1334,7 +1385,7 @@ def plan_next(camp_dir, camp):
                 camp["next_planner"] = OTHER[planner]
                 return result
         except (RuntimeError, subprocess.TimeoutExpired) as e:
-            log(f"planner {NAMES[planner]} failed: {tail(str(e), 200)}")
+            log(f"planner {NAMES[planner]} failed: {tail(str(e), 200)}", "error")
     return None
 
 
@@ -1361,14 +1412,14 @@ def push_branch(camp):
     """Publish the campaign branch after a goal; a failed push is logged, never fatal."""
     branch = camp["branch"]
     if branch in ("main", "master"):
-        log(f"not pushing {branch}: campaigns never push the default branch")
+        log(f"not pushing {branch}: campaigns never push the default branch", "warn")
         return
     proc = subprocess.run(["git", "push", "origin", f"{branch}:{branch}"], cwd=camp["repo"],
                           stdin=subprocess.DEVNULL, capture_output=True, text=True, **CHILD_POPEN)
     if proc.returncode == 0:
-        log(f"pushed {branch} to origin at {git(camp['worktree'], 'rev-parse', '--short', 'HEAD')}")
+        log(f"pushed {branch} to origin at {git(camp['worktree'], 'rev-parse', '--short', 'HEAD')}", "ok")
     else:
-        log(f"push failed, continuing: {tail(proc.stderr, 300)}")
+        log(f"push failed, continuing: {tail(proc.stderr, 300)}", "warn")
 
 
 def refuse_if_running(camp_dir):
@@ -1413,7 +1464,7 @@ def _campaign_loop(camp_dir):
                 if state["outcome"] != "failed" or waits >= MAX_FAILED_WAITS or stop_file.exists():
                     break
                 waits += 1
-                log(f"both agents failing, probably a usage limit; waiting {FAILED_RUN_WAIT // 60} min ({waits}/{MAX_FAILED_WAITS})")
+                log(f"both agents failing, probably a usage limit; waiting {FAILED_RUN_WAIT // 60} min ({waits}/{MAX_FAILED_WAITS})", "warn")
                 if not wait_until(datetime.datetime.now() + datetime.timedelta(seconds=FAILED_RUN_WAIT), stop_file):
                     break
                 state["failures"] = {"claude": 0, "codex": 0}
@@ -1445,10 +1496,10 @@ def _campaign_loop(camp_dir):
             if camp.get("push"):
                 push_branch(camp)
             if outcome == "failed":
-                log("campaign paused: both agents kept failing after waiting; resume later")
+                log("campaign paused: both agents kept failing after waiting; resume later", "warn")
                 return
             if camp["no_progress"] >= MAX_GOALS_WITHOUT_PROGRESS:
-                log(f"campaign paused: {camp['no_progress']} goals in a row ended without progress; see BLOCKERS.md")
+                log(f"campaign paused: {camp['no_progress']} goals in a row ended without progress; see BLOCKERS.md", "warn")
                 return
             if stop_file.exists():
                 log("campaign stopped by the owner")
@@ -1467,16 +1518,16 @@ def _campaign_loop(camp_dir):
                 waits = [w for w in map(unavailable_until, NAMES) if w]
                 wake = min(waits) if len(waits) == len(NAMES) else \
                     datetime.datetime.now() + datetime.timedelta(seconds=PLAN_RETRY_WAIT)
-                log(f"neither agent could plan the next goal; retrying at {wake:%H:%M}")
+                log(f"neither agent could plan the next goal; retrying at {wake:%H:%M}", "warn")
                 wait_until(wake, stop_file)
                 continue
             if plan.get("finished"):
-                log(f"campaign finished: {plan.get('reason')}")
+                log(f"campaign finished: {plan.get('reason')}", "ok")
                 return
             item = {"goal": plan["goal"], "name": slug(plan["name"]) or "goal",
                     "first": plan.get("first") if plan.get("first") in NAMES else "claude",
                     "check": plan.get("check", "")}
-            log(f"next goal: {item['name']} - {plan.get('reason')}")
+            log(f"next goal: {item['name']} - {plan.get('reason')}", "run")
         n = len(camp["runs"]) + 1
         # The next run starts from whatever /models set since the last one began.
         apply_tuning(camp, [camp_dir / "tuning.json"])
@@ -1522,8 +1573,10 @@ def prepare_campaign_start(args):
     camp["queue"] = [read_goal_file(p) for p in args.goal_file or []]
     write_json(camp_dir / "campaign.json", camp)
     CURRENT["target"] = camp_dir
-    log(f"campaign {camp_dir.name} on {camp['branch']} ({camp['worktree']})")
-    log(f"talk: {prog_name()} campaign say {camp_dir} \"...\"   stop: {prog_name()} campaign stop {camp_dir}")
+    log(f"campaign {camp_dir.name} on {camp['branch']} ({camp['worktree']})", brief="")
+    log(f"talk: {prog_name()} campaign say {camp_dir} \"...\"   stop: {prog_name()} campaign stop {camp_dir}", brief="")
+    if in_session():
+        emit(CONSOLE.rule(f"campaign {camp_dir.name} \u00b7 {camp['branch']}"))
     return camp_dir
 
 
@@ -1555,6 +1608,8 @@ def prepare_campaign_resume(args):
         save(pathlib.Path(camp["current"]), state)
     write_json(path, camp)
     CURRENT["target"] = camp_dir
+    if in_session():
+        emit(CONSOLE.rule(f"campaign {camp_dir.name} · {camp['branch']} · resumed"))
     return camp_dir
 
 
@@ -1594,7 +1649,8 @@ def prepare_run(args):
     run_dir = create_run(RUNS / run_id, repo, item["goal"], name or run_id,
                          cfg, args.max_turns, args.first or item.get("first") or "claude")
     CURRENT["target"] = run_dir
-    log(f"talk to the agents: {prog_name()} say {run_dir} \"...\"")
+    # The only hint for start; in the session typing and /say already talk to the agents.
+    log(f"talk to the agents: {prog_name()} say {run_dir} \"...\"", brief="")
     return run_dir
 
 
@@ -2625,6 +2681,7 @@ class LineEditor:
         # (None turns the mode off), save_models(changed, values) gets the choice after Enter.
         self.models = lambda: None
         self.save_models = lambda changed, values: None
+        self.echo = lambda line: self.prompt + line  # how a submitted line stays in the scrollback
         self.fields, self.field, self.fields_before, self.saving = None, 0, {}, None
         self.history = self.load_history()
         self.hist_pos, self.draft = len(self.history), ""
@@ -2702,8 +2759,9 @@ class LineEditor:
                 # Otherwise the line stays as typed, without the menu. After Enter the cursor goes below
                 # it; after Ctrl+C or Ctrl+D it stays at the end, and the next output starts a fresh line.
                 with contextlib.suppress(OSError):
-                    self.write("\x1b[?2004l" if self.kept else self.erase() + self.prompt + self.buffer
-                               + ("\n" if line is not None else "") + "\x1b[?2004l")
+                    self.write("\x1b[?2004l" if self.kept else self.erase()
+                               + (self.echo(line) + "\n" if line is not None else self.prompt + self.buffer)
+                               + "\x1b[?2004l")
                 self.mid_line = line is None
             if saved is not None:
                 with contextlib.suppress(OSError, termios.error):
@@ -2877,8 +2935,12 @@ class LineEditor:
 class Console:
     """Prompt-aware output for the interactive session. write() is only called holding OUT_LOCK."""
 
-    def __init__(self, fancy):
+    def __init__(self, fancy, styled=None, utf=None):
         self.fancy = fancy
+        # styled: restyle the log, the owner's lines and the run rules, which a terminal without color
+        # (NO_COLOR) still gets as symbols and dashes; fancy adds the colors.
+        self.styled = fancy if styled is None else styled
+        self.utf = "utf" in (sys.stdout.encoding or "").lower() if utf is None else utf
         self.prompt = ""
         self.prompt_active = False
         self.status_shown = False
@@ -2895,6 +2957,34 @@ class Console:
         editor.header = lambda: [self.status_text()] if self.running and not self.bar_state() else []
         editor.footer_lines = self.bar
         editor.models = lambda: model_choices(Session.current_models())
+        if self.styled:
+            editor.echo = self.owner_line
+
+    def paint(self, style, text):
+        return f"\x1b[{style}m{text}\x1b[0m" if self.fancy and style else text
+
+    def owner_line(self, line):
+        """A submitted line as it stays in the scrollback: the owner's marker on a band across the row
+        (erasing to the end of the row paints the band there), so it is the first thing to find."""
+        text = ("› " if self.utf else "> ") + line
+        return f"\x1b[{OWNER_STYLE}m{text}\x1b[K\x1b[0m" if self.fancy else text
+
+    def log_line(self, msg, kind=None):
+        """Keep each session log entry on one row, with an explicit mark when text is clipped."""
+        symbol, plain, style = LOG_MARKS.get(kind, (" ", " ", None))
+        symbol = symbol if self.utf else plain
+        width = max(term_width() - 1, 20)
+        text_style = style if kind in ("turn", "warn", "error") else None
+        head = self.paint("2", datetime.datetime.now().strftime("%H:%M")) + " " + self.paint(style, symbol) + " "
+        text = CONTROL_CHARS.sub(" ", msg)
+        room = width - display_width(head)
+        if display_width(text) > room:
+            more = "…" if self.utf else "..."
+            text = fit_width(text, room - len(more)) + more
+        return head + self.paint(text_style, text)
+
+    def rule(self, title, style="1"):
+        return rule_line(title, max(term_width() - 1, MIN_CARD_WIDTH), style, self.fancy, self.utf)
 
     def bar_state(self):
         """The state of the run the session works on, as last saved; None before there is one."""
@@ -3033,6 +3123,10 @@ class Session:
     def busy(self):
         return self.thread is not None and self.thread.is_alive()
 
+    def note(self, text, kind=None):
+        """A session message in the log's look, so it does not read like the owner's own line."""
+        emit(self.console.log_line(text, kind) if in_session() else text)
+
     def refuse_if_busy(self):
         if self.busy():
             emit("a run is already going; /say talks to it, /stop ends it")
@@ -3052,14 +3146,14 @@ class Session:
                 pass
             except SystemExit as exc:
                 if exc.code not in (None, 0):
-                    emit(f"{label}: {exc.code}")
+                    self.note(f"{label}: {exc.code}", "error")
             except Exception as exc:  # the session must survive a failing run
-                emit(f"{label} failed: {exc}")
+                self.note(f"{label} failed: {exc}", "error")
             finally:
                 with OUT_LOCK:
                     self.console.running = False
                 if not self.quitting:
-                    emit(f"{label} ended; type a goal, /resume or /quit")
+                    self.note(f"{label} ended; type a goal, /resume or /quit")
 
         with OUT_LOCK:
             self.console.running = True
@@ -3506,7 +3600,7 @@ def cmd_interactive(args):
         sys.exit("not confirmed; nothing started")
     # The logo and dots need escape codes and UTF-8; anything less gets the plain lines.
     print(banner(args.repo, fancy_terminal() and "utf" in (sys.stdout.encoding or "").lower()))
-    console = Console(fancy_terminal())
+    console = Console(fancy_terminal(), styled=sys.stdout.isatty())
     session = Session(args, console)
     if editor_terminal():
         console.attach(LineEditor(sys.stdin.fileno(), None, history_path(), paste=session.paste_inline,

@@ -667,7 +667,7 @@ class Tuning(unittest.TestCase):
             return {"status": "continue"}, 0
 
         with mock.patch.object(tandem, "call_agent", side_effect=agent), \
-                mock.patch.object(tandem, "log", side_effect=lines.append):
+                mock.patch.object(tandem, "log", side_effect=lambda msg, *kind, **brief: lines.append(msg)):
             tandem.loop(run_dir)
         self.assertEqual(seen, [None, "gpt-y"])
         self.assertIn("config: codex_model default -> gpt-y", lines)
@@ -2271,6 +2271,152 @@ class Editor(unittest.TestCase):
         self.assertEqual(attrs(), before)
 
 
+class SessionLook(unittest.TestCase):
+    """The session restyles its own output; everything else keeps the dated lines scripts parse."""
+
+    def console(self, fancy=True, styled=True):
+        return tandem.Console(fancy=fancy, styled=styled, utf=True)
+
+    def history(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        return pathlib.Path(temp.name) / "history"
+
+    def lines(self, console, fn, width=80):
+        out = []
+        with mock.patch.object(tandem, "CONSOLE", console), mock.patch.object(tandem, "term_width", return_value=width), \
+                mock.patch.object(tandem, "emit", side_effect=out.append):
+            fn()
+        return "\n".join(out).split("\n")
+
+    def test_session_log_has_a_short_stamp_and_no_date(self):
+        rows = self.lines(self.console(), lambda: tandem.log("hello", "warn"))
+        self.assertEqual(len(rows), 1)
+        self.assertRegex(plain(rows[0]), r"^\d\d:\d\d ! hello$")
+        self.assertIn("\x1b[33mhello", rows[0])  # a warning keeps its color, it is not dimmed
+        self.assertNotRegex(rows[0], r"\d{4}-\d\d-\d\d")
+
+    def test_log_without_a_session_is_unchanged(self):
+        for console in (None, self.console(fancy=False, styled=False)):
+            out = io.StringIO()
+            with mock.patch.object(tandem, "CONSOLE", console), mock.patch("sys.stdout", out), \
+                    mock.patch.object(tandem, "now", return_value="2026-10-24 07:16:12"):
+                tandem.log("turn 1: Claude Code working...", "turn", brief="turn 1 · Claude Code")
+                tandem.log("talk to the agents: x", brief="")
+            self.assertEqual(out.getvalue(), "[2026-10-24 07:16:12] turn 1: Claude Code working...\n"
+                                             "[2026-10-24 07:16:12] talk to the agents: x\n")
+
+    def test_brief_replaces_or_hides_the_line_in_the_session(self):
+        rows = self.lines(self.console(), lambda: (tandem.log("long", "turn", brief="turn 1 · Codex"),
+                                                   tandem.log("talk to the agents: x", brief="")))
+        self.assertEqual(len(rows), 1)
+        self.assertTrue(plain(rows[0]).endswith("· turn 1 · Codex"))
+
+    def test_submitted_line_is_redrawn_as_the_owners(self):
+        for fancy, marked in ((True, f"\x1b[{tandem.OWNER_STYLE}m\u203a /goal x.md\x1b[K\x1b[0m\n"),
+                              (False, "\u203a /goal x.md\n")):
+            console = self.console(fancy=fancy)
+            out = io.StringIO()
+            editor = tandem.LineEditor(None, out, self.history(), keys=iter(list("/goal x.md") + ["enter"]),
+                                       color=fancy)
+            console.attach(editor)
+            editor.footer_lines = lambda width: []
+            with mock.patch.object(tandem, "CONSOLE", console):
+                self.assertEqual(editor.read("tandem> "), "/goal x.md")
+            self.assertIn(marked, out.getvalue())
+            self.assertNotIn("tandem> /goal", out.getvalue().split("\x1b[J")[-1])
+
+    def test_plain_editor_keeps_the_prompt(self):
+        out = io.StringIO()
+        editor = tandem.LineEditor(None, out, self.history(), keys=iter(list("abc") + ["enter"]))
+        self.assertEqual(editor.read("tandem> "), "abc")
+        self.assertTrue(out.getvalue().endswith("tandem> abc\n\x1b[?2004l"))
+
+    def test_run_rules_fit_the_width_and_close_in_the_outcome_color(self):
+        with tempfile.TemporaryDirectory() as d:
+            run_dir = pathlib.Path(d)
+            state = {"name": "bar-controls-" + "x" * 80, "history": []}
+            for width in (40, 120):
+                with mock.patch.object(tandem, "save"), mock.patch.object(tandem, "append_transcript"):
+                    rows = self.lines(self.console(), lambda: tandem.finish(run_dir, state, "failed", "Both failed."),
+                                      width)
+                self.assertTrue(plain(rows[-1]).startswith("\u2500\u2500 failed \u00b7 bar-controls"))
+                self.assertEqual(tandem.display_width(plain(rows[-1])), width - 1)
+                self.assertIn("\x1b[31mfailed", rows[-1])
+                self.assertIn("transcript transcript.md", plain(rows[-2]))
+                self.assertNotIn("FINISHED", "".join(rows))
+
+    def test_long_path_is_shortened_and_never_split(self):
+        home = str(pathlib.Path.home())
+        path = home + "/" + "/".join(["a-rather-long-directory-name"] * 4) + "/transcript.md"
+        console = self.console()
+        rows = self.lines(console, lambda: tandem.log("transcript " + tandem.show_path(path)), 60)
+        short = "~/" + path[len(home) + 1:]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(tandem.display_width(rows[0]), 59)
+        self.assertEqual(plain(rows[0])[8:], ("transcript " + short)[:59 - 8 - 1] + "\u2026")
+        with mock.patch.object(tandem, "CONSOLE", None):
+            self.assertEqual(tandem.show_path(path), path)  # whole for scripts
+        run = pathlib.Path(home) / "runs" / "r1"
+        with mock.patch.object(tandem, "CONSOLE", console):
+            self.assertEqual(tandem.show_path(run / "transcript.md", run), "transcript.md")
+            self.assertEqual(tandem.show_path("/elsewhere/x"), "/elsewhere/x")
+
+    def test_long_logs_fit_one_row_and_keep_error_color(self):
+        for utf, more in ((True, "…"), (False, "...")):
+            console = tandem.Console(fancy=True, styled=True, utf=utf)
+            rows = self.lines(console, lambda: tandem.log("界 word " * 30, "error"), 40)
+            self.assertEqual(len(rows), 1)
+            self.assertLessEqual(tandem.display_width(rows[0]), 39)
+            self.assertTrue(plain(rows[0]).endswith(more))
+            self.assertIn("\x1b[31m界", rows[0])
+            self.assertTrue(rows[0].endswith(more + "\x1b[0m"))
+
+    def test_talk_hint_only_outside_the_session(self):
+        args = argparse.Namespace(repo=".", goal_file=None, goal="g", name="n", base="HEAD", check=None,
+                                  max_turns=3, first=None)
+        for console, expected in ((None, True), (self.console(), False)):
+            with tempfile.TemporaryDirectory() as d, mock.patch.object(tandem, "RUNS", pathlib.Path(d)), \
+                    mock.patch.object(tandem, "require_repo", return_value=pathlib.Path(d)), \
+                    mock.patch.object(tandem, "config_from", return_value={}), \
+                    mock.patch.object(tandem, "create_run", side_effect=lambda path, *a: path), \
+                    mock.patch.dict(tandem.CURRENT):
+                rows = self.lines(console, lambda: tandem.prepare_run(args))
+            self.assertEqual(any("talk to the agents" in r for r in rows), expected)
+
+    def test_no_color_keeps_the_marker_and_rules(self):
+        console = self.console(fancy=False)
+        rows = self.lines(console, lambda: (tandem.log("pushed", "ok"), emit_rule(console)))
+        self.assertNotIn("\x1b", "".join(rows))
+        self.assertRegex(rows[0], r"^\d\d:\d\d \u2713 pushed$")
+        self.assertTrue(rows[1].startswith("\u2500\u2500 done \u00b7 x \u2500"))
+        self.assertEqual(console.owner_line("hi"), "\u203a hi")
+        ascii_console = tandem.Console(fancy=False, styled=True, utf=False)
+        self.assertEqual(ascii_console.owner_line("hi"), "> hi")
+        with mock.patch.object(tandem, "term_width", return_value=30):
+            self.assertEqual(ascii_console.rule("done"), "-- done " + "-" * 21)
+
+    def test_no_color_turn_line_marks_an_error(self):
+        entry = {"turn": 2, "agent": "codex", "status": "error", "seconds": 5, "commit": None, "error": "boom"}
+        rows = self.lines(self.console(fancy=False), lambda: tandem.report_turn(entry))
+        self.assertRegex(rows[0], r"^\d\d:\d\d \u2717 turn 2: Codex -> error")
+
+    def test_campaign_resume_opens_with_a_rule(self):
+        args = argparse.Namespace(push=None, codex_effort=None, codex_role=None, seed_review=None)
+        for console, expected in ((None, 0), (self.console(), 1)):
+            with tempfile.TemporaryDirectory() as d, mock.patch.object(tandem, "refuse_if_running"), \
+                    mock.patch.dict(tandem.CURRENT):
+                args.dir = d
+                tandem.write_json(pathlib.Path(d) / "campaign.json",
+                                  {"config": {}, "branch": "tandem/campaign-x", "current": None})
+                rows = self.lines(console, lambda: tandem.prepare_campaign_resume(args))
+            self.assertEqual(sum("tandem/campaign-x \u00b7 resumed" in plain(r) for r in rows), expected)
+
+
+def emit_rule(console):
+    tandem.emit(console.rule("done \u00b7 x", tandem.OUTCOME_COLORS["done"]))
+
+
 PNG = b"\x89PNG\r\n\x1a\n" + b"\0" * 16
 
 
@@ -2659,7 +2805,7 @@ class SessionProcess(unittest.TestCase):
         self.wait_for(started.exists, "the check starting")
         os.killpg(self.proc.pid, signal.SIGINT)
         self.wait_for(lambda: "press Ctrl+C again to exit" in self.text(), "the exit hint")
-        self.wait_for(lambda: "FINISHED" in self.text(), "the run finishing")
+        self.wait_for(lambda: "transcript transcript.md" in self.text(), "the run finishing")
         self.assertTrue(done.exists())
         self.assertEqual((self.state()["outcome"], self.state()["turn"]), ("done", 3))
         self.type("/quit")
@@ -2746,7 +2892,7 @@ class SessionProcess(unittest.TestCase):
         self.start()
         self.wait_for(self.screen_ends_with_prompt(), "the prompt")
         self.type("exit now please")
-        self.wait_for(lambda: "FINISHED" in self.text(), "the run finishing")
+        self.wait_for(lambda: "transcript transcript.md" in self.text(), "the run finishing")
         self.assertEqual(self.state()["goal"], "exit now please")
         self.type("/quit")
         self.assertEqual(self.proc.wait(timeout=10), 0, self.text())
@@ -2786,7 +2932,7 @@ class SessionProcess(unittest.TestCase):
         os.write(self.master, b"\x16")
         self.wait_for(lambda: "[image #1]" in self.text(), "the image in the line")
         self.type("please")
-        self.wait_for(lambda: "FINISHED" in self.text(), "the run finishing")
+        self.wait_for(lambda: "transcript transcript.md" in self.text(), "the run finishing")
         goal = self.state()["goal"]
         image = tandem.IMAGE_MARK.search(goal).group(1)
         self.assertEqual(goal, f"fix the layout in [image: {image}] please")
@@ -2942,7 +3088,7 @@ class SessionProcess(unittest.TestCase):
 
         def count():
             rows = [plain(r) for r in screen(self.text())]
-            return sum("tandem> " in r for r in rows), sum(r.startswith("claude ") and "working" in r for r in rows)
+            return sum(r.startswith(("tandem> ", "\u203a ")) for r in rows), sum(r.startswith("claude ") and "working" in r for r in rows)
 
         self.wait_for(lambda: count() == (2, 1), "the goal line, the prompt and the bar")
         for _ in range(3):
@@ -2965,7 +3111,7 @@ class SessionProcess(unittest.TestCase):
         self.wait_for(lambda: plain(self.text()[seen:]).count("working 0m") >= 2, "the bar ticking while typing")
         os.write(self.master, b"\r")
         self.wait_for(lambda: "queued for the next turn" in self.text(), "the typed line arriving")
-        self.assertIn("tandem> abc", [plain(r) for r in screen(self.text())])
+        self.assertIn("\u203a abc", [plain(r) for r in screen(self.text())])  # kept as the owner's line
 
     def test_typing_survives_a_log_line(self):
         self.check_typing_survives_a_log_line()
