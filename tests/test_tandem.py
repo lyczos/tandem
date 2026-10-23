@@ -526,9 +526,13 @@ class Headless(unittest.TestCase):
                 "--codex-role", "peer", "--codex-network", "--claude-budget", "2.5", "--timeout", "60")
         self.assertEqual(code, 0, err)
         result = json.loads(out)  # Extra log lines or JSON objects make this fail.
-        self.assertEqual(set(result), {"run_id", "name", "repo", "branch", "base", "outcome",
-                                      "outcome_message", "turn_count", "cost_usd", "max_cost", "transcript", "turns"})
+        self.assertEqual(set(result), {"run_id", "name", "repo", "branch", "base", "worktree", "commits", "diffstat",
+                                      "outcome", "outcome_message", "turn_count", "cost_usd", "max_cost",
+                                      "transcript", "turns"})
         self.assertIsNone(result["max_cost"])
+        self.assertEqual(result["worktree"], str(self.runs / result["run_id"] / "work"))
+        self.assertEqual((result["commits"], result["diffstat"]), (0, {"files": 0, "added": 0, "removed": 0}))
+        self.assertIn("no changes over", err)
         self.assertEqual((result["name"], result["outcome"], result["turn_count"], result["cost_usd"]),
                          ("json-check", "done", 2, .5))
         self.assertEqual(result["repo"], str(self.repo))
@@ -641,6 +645,149 @@ class Headless(unittest.TestCase):
         self.assertIn("working...", out)
         state = tandem.load(next(self.runs.iterdir()))
         self.assertEqual((state["goal"], state["outcome"]), ("Legacy goal", "max_turns"))
+
+
+class Handoff(unittest.TestCase):
+    setUp = Headless.setUp  # same throwaway repo and RUNS patches
+    invoke = Headless.invoke
+
+    def run_with(self, status, edit=True):
+        def agent(name, cfg, worktree, *args, **kwargs):
+            if edit and name == "claude" and not (pathlib.Path(worktree) / "new.txt").exists():
+                (pathlib.Path(worktree) / "new.txt").write_text("one\ntwo\n")
+            return {"status": status, "summary": "s", "handoff": "Need answer"}, 0
+        with mock.patch.object(tandem, "call_agent", side_effect=agent):
+            code, out, err = self.invoke("-p", "Work", "--max-turns", "4")
+        run_dir = next(self.runs.iterdir())
+        return out, run_dir, tandem.load(run_dir)
+
+    def command(self, *argv):
+        out = io.StringIO()
+        with mock.patch("sys.stdout", out):
+            tandem.main(list(argv))
+        return out.getvalue()
+
+    def test_summary_after_a_run_with_commits(self):
+        out, run_dir, state = self.run_with("done")
+        self.assertEqual(state["outcome"], "done")
+        repo, work, branch = shlex.quote(str(self.repo)), shlex.quote(state["worktree"]), state["branch"]
+        after = out[out.index("FINISHED"):]
+        self.assertIn(f"{branch}: 1 commit over {state['base'][:12]}, 1 file changed, +2 -0", after)
+        self.assertIn(f"worktree  {state['worktree']}\n", after)
+        self.assertIn(f"git -C {repo} diff {state['base'][:12]}..{branch}\n", after)
+        self.assertIn(f"git -C {repo} merge {branch}\n", after)
+        self.assertIn(f"git -C {repo} worktree remove {work} && git -C {repo} branch -d {branch}\n", after)
+        self.assertNotIn("resume", after.split("transcript")[0])
+        # The commands really work: the merge brings the run's file into the owner's checkout.
+        tandem.git(self.repo, "merge", "-q", branch)
+        self.assertTrue((self.repo / "new.txt").is_file())
+
+    def test_no_commits_says_no_changes_and_skips_the_commands(self):
+        out, run_dir, state = self.run_with("done", edit=False)
+        self.assertIn(f"{state['branch']}: no changes over", out)
+        self.assertNotIn(" merge ", out)
+        self.assertNotIn("worktree remove", out)
+
+    def test_blocked_run_offers_resume_before_the_merge(self):
+        out, run_dir, state = self.run_with("blocked")
+        self.assertEqual(state["outcome"], "blocked")
+        resume = out.index(f"resume    {tandem.prog_name()} resume {run_dir}")
+        self.assertLess(resume, out.index(f"merge {state['branch']}"))
+
+    def test_diff_command_with_bare_id_and_newest(self):
+        _, run_dir, state = self.run_with("done")
+        for argv in (("diff", run_dir.name), ("diff",)):
+            with self.subTest(argv=argv):
+                text = self.command(*argv)
+                self.assertIn(f"{state['branch']}: 1 commit over", text)
+                self.assertIn("new.txt", text)  # the --stat file list
+                self.assertIn("1 file changed, 2 insertions(+)", text)
+
+    def test_diff_with_no_runs(self):
+        self.assertIn("no runs yet", self.command("diff"))
+
+    def test_session_diff_without_a_run_says_so(self):
+        session = tandem.Session(argparse.Namespace(repo=self.repo), tandem.Console(fancy=False))
+        with mock.patch.dict(tandem.CURRENT, {}, clear=True), mock.patch.object(tandem, "emit") as emit:
+            self.assertTrue(session.handle("diff", ""))
+        emit.assert_called_once_with("no run yet; type a goal first")
+        self.assertIn("/diff", tandem.SLASH_HELP)
+
+    def test_removed_worktree_and_deleted_branch_do_not_crash(self):
+        _, run_dir, state = self.run_with("done")
+        tandem.git(self.repo, "worktree", "remove", "--force", state["worktree"])
+        text = self.command("diff", run_dir.name)
+        self.assertIn("1 commit over", text)  # read from the owner's repo, not the worktree
+        self.assertIn("the worktree is gone", text)
+        tandem.git(self.repo, "branch", "-D", state["branch"])
+        text = self.command("diff", run_dir.name)
+        self.assertIn(f"cannot read {state['branch']}", text)
+        self.assertNotIn(" merge ", text)
+        out = io.StringIO()
+        with mock.patch("sys.stdout", out):
+            tandem.finish(run_dir, state, "done", "again")
+        self.assertIn("the worktree is gone", out.getvalue())
+        result = tandem.headless_result(run_dir, state)
+        self.assertEqual((result["commits"], result["diffstat"]), (None, None))
+
+    def test_unreadable_diffstat_is_unknown_not_zero(self):
+        _, run_dir, state = self.run_with("done")
+        with mock.patch.object(tandem, "diffstat", return_value=None):
+            text = self.command("diff", run_dir.name)
+        self.assertIn("1 commit over", text)
+        self.assertIn("files changed unknown", text)
+        self.assertNotIn("0 files changed", text)
+        self.assertIn("cannot read the diffstat", text)
+        self.assertIn(f" merge {state['branch']}", text)  # the commits are known, so the commands stay
+
+    def test_campaign_summary_uses_its_own_base(self):
+        base = tandem.git(self.repo, "rev-parse", "HEAD")
+        camp_dir = self.runs / "campaign-x"
+        work = camp_dir / "work"
+        camp_dir.mkdir(parents=True)
+        tandem.git(self.repo, "worktree", "add", "-q", "-b", "tandem/campaign-x", str(work), base)
+        (work / "a.txt").write_text("a\n")
+        tandem.git(work, "add", "-A")
+        tandem.git(work, "commit", "-qm", "goal one")
+        tandem.write_json(camp_dir / "campaign.json", {"repo": str(self.repo), "worktree": str(work),
+                                                       "branch": "tandem/campaign-x", "base": base, "runs": []})
+        text = self.command("diff", "campaign-x")
+        self.assertIn("tandem/campaign-x: 1 commit over", text)
+        self.assertIn("campaign resume", text)
+        self.assertIn("merge tandem/campaign-x", text)
+
+    def test_campaign_run_finish_prints_summary_after_finished(self):
+        _, run_dir, state = self.run_with("done")
+        state["campaign"] = str(self.runs / "campaign-x")
+        out = io.StringIO()
+        with mock.patch("sys.stdout", out):
+            tandem.finish(run_dir, state, "blocked", "Need owner input")
+        text = out.getvalue()
+        lines = text.splitlines()
+        finished = next(i for i, line in enumerate(lines) if "FINISHED" in line)
+        self.assertIn(f"{state['branch']}: 1 commit over", lines[finished + 1])
+        self.assertIn(f"campaign resume {state['campaign']}", text)
+
+    def test_campaign_exit_prints_summary_even_on_interrupt(self):
+        _, run_dir, state = self.run_with("done")
+        camp_dir = self.runs / "campaign-x"
+        camp_dir.mkdir()
+        tandem.write_json(camp_dir / "campaign.json", {
+            **{key: state[key] for key in ("repo", "worktree", "branch", "base")},
+            "runs": []})
+        for error in (None, KeyboardInterrupt(), tandem.GitError("git failed")):
+            with self.subTest(error=error):
+                out = io.StringIO()
+                with mock.patch("sys.stdout", out), \
+                        mock.patch.object(tandem, "_campaign_loop", side_effect=error):
+                    if error is None:
+                        tandem.campaign_loop(camp_dir)
+                    else:
+                        with self.assertRaises(type(error)):
+                            tandem.campaign_loop(camp_dir)
+                self.assertFalse((camp_dir / ".lock").exists())
+                self.assertIn(f"{state['branch']}: 1 commit over", out.getvalue())
+                self.assertIn(f"campaign resume {camp_dir}", out.getvalue())
 
 
 class Tuning(unittest.TestCase):
@@ -999,7 +1146,7 @@ class Budget(unittest.TestCase):
                 camp = json.loads((camp_dir / "campaign.json").read_text())
                 # A planner that says the plan is finished ends the campaign as finished, cap or not.
                 finished = bool(result and result["finished"])
-                self.assertEqual(camp.get("outcome"), None if finished else "over_budget")
+                self.assertEqual(camp.get("outcome"), "finished" if finished else "over_budget")
                 self.assertAlmostEqual(camp["cost_usd"], 1.1)
                 self.assertEqual(call.call_count, 1)
                 wait.assert_not_called()
@@ -1275,7 +1422,7 @@ class StatusBar(unittest.TestCase):
         self.assertEqual(state["history"][0]["model"], "claude-opus-5-5")
         self.assertNotIn("usage", state["history"][1])  # Codex reported nothing: nothing is guessed
         self.assertEqual(state["tokens"], {"claude": 105, "codex": 0})
-        self.assertEqual(state["diffstat"], {"added": 2, "removed": 1})
+        self.assertEqual(state["diffstat"], {"files": 1, "added": 2, "removed": 1})
 
 
 class Interactive(unittest.TestCase):

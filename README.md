@@ -134,15 +134,29 @@ tandem resume <id> --more-turns 6     # after Ctrl+C, a limit, or a blocked run
 `tandem watch` with no id follows whichever run acted last, so one left open in a side pane keeps
 up with every new goal and every run of a campaign.
 
-When a run is done, review and take the branch:
+## After a run
 
-```bash
-cd ~/code/my-project
-git log --oneline main..tandem/<id>
-git diff main...tandem/<id>
-git merge --squash tandem/<id>              # or open a PR from the branch
-git worktree remove <runs-directory>/<id>/work
+The work sits on the run's branch, in its own worktree; tandem never merges, pushes or deletes it.
+Right after the `FINISHED` line every run prints what changed and how to take it, with your real
+paths filled in:
+
+```text
+  branch    tandem/20261024-120000-parser: 3 commits over f89ce5c3f217, 4 files changed, +120 -7
+  worktree  /home/me/.tandem/runs/20261024-120000-parser/work
+  read      git -C /home/me/project diff f89ce5c3f217..tandem/20261024-120000-parser
+  merge     git -C /home/me/project merge tandem/20261024-120000-parser
+  clean up  git -C /home/me/project worktree remove /home/me/.tandem/runs/20261024-120000-parser/work && git -C /home/me/project branch -d tandem/20261024-120000-parser
 ```
+
+The merge is a plain one, so each turn's commit stays in your history; squash it yourself if you
+prefer. Clean up only after merging: `branch -d` refuses a branch that is not merged. A run that
+ended `blocked`, `failed`, `max_turns`, `stopped` or `over_budget` shows a `resume` line first,
+because its work is not finished. A run with no commits says `no changes` and prints no commands.
+A campaign prints the same summary for its branch when it ends.
+
+`tandem diff [RUN]` (default: the newest run or campaign) and `/diff` in the session print it again
+at any time, followed by `git diff --stat` of the branch (its first 20 files). If the worktree or
+the branch is already gone, they say so in a `note` line instead of failing.
 
 ## Interactive session
 
@@ -163,6 +177,8 @@ before the cursor. A paste of several lines arrives as one line. With `TERM=dumb
 terminal the session uses Python's `input()` with readline instead, without the menu. Slash commands:
 
 - `/help`, `/status`, `/runs`, `/transcript` (prints the transcript path), `/doctor`
+- `/diff` shows what the current or last run changed and the commands to read, merge and clean
+  it up (see [After a run](#after-a-run))
 - `/board` shows where the run stands: what both agents agree on, what is still open, the models in use
   and the cost. Each finished turn appears in the session as a small card with its summary, handoff and checks.
 - `/budget [USD|off]` shows spent cost and the cap, sets a positive dollar cap, or removes it.
@@ -287,6 +303,9 @@ in either format; the final result and errors remain. For example, `result.json`
   "repo": "/home/me/project",
   "branch": "tandem/20261023-120000-parser",
   "base": "f89ce5c3f217b8d35b0d8e804ba98a10ab78f6a1",
+  "worktree": "/home/me/.tandem/runs/20261023-120000-parser/work",
+  "commits": 1,
+  "diffstat": {"files": 2, "added": 40, "removed": 3},
   "outcome": "max_turns",
   "outcome_message": "Turn limit reached before both agents agreed.",
   "turn_count": 1,
@@ -299,6 +318,8 @@ in either format; the final result and errors remain. For example, `result.json`
 }
 ```
 
+`commits` and `diffstat` are what the branch holds over `base`, so a script can tell an empty run
+from one worth merging without running git; both are `null` when the branch cannot be read.
 `cost_usd` counts Claude costs only; Codex cost is not tracked. Setup errors after argument
 parsing produce the same JSON shape with `outcome: "error"` and null fields for a run that was
 not created. Invalid arguments print usage on stderr. Ctrl+C records `stopped`; `resume` can

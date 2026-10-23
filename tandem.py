@@ -1114,14 +1114,150 @@ def commit_turn(state, agent, turn, summary, failed):
     return git(work, "rev-parse", "--short", "HEAD")
 
 
-def diffstat(worktree, base):
-    """{"added": N, "removed": N} for the branch so far, from git's own summary line."""
+def diffstat(worktree, base, head="HEAD"):
+    """{"files": N, "added": N, "removed": N} for base..head, from git's own summary line."""
     try:
-        line = git(worktree, "diff", "--shortstat", f"{base}..HEAD")
-    except GitError:
+        line = git(worktree, "diff", "--shortstat", f"{base}..{head}")
+    except (GitError, OSError):
         return None
-    counts = {kind: int(n) for n, kind in re.findall(r"(\d+) (insertion|deletion)", line)}
-    return {"added": counts.get("insertion", 0), "removed": counts.get("deletion", 0)}
+    counts = {kind: int(n) for n, kind in re.findall(r"(\d+) (file|insertion|deletion)", line)}
+    return {"files": counts.get("file", 0), "added": counts.get("insertion", 0), "removed": counts.get("deletion", 0)}
+
+
+# Outcomes whose work is not finished: the summary offers resume before the merge.
+UNFINISHED = ("blocked", "failed", "max_turns", "stopped", "over_budget")
+
+
+def branch_facts(repo, branch, base, worktree=None):
+    """What branch holds over base, read in the owner's repo so a removed worktree still answers.
+    Never raises: the end of a run must not crash on a branch the owner already merged and deleted."""
+    facts = {"commits": None, "diffstat": None, "note": None}
+    notes = []
+    try:
+        facts["commits"] = int(git(repo, "rev-list", "--count", f"{base}..{branch}"))
+        facts["diffstat"] = diffstat(repo, base, branch)
+    except (GitError, OSError, ValueError, TypeError):
+        notes.append(f"cannot read {branch} in {repo}; merged and deleted already?")
+    else:
+        if facts["diffstat"] is None:
+            notes.append(f"cannot read the diffstat of {base[:12]}..{branch}")
+    if worktree and not pathlib.Path(worktree).is_dir():
+        notes.append("the worktree is gone")
+    facts["note"] = "; ".join(notes) or None
+    return facts
+
+
+def run_handoff(run_dir, state):
+    """The branch a run left behind, as handoff_lines() takes it."""
+    camp = state.get("campaign")
+    again = f"campaign resume {shlex.quote(camp)}" if camp else f"resume {shlex.quote(str(run_dir))}"
+    return {"repo": state.get("repo"), "worktree": state.get("worktree"), "branch": state.get("branch"),
+            "base": state.get("base"),
+            "resume": f"{prog_name()} {again}" if state.get("outcome") in UNFINISHED else None}
+
+
+def campaign_base(camp):
+    """Where the campaign's branch started. Older campaigns did not record it; their first run did."""
+    if camp.get("base"):
+        return camp["base"]
+    for d in [r.get("dir") for r in camp.get("runs", [])] + [camp.get("current")]:
+        try:
+            return load(pathlib.Path(d))["base"]
+        except (OSError, ValueError, KeyError, TypeError):
+            continue
+    return None
+
+
+def campaign_handoff(camp_dir, camp):
+    # A running campaign holds its lock; offering resume then would only meet "already running".
+    unfinished = camp.get("outcome") != "finished" and not (camp_dir / ".lock").exists()
+    return {"repo": camp.get("repo"), "worktree": camp.get("worktree"), "branch": camp.get("branch"),
+            "base": campaign_base(camp),
+            "resume": f"{prog_name()} campaign resume {shlex.quote(str(camp_dir))}" if unfinished else None}
+
+
+def handoff_lines(h):
+    """The end-of-run summary: what the branch holds, where it is, and the commands that read, take
+    and clean it up. The commands are printed whole and unstyled so they copy cleanly."""
+    paint = CONSOLE.paint if in_session() else (lambda style, text: text)
+    branch, base, repo, work = h.get("branch"), h.get("base"), h.get("repo"), h.get("worktree")
+    if repo and branch and base:
+        facts = branch_facts(repo, branch, base, work)
+    else:
+        facts = {"commits": None, "diffstat": None, "note": "no branch recorded for this run"}
+    n, stat = facts["commits"], facts["diffstat"] or {}
+    short = (base or "?")[:12]
+    if n is None:
+        what = f"{branch or '?'} over {short}: unknown"
+    elif n == 0:
+        what = f"{branch}: no changes over {short}"
+    else:
+        what = f"{branch}: {n} commit{'' if n == 1 else 's'} over {short}, "
+        if facts["diffstat"] is None:
+            what += "files changed unknown"
+        else:
+            what += (f"{stat['files']} file{'' if stat['files'] == 1 else 's'} changed, "
+                     f"+{stat['added']} -{stat['removed']}")
+    rows = [("branch", what, False), ("worktree", str(work or "?"), True)]
+    if h.get("resume"):
+        rows.append(("resume", h["resume"], True))
+    if n:
+        q = shlex.quote
+        r = q(str(repo))
+        rows += [("read", f"git -C {r} diff {short}..{q(branch)}", True),
+                 ("merge", f"git -C {r} merge {q(branch)}", True),
+                 ("clean up", f"git -C {r} worktree remove {q(str(work))} && git -C {r} branch -d {q(branch)}", True)]
+    if facts["note"]:
+        rows.append(("note", facts["note"], False))
+    width = max(term_width() - 1, 20)
+    lines = []
+    for label, text, whole in rows:
+        head = paint("2", f"  {label:<9} ")
+        lines.append(head + (text if whole or not in_session() else fit_width(text, width - 12)))
+    return lines
+
+
+def diff_stat_lines(repo, base, branch, limit=20):
+    """`git diff --stat` of the branch, cut to its first limit files plus git's summary line."""
+    try:
+        files = git(repo, "diff", "--stat", f"{base}..{branch}").splitlines()
+    except (GitError, OSError, TypeError):
+        return []
+    total = files[-1:]
+    files = files[:-1]
+    if len(files) > limit:
+        files = files[:limit] + [f" ... {len(files) - limit} more files"]
+    return files + total
+
+
+def show_handoff(h, stat=False):
+    for line in handoff_lines(h):
+        emit(line)
+    if stat and h.get("repo") and h.get("branch") and h.get("base"):
+        for line in diff_stat_lines(h["repo"], h["base"], h["branch"]):
+            emit(line)
+
+
+def handoff_of(target):
+    """The handoff for a run or campaign directory; None when target is neither."""
+    if (target / "campaign.json").is_file():
+        return campaign_handoff(target, json.loads((target / "campaign.json").read_text()))
+    if (target / "state.json").is_file():
+        return run_handoff(target, load(target))
+    return None
+
+
+def show_diff(target):
+    """`tandem diff` and /diff: the end-of-run summary at any time, plus the files it touched."""
+    try:
+        h = handoff_of(target)
+    except (OSError, ValueError) as exc:
+        emit(f"cannot read {target}: {exc}")
+        return
+    if h is None:
+        emit(f"no run or campaign at {target}")
+        return
+    show_handoff(h, stat=True)
 
 
 def run_check(state):
@@ -1187,6 +1323,7 @@ def finish(run_dir, state, outcome, message):
     append_transcript(run_dir, f"\n## Finished: {outcome}\n\n{message}\n")
     log(f"FINISHED {state.get('name') or run_dir.name}: {outcome} - {message}",
         "error" if outcome == "failed" else "ok" if outcome == "done" else None, brief=message)
+    show_handoff(run_handoff(run_dir, state))
     log(f"transcript {run_dir / 'transcript.md'}", brief=f"transcript {show_path(run_dir / 'transcript.md', run_dir)}")
     if in_session():
         emit(CONSOLE.rule(f"{outcome} \u00b7 {state.get('name') or run_dir.name}", OUTCOME_COLORS.get(outcome, "1")))
@@ -1508,6 +1645,11 @@ def campaign_loop(camp_dir):
         _campaign_loop(camp_dir)
     finally:
         lock.unlink(missing_ok=True)
+        # Interrupts still leave work to take or resume; release the lock before offering resume.
+        try:
+            show_handoff(campaign_handoff(camp_dir, json.loads((camp_dir / "campaign.json").read_text())))
+        except (OSError, ValueError) as exc:
+            log(f"cannot sum up the campaign's branch: {exc}", "warn")
 
 
 def _campaign_loop(camp_dir):
@@ -1610,6 +1752,8 @@ def _campaign_loop(camp_dir):
                 wait_until(wake, stop_file)
                 continue
             if plan.get("finished"):
+                camp["outcome"] = "finished"
+                write_json(path, camp)
                 log(f"campaign finished: {plan.get('reason')}", "ok")
                 return
             item = {"goal": plan["goal"], "name": slug(plan["name"]) or "goal",
@@ -1643,7 +1787,7 @@ def prepare_campaign_start(args):
     if args.adopt:
         run_dir = run_path(args.adopt)
         state = load(run_dir)
-        camp.update(repo=state["repo"], worktree=state["worktree"], branch=state["branch"])
+        camp.update(repo=state["repo"], worktree=state["worktree"], branch=state["branch"], base=state["base"])
         state.setdefault("name", run_dir.name)
         state["inboxes"] = [str(run_dir / "inbox.md"), str(camp_dir / "inbox.md")]
         state["stop_file"] = str(camp_dir / "STOP")
@@ -1659,8 +1803,9 @@ def prepare_campaign_start(args):
         repo = require_repo(args.repo)
         branch = f"tandem/campaign-{camp_id}"
         worktree = str(camp_dir / "work")
-        git(repo, "worktree", "add", "-q", "-b", branch, worktree, git(repo, "rev-parse", args.base))
-        camp.update(repo=str(repo), worktree=worktree, branch=branch)
+        base = git(repo, "rev-parse", args.base)
+        git(repo, "worktree", "add", "-q", "-b", branch, worktree, base)
+        camp.update(repo=str(repo), worktree=worktree, branch=branch, base=base)
     camp["queue"] = [read_goal_file(p) for p in args.goal_file or []]
     write_json(camp_dir / "campaign.json", camp)
     CURRENT["target"] = camp_dir
@@ -1761,10 +1906,14 @@ def outcome_exit_code(outcome):
 
 def headless_result(run_dir, state):
     history = state.get("history", [])
+    facts = {"commits": None, "diffstat": None}
+    if state.get("repo") and state.get("branch") and state.get("base"):
+        facts = branch_facts(state["repo"], state["branch"], state["base"])
     return {
         "run_id": run_dir.name if run_dir else None,
         "name": state.get("name"), "repo": state.get("repo"), "branch": state.get("branch"),
-        "base": state.get("base"), "outcome": state.get("outcome"),
+        "base": state.get("base"), "worktree": state.get("worktree"),
+        "commits": facts["commits"], "diffstat": facts["diffstat"], "outcome": state.get("outcome"),
         "outcome_message": state.get("outcome_message", ""), "turn_count": len(history),
         "cost_usd": state.get("cost_usd", 0.0), "max_cost": (state.get("config") or {}).get("max_cost"),
         "transcript": str(run_dir / "transcript.md") if run_dir else None,
@@ -1964,6 +2113,18 @@ def cmd_status(args):
     for h in state["history"]:
         emit(f"  {h['turn']:>2} {h['agent']:<6} {h['status']:<8} {h.get('commit') or '-':<8} "
               f"{(h.get('summary') or h.get('error') or '')[:100]}")
+
+
+def cmd_diff(args):
+    if args.run:
+        target = run_path(args.run)
+    else:
+        rows = list_runs(1)
+        if not rows:
+            emit(f"no runs yet in {RUNS}")
+            return
+        target = pathlib.Path(rows[0]["path"])
+    show_diff(target)
 
 
 def list_runs(limit=None):
@@ -2193,6 +2354,10 @@ def build_parser():
     t.add_argument("run")
     t.set_defaults(fn=cmd_status)
 
+    f = sub.add_parser("diff", help="what a run changed and the commands to read, merge and clean it up")
+    f.add_argument("run", nargs="?", help="a run or campaign; default: the newest")
+    f.set_defaults(fn=cmd_diff)
+
     d = sub.add_parser("doctor", help="check tools and logins before the first run")
     d.set_defaults(fn=cmd_doctor)
 
@@ -2258,6 +2423,7 @@ SLASH = [
     ("goal", "FILE", "start a run from a goal file"),
     ("campaign", "ARGS...", "same as `tandem campaign ARGS...` (start, resume, stop, status, say)"),
     ("runs", "", "recent runs and campaigns"),
+    ("diff", "", "what the run changed and the commands to read, merge and clean it up"),
     ("transcript", "", "print the transcript path"),
     ("doctor", "", "check tools and logins"),
     ("quit", "", "leave (also Ctrl+D, or Ctrl+C twice)"),
@@ -3499,7 +3665,7 @@ class Session:
         elif name == "watch":
             self.watch()
         else:
-            target = self.target(latest=name in ("resume", "status", "transcript", "board"))
+            target = self.target(latest=name in ("resume", "status", "transcript", "board", "diff"))
             if not target:
                 return True
             if name == "say":
@@ -3523,6 +3689,8 @@ class Session:
                 self.guarded(lambda _: self.show_board(target), None)
             elif name == "transcript":
                 emit(str(self.transcript_path(target)))
+            elif name == "diff":
+                self.guarded(lambda _: show_diff(target), None)
             elif name == "resume":
                 self.resume(target, rest)
         return True

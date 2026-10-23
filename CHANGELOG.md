@@ -2,6 +2,13 @@
 
 ## 0.1.0
 
+- Every run ends with what changed and how to take it: the branch, its commits and diffstat
+  over the base, the worktree, and ready-to-copy `git -C REPO diff`, `merge` and cleanup
+  commands (a `resume` line first when the run is unfinished). Campaigns print the same for
+  their branch at the end. `tandem diff [RUN]` and `/diff` show it at any time with
+  `git diff --stat`. Headless JSON gains `worktree`, `commits` and `diffstat`, and the
+  diffstat now includes `files`. tandem still never merges, pushes or deletes anything itself.
+
 - Add `--max-cost USD` for runs and campaigns, with a shared campaign cap, remaining-budget
   limits for Claude turns, and `over_budget` (headless exit 6). The cap counts reported cost
   only; Codex reports none. `/budget [USD|off]` changes the cap from the next turn. Show
