@@ -512,7 +512,8 @@ class Headless(unittest.TestCase):
 
     def test_outcome_exit_codes(self):
         for outcome, expected in (("done", 0), ("error", 1), (None, 1), ("unexpected", 1),
-                                  ("max_turns", 2), ("blocked", 3), ("stopped", 4), ("failed", 5)):
+                                  ("max_turns", 2), ("blocked", 3), ("stopped", 4), ("failed", 5),
+                                  ("over_budget", 6)):
             with self.subTest(outcome=outcome):
                 self.assertEqual(tandem.outcome_exit_code(outcome), expected)
 
@@ -526,7 +527,8 @@ class Headless(unittest.TestCase):
         self.assertEqual(code, 0, err)
         result = json.loads(out)  # Extra log lines or JSON objects make this fail.
         self.assertEqual(set(result), {"run_id", "name", "repo", "branch", "base", "outcome",
-                                      "outcome_message", "turn_count", "cost_usd", "transcript", "turns"})
+                                      "outcome_message", "turn_count", "cost_usd", "max_cost", "transcript", "turns"})
+        self.assertIsNone(result["max_cost"])
         self.assertEqual((result["name"], result["outcome"], result["turn_count"], result["cost_usd"]),
                          ("json-check", "done", 2, .5))
         self.assertEqual(result["repo"], str(self.repo))
@@ -721,6 +723,296 @@ class Tuning(unittest.TestCase):
         self.assertEqual(state["tuning_files"], [str(camp_dir / "tuning.json")])
         self.assertEqual(state["config"]["codex_model"], "gpt-z")
         self.assertEqual(camp["config"]["codex_model"], "gpt-z")
+
+
+class Budget(unittest.TestCase):
+    setUp = Headless.setUp
+    invoke = Headless.invoke
+    run_dir_with = Tuning.run_dir_with
+
+    def agent(self, cost, seen, on_call=None):
+        def call(name, cfg, *rest):
+            seen.append(cfg.get("claude_budget"))
+            if on_call:
+                on_call(len(seen), rest[-1])  # rest[-1] is call_agent's run_dir
+            return {"status": "continue"}, cost
+        return call
+
+    def test_headless_stops_before_the_turn_past_the_cap(self):
+        seen = []
+        with mock.patch.object(tandem, "call_agent", side_effect=self.agent(.4, seen)):
+            code, out, err = self.invoke("-p", "Work", "--output-format", "json", "--max-cost", "1")
+        self.assertEqual(code, 6, err)
+        result = json.loads(out)
+        # .4, .8 and 1.2 spent: the third turn ran to the end, the fourth never started.
+        self.assertEqual((result["outcome"], result["turn_count"], result["max_cost"]), ("over_budget", 3, 1.0))
+        self.assertTrue(all(t["status"] == "continue" for t in result["turns"]))
+        self.assertIn("spent $1.20 of the $1.00 cap", result["outcome_message"])
+        self.assertIn(f"resume {self.runs / result['run_id']} --max-cost 2", result["outcome_message"])
+        # Each Claude turn may spend at most what is left of the cap.
+        self.assertEqual(seen, [1.0, .6, .2])
+
+    def test_one_expensive_turn_finishes_then_the_run_stops(self):
+        seen = []
+        with mock.patch.object(tandem, "call_agent", side_effect=self.agent(5, seen)):
+            code, out, err = self.invoke("-p", "Work", "--output-format", "json", "--max-cost", "1")
+        self.assertEqual(code, 6, err)
+        self.assertEqual(json.loads(out)["turn_count"], 1)
+
+    def test_turn_budget_is_the_smaller_of_cap_left_and_claude_budget(self):
+        seen = []
+        with mock.patch.object(tandem, "call_agent", side_effect=self.agent(.4, seen)):
+            self.invoke("-p", "Work", "--quiet", "--max-cost", "1", "--claude-budget", ".5")
+        self.assertEqual(seen, [.5, .5, .2])
+        self.assertEqual(tandem.turn_budget({"claude_budget": 3}, 0), 3)
+        self.assertIsNone(tandem.turn_budget({}, 0))
+
+    def test_cost_of_a_turn_that_errored_still_counts(self):
+        err = RuntimeError("error_max_budget_usd: over")
+        err.cost = 2.0
+        with mock.patch.object(tandem, "call_agent", side_effect=err):
+            code, out, _ = self.invoke("-p", "Work", "--output-format", "json", "--max-cost", "1")
+        self.assertEqual((code, json.loads(out)["turn_count"], json.loads(out)["cost_usd"]), (6, 1, 2.0))
+
+    def test_zero_negative_or_bad_cap_is_a_usage_error(self):
+        for value in ("0", "-1", "abc", "nan", "inf"):
+            with self.subTest(value=value):
+                code, _, err = self.invoke("-p", "Work", "--max-cost", value)
+                self.assertEqual(code, 1)
+                self.assertIn("--max-cost", err)
+        for argv in (["resume", "r1", "--max-cost", "0"], ["campaign", "resume", "c", "--max-cost", "-2"],
+                     ["campaign", "start", "--max-cost", "0"], ["start", "--goal", "g", "--max-cost", "0"]):
+            with self.subTest(argv=argv), self.assertRaises(SystemExit) as exit, \
+                    mock.patch("sys.stderr", io.StringIO()):
+                tandem.build_parser().parse_args(argv)
+            self.assertEqual(exit.exception.code, 1)
+
+    def test_tuning_raises_the_cap_from_the_next_turn_and_null_removes_it(self):
+        cfg = tandem.load(self.run_dir_with(max_cost=1.0))["config"]
+        for i, (new, outcome) in enumerate(((10, "max_turns"), (None, "max_turns"), (.5, "over_budget"))):
+            with self.subTest(new=new), mock.patch.object(tandem, "log"):
+                run_dir = tandem.create_run(self.runs / f"t{i}", self.repo, "goal", "t", dict(cfg), 3, "codex")
+                seen = []
+                on_call = lambda n, rd: n == 1 and tandem.write_tuning(rd, {"max_cost": new})
+                with mock.patch.object(tandem, "call_agent", side_effect=self.agent(.6, seen, on_call)), \
+                        mock.patch.object(tandem, "log"):
+                    tandem.loop(run_dir)
+                state = tandem.load(run_dir)
+                self.assertEqual(state["outcome"], outcome)
+                self.assertEqual(state["config"]["max_cost"], new)
+                self.assertEqual(len(state["history"]), 3 if outcome == "max_turns" else 1)
+
+    def test_resume_raises_the_cap_over_an_older_tuning_value(self):
+        run_dir = self.run_dir_with(max_cost=1.0)
+        tandem.write_tuning(run_dir, {"max_cost": 1.0})
+        with mock.patch.object(tandem, "call_agent", side_effect=self.agent(.6, [])), mock.patch.object(tandem, "log"):
+            tandem.loop(run_dir)
+            self.assertEqual(tandem.load(run_dir)["outcome"], "over_budget")
+            tandem.cmd_resume(argparse.Namespace(run=str(run_dir), more_turns=None, max_cost=10.0))
+        state = tandem.load(run_dir)
+        self.assertEqual((state["outcome"], state["config"]["max_cost"], len(state["history"])), ("max_turns", 10.0, 3))
+
+    def test_session_budget_changes_apply_from_next_turn(self):
+        run_dir = self.run_dir_with(max_cost=1.0)
+        session = tandem.Session.__new__(tandem.Session)
+        session.args = argparse.Namespace(repo=self.repo)
+        seen = []
+
+        def change(n, rd):
+            session.handle("budget", "10" if n == 1 else "off")
+            # The session writes tuning only; the loop still owns the saved config.
+            self.assertEqual(tandem.load(rd)["config"]["max_cost"], 1.0 if n == 1 else 10.0)
+
+        with mock.patch.dict(tandem.CURRENT, target=run_dir), mock.patch.object(tandem, "emit"), \
+                mock.patch.object(tandem, "log"), \
+                mock.patch.object(tandem, "call_agent", side_effect=self.agent(.6, seen, lambda n, rd: change(n, rd) if n < 3 else None)):
+            tandem.loop(run_dir)
+        self.assertEqual(seen, [1.0, 9.4, None])
+        self.assertIsNone(tandem.load(run_dir)["config"]["max_cost"])
+
+    def test_session_budget_reports_pending_cap_and_rejects_invalid_amounts(self):
+        run_dir = self.run_dir_with(max_cost=1.0)
+        session = tandem.Session.__new__(tandem.Session)
+        with mock.patch.object(tandem, "emit") as emit:
+            session.budget(run_dir, "10")
+            session.budget(run_dir, "")
+            emit.assert_called_with("spent $0.00; $10.00 cap (reported cost only)")
+            for value in ("0", "-1", "nan", "bad"):
+                session.budget(run_dir, value)
+                self.assertIn("usage: /budget", emit.call_args[0][0])
+            self.assertEqual(tandem.read_tuning(run_dir / "tuning.json"), {"max_cost": 10.0})
+            session.budget(run_dir, "off")
+            session.budget(run_dir, "")
+            emit.assert_called_with("spent $0.00; no cap (reported cost only)")
+
+    def test_session_budget_campaign_total_excludes_already_counted_last_run(self):
+        run_dir = self.run_dir_with(max_cost=1)
+        state = tandem.load(run_dir)
+        state["cost_usd"] = .75
+        tandem.save(run_dir, state)
+        camp_dir = self.runs / "camp"
+        camp_dir.mkdir()
+        camp = {"config": {"max_cost": 5}, "cost_usd": 2,
+                "current": str(run_dir), "runs": [{"dir": str(run_dir)}]}
+        session = tandem.Session.__new__(tandem.Session)
+        with mock.patch.object(tandem, "emit") as emit:
+            tandem.write_json(camp_dir / "campaign.json", camp)
+            session.budget(camp_dir, "")
+            emit.assert_called_with("spent $2.75; $5.00 cap (reported cost only)")
+            camp["current"] = None
+            tandem.write_json(camp_dir / "campaign.json", camp)
+            session.budget(camp_dir, "")
+            emit.assert_called_with("spent $2.00; $5.00 cap (reported cost only)")
+
+    def test_eighty_percent_is_said_once(self):
+        run_dir = self.run_dir_with(max_cost=1.0)
+        lines = []
+        with mock.patch.object(tandem, "call_agent", side_effect=self.agent(.3, [])), \
+                mock.patch.object(tandem, "log", side_effect=lambda msg, *kind, **brief: lines.append(msg)):
+            tandem.loop(run_dir)
+        self.assertEqual([l for l in lines if "cap" in l and "spent" in l][:1], ["spent $0.90 of the $1.00 cap"])
+        self.assertEqual(sum(l.startswith("spent $") for l in lines), 1)
+
+    def test_campaign_stops_on_the_sum_of_its_runs_and_resume_raises_it(self):
+        self.run_dir_with()  # patches HOME
+        camp_dir = self.runs / "campaign-x"
+        camp_dir.mkdir(parents=True)
+        worktree = self.base / "camp-work"
+        tandem.git(self.repo, "worktree", "add", "-q", "-b", "camp", str(worktree), "HEAD")
+        cfg = {"timeout": 5, "claude_permission_mode": "acceptEdits", "codex_role": "peer", "check": None,
+               "max_cost": 1.0, **{k: None for k in tandem.TUNABLE}}
+        tandem.write_json(camp_dir / "campaign.json", {
+            "id": "x", "config": cfg, "max_turns": 3, "push": False, "runs": [], "blockers": [], "no_progress": 0,
+            "cost_usd": 0.0, "current": None, "repo": str(self.repo), "worktree": str(worktree), "branch": "camp",
+            "queue": [{"goal": "g", "name": n, "first": "claude"} for n in ("one", "two", "three")]})
+        seen = []
+        with mock.patch.object(tandem, "call_agent", side_effect=self.agent(.3, seen)), \
+                mock.patch.object(tandem, "log"):
+            tandem._campaign_loop(camp_dir)
+            camp = json.loads((camp_dir / "campaign.json").read_text())
+            # Goal one runs out of turns at .9; goal two takes one turn to 1.2 and stops there.
+            self.assertEqual(camp["outcome"], "over_budget")
+            self.assertEqual([r["name"] for r in camp["runs"]], ["one"])
+            state = tandem.load(pathlib.Path(camp["current"]))
+            self.assertEqual((state["name"], state["outcome"], len(state["history"])), ("two", "over_budget", 1))
+            self.assertIn(f"campaign resume {camp_dir} --max-cost 2", state["outcome_message"])
+            self.assertEqual([round(b, 2) for b in seen], [1.0, .7, .4, .1])
+            tandem.prepare_campaign_resume(argparse.Namespace(
+                dir=str(camp_dir), push=None, codex_effort=None, codex_role=None, seed_review=None, max_cost=2.0))
+            self.assertNotIn("outcome", json.loads((camp_dir / "campaign.json").read_text()))
+            tandem._campaign_loop(camp_dir)
+        camp = json.loads((camp_dir / "campaign.json").read_text())
+        # Goal two finishes its turns at 1.8; goal three's first turn reaches 2.1, past the raised cap.
+        self.assertEqual([r["name"] for r in camp["runs"]], ["one", "two"])
+        self.assertEqual(camp["outcome"], "over_budget")
+        self.assertAlmostEqual(camp["cost_usd"], 1.8)
+        state = tandem.load(pathlib.Path(camp["current"]))
+        self.assertEqual((state["name"], len(state["history"])), ("three", 1))
+        self.assertAlmostEqual(tandem.budget_spent(state), 2.1)
+
+    def test_claude_cli_gets_what_is_left_of_the_cap(self):
+        reply = json.dumps({"type": "result", "structured_output": {"status": "continue"}, "total_cost_usd": .4})
+        done = subprocess.CompletedProcess([], 0, reply + "\n", "")
+        with mock.patch.object(tandem, "run_child", return_value=done) as run:
+            code, out, err = self.invoke("-p", "Work", "--output-format", "json", "--max-turns", "1",
+                                         "--max-cost", "1.5", "--claude-budget", "2")
+        self.assertEqual((code, json.loads(out)["cost_usd"]), (2, .4), err)
+        cmd = run.call_args[0][0]
+        self.assertEqual(cmd[cmd.index("--max-budget-usd") + 1], "1.5")
+
+    def test_spent_cap_wins_over_the_turn_limit_and_skips_availability_waits(self):
+        run_dir = self.run_dir_with(max_cost=1.0)
+        state = tandem.load(run_dir)
+        state.update(cost_usd=1.0, turn=state["max_turns"] + 1)
+        tandem.save(run_dir, state)
+        later = datetime.datetime.now() + datetime.timedelta(hours=3)
+        with mock.patch.object(tandem, "unavailable_until", return_value=later), \
+                mock.patch.object(tandem, "wait_until") as wait, mock.patch.object(tandem, "log"):
+            tandem.loop(run_dir)
+        wait.assert_not_called()
+        self.assertEqual(tandem.load(run_dir)["outcome"], "over_budget")
+
+    def test_transient_retries_keep_the_cost_of_failed_attempts(self):
+        calls = []
+
+        def runner(cfg, *rest):
+            calls.append(cfg.get("claude_budget"))
+            if len(calls) <= 2:
+                err = RuntimeError("API Error: 529 overloaded")
+                err.cost = .3
+                raise err
+            return {"status": "continue"}, .2, {}
+
+        with mock.patch.dict(tandem.RUNNERS, claude=runner), mock.patch.object(tandem, "log"), \
+                mock.patch.object(tandem, "wait_until", return_value=True):
+            result, cost, _ = tandem.call_agent("claude", {"claude_budget": 1.0}, None, "p", None, None, "status", False)
+            self.assertAlmostEqual(cost, .8)
+            self.assertEqual(calls, [1.0, .7, .4])
+            calls.clear()
+            failing = lambda *a: (_ for _ in ()).throw(type("E", (RuntimeError,), {"cost": .3})("x 503"))
+            with mock.patch.dict(tandem.RUNNERS, claude=failing), self.assertRaises(RuntimeError) as caught:
+                tandem.call_agent("claude", {}, None, "p", None, None, "status", False)
+        self.assertAlmostEqual(caught.exception.cost, .3 * (tandem.MAX_TRANSIENT_RETRIES + 1))
+
+    def test_planner_gets_what_is_left_and_its_failed_cost_counts(self):
+        camp_dir = self.runs / "camp-plan"
+        camp_dir.mkdir(parents=True)
+        camp = {"config": {"max_cost": 1.0, "claude_budget": None}, "cost_usd": .7, "runs": [], "blockers": [],
+                "next_planner": "claude", "worktree": str(self.repo)}
+        seen = []
+
+        def planner(agent, cfg, *rest):
+            seen.append(cfg["claude_budget"])
+            err = RuntimeError("planner crashed")
+            err.cost = .1
+            raise err
+
+        with mock.patch.object(tandem, "call_agent", side_effect=planner), mock.patch.object(tandem, "log"), \
+                mock.patch.object(tandem, "unavailable_until", return_value=None):
+            self.assertIsNone(tandem.plan_next(camp_dir, camp))
+        self.assertEqual([round(b, 2) for b in seen], [.3, .2])
+        self.assertAlmostEqual(camp["cost_usd"], .9)
+
+    def test_campaign_planner_exhausts_cap_without_fallback_or_wait(self):
+        for result in (None, {"finished": True, "reason": "done"},
+                       {"finished": False, "goal": "Next goal", "name": "next"}):
+            with self.subTest(result=result):
+                camp_dir = self.runs / "camp-plan-cap"
+                camp_dir.mkdir(parents=True, exist_ok=True)
+                tandem.write_json(camp_dir / "campaign.json", {
+                    "config": {"max_cost": 1.0}, "cost_usd": .7, "runs": [], "blockers": [],
+                    "queue": [], "current": None, "next_planner": "claude", "worktree": str(self.repo)})
+
+                def planner(*args):
+                    if result is None:
+                        err = RuntimeError("planner crashed")
+                        err.cost = .4
+                        raise err
+                    return result, .4
+
+                with mock.patch.object(tandem, "call_agent", side_effect=planner) as call, \
+                        mock.patch.object(tandem, "log"), \
+                        mock.patch.object(tandem, "unavailable_until", return_value=None), \
+                        mock.patch.object(tandem, "wait_until") as wait, \
+                        mock.patch.object(tandem, "create_run") as create:
+                    tandem._campaign_loop(camp_dir)
+                camp = json.loads((camp_dir / "campaign.json").read_text())
+                # A planner that says the plan is finished ends the campaign as finished, cap or not.
+                finished = bool(result and result["finished"])
+                self.assertEqual(camp.get("outcome"), None if finished else "over_budget")
+                self.assertAlmostEqual(camp["cost_usd"], 1.1)
+                self.assertEqual(call.call_count, 1)
+                wait.assert_not_called()
+                create.assert_not_called()
+                self.assertEqual([item["goal"] for item in camp["queue"]],
+                                 ["Next goal"] if result and not result["finished"] else [])
+
+    def test_bar_shows_spent_over_cap(self):
+        state = {"turn": 2, "max_turns": 4, "next": "claude", "cost_usd": 2.83, "history": [],
+                 "failures": {"claude": 0, "codex": 0}, "config": {"max_cost": 5}}
+        self.assertIn("$2.83/$5.00", tandem.status_bar(state, 0, 200, False, progress={})[1])
+        self.assertEqual(tandem.cost_text(dict(state, prior_cost=1)), "$3.83/$5.00")
+        self.assertEqual(tandem.cost_text(dict(state, config={})), "$2.83")
 
 
 ANSI = re.compile(r"\x1b\[[0-9;]*m")

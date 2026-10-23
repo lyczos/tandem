@@ -63,6 +63,9 @@ EFFORTS = ["low", "medium", "high", "xhigh", "max", "ultra"]
 CLAUDE_EFFORTS = ["low", "medium", "high", "xhigh", "max"]
 # The settings a saved default and a mid-run change can both touch; nothing else is stored or tuned.
 TUNABLE = ("claude_model", "claude_effort", "codex_model", "codex_effort")
+# What tuning.json may change mid-run: the models, plus the spending cap that /budget sets.
+TUNING_KEYS = TUNABLE + ("max_cost",)
+BUDGET_WARN = 0.8  # share of --max-cost after which the log says, once, that the cap is near
 OTHER = {"claude": "codex", "codex": "claude"}
 
 CLAUDE_READ = [
@@ -374,16 +377,28 @@ def interrupted(run_dir):
 
 def call_agent(agent, cfg, worktree, prompt, out_base, schema, key, readonly, stop_file=None, run_dir=None):
     """Run one agent call, retrying network hiccups; a usage limit pauses the agent and re-raises."""
+    spent = 0.0  # reported by attempts that failed; --max-cost counts every attempt, not just the last
+    budget = cfg.get("claude_budget")
     for attempt in range(MAX_TRANSIENT_RETRIES + 1):
         if attempt and interrupted(run_dir):
-            raise TurnInterrupted("interrupted by the owner")
+            stop = TurnInterrupted("interrupted by the owner")
+            stop.cost = spent
+            raise stop
+        if spent and budget:
+            # A retry is the same turn: it gets what the failed attempts left of the turn's budget.
+            cfg = dict(cfg, claude_budget=max(round(budget - spent, 2), 0.01))
         try:
-            return RUNNERS[agent](cfg, worktree, prompt, out_base, schema, key, readonly)
+            result, cost, *more = RUNNERS[agent](cfg, worktree, prompt, out_base, schema, key, readonly)
+            return (result, cost + spent, *more)
         except RuntimeError as e:
+            spent += getattr(e, "cost", 0.0)
+            e.cost = spent
             # Stopping the agent makes it exit like a crash; that must not count as a failure or a
             # network hiccup worth waiting for.
             if interrupted(run_dir):
-                raise TurnInterrupted("interrupted by the owner") from e
+                stop = TurnInterrupted("interrupted by the owner")
+                stop.cost = spent
+                raise stop from e
             kind = classify(str(e))
             if kind == "limit":
                 mark_unavailable(agent, parse_reset(str(e)))
@@ -408,7 +423,7 @@ def write_tuning(target, values):
     touch state.json, which the loop owns and rewrites. None means "back to the default"."""
     path = target / "tuning.json"
     current = read_tuning(path)
-    current.update({k: v for k, v in values.items() if k in TUNABLE})
+    current.update({k: v for k, v in values.items() if k in TUNING_KEYS})
     write_json(path, current)
 
 
@@ -417,7 +432,7 @@ def read_tuning(path):
         data = json.loads(pathlib.Path(path).read_text())
     except (OSError, ValueError):
         return {}  # missing, or caught mid-edit by hand: keep the current settings
-    return {k: v for k, v in data.items() if k in TUNABLE} if isinstance(data, dict) else {}
+    return {k: v for k, v in data.items() if k in TUNING_KEYS} if isinstance(data, dict) else {}
 
 
 def apply_tuning(state, paths):
@@ -488,7 +503,8 @@ def render_history(history):
 
 AGENT_COLORS = {"claude": 208, "codex": 75}  # the banner logo's two ends
 STATUS_COLORS = {"continue": "36", "done": "32", "blocked": "33", "error": "31", "interrupted": "35"}
-OUTCOME_COLORS = {"done": "32", "max_turns": "33", "blocked": "33", "stopped": "35", "parked": "36", "failed": "31"}
+OUTCOME_COLORS = {"done": "32", "max_turns": "33", "blocked": "33", "stopped": "35", "parked": "36", "failed": "31",
+                  "over_budget": "33"}
 # The session's log lines by kind: (symbol, ASCII symbol, style). Warnings and errors keep their
 # color on the text too, so dimming the rest of the log never hides them.
 LOG_MARKS = {"run": ("▸", ">", "1"), "turn": ("·", ".", "2"), "ok": ("✓", "+", "32"),
@@ -622,6 +638,12 @@ def usage_tokens(usage):
     return usage.get("total", usage.get("input", 0) + usage.get("output", 0))
 
 
+def cost_text(state):
+    """The run's reported cost, or spent/cap when --max-cost is set (a campaign's total, inside one)."""
+    cap = (state.get("config") or {}).get("max_cost")
+    return f"${budget_spent(state):.2f}/${cap:.2f}" if cap else f"${state.get('cost_usd', 0):.2f}"
+
+
 def short_count(n):
     return f"{n}" if n < 1000 else f"{n / 1000:.0f}k" if n < 999500 else f"{n / 1e6:.1f}M"
 
@@ -712,7 +734,7 @@ def status_bar(state, now, width, fancy, progress=None, session_start=None, defa
             [fit_segments(first + [sep, (hint or "/models to change", dim)], width, fancy)]
 
     second = [("turn ", dim), (f"{min(state['turn'], state['max_turns'])}/{state['max_turns']}", None),
-              sep, (f"${state.get('cost_usd', 0):.2f}", None)]
+              sep, (cost_text(state), None)]
     tokens = sum(usage_tokens(h["usage"]) for h in history if h.get("usage"))  # only what was reported
     if tokens:
         second += [sep, (short_count(tokens), None), (" tok", dim)]
@@ -1000,7 +1022,10 @@ def run_claude(cfg, worktree, prompt, out_base, schema, key, readonly):
     if payload is None:
         raise RuntimeError(f"exit {proc.returncode}, no JSON output: {tail(proc.stderr or proc.stdout)}")
     if payload.get("is_error"):
-        raise RuntimeError(f"{payload.get('subtype')}: {tail(str(payload.get('result')))}")
+        err = RuntimeError(f"{payload.get('subtype')}: {tail(str(payload.get('result')))}")
+        # A turn stopped by --max-budget-usd still spent money; --max-cost must count it.
+        err.cost = payload.get("total_cost_usd") or 0.0
+        raise err
     result = payload.get("structured_output") or parse_result(payload.get("result"), key)
     return result, payload.get("total_cost_usd") or 0.0, claude_usage(payload)
 
@@ -1167,6 +1192,29 @@ def finish(run_dir, state, outcome, message):
         emit(CONSOLE.rule(f"{outcome} \u00b7 {state.get('name') or run_dir.name}", OUTCOME_COLORS.get(outcome, "1")))
 
 
+def budget_spent(state):
+    """What counts against --max-cost: the cost the CLIs reported. A campaign's cap covers all its runs,
+    so a run inside one also carries what the campaign had spent when the run began."""
+    return state.get("prior_cost", 0.0) + state.get("cost_usd", 0.0)
+
+
+def turn_budget(cfg, spent):
+    """The --max-budget-usd for one Claude turn: what is left of the cap, or --claude-budget if smaller,
+    so a single turn cannot run far past the cap."""
+    caps = [b for b in (cfg.get("claude_budget"),) if b]
+    if cfg.get("max_cost"):
+        caps.append(max(round(cfg["max_cost"] - spent, 2), 0.01))
+    return min(caps) if caps else None
+
+
+def over_budget_message(run_dir, state):
+    cap = state["config"]["max_cost"]
+    camp = state.get("campaign")
+    again = f"campaign resume {camp}" if camp else f"resume {run_dir}"
+    return (f"spent ${budget_spent(state):.2f} of the ${cap:.2f} cap; "
+            f"`{prog_name()} {again} --max-cost {cap * 2:g}` continues")
+
+
 PROGRESS = {}  # turn, agent, since: what the interactive status line shows
 CURRENT = {}   # target: the run or campaign directory the session's /say, /stop and /status act on
 
@@ -1183,6 +1231,16 @@ def loop(run_dir):
     while True:
         if stop_requested(state):
             return finish(run_dir, state, "stopped", "The owner asked to stop.")
+        changes = apply_tuning(state, tuning_files)
+        for key, old, new in changes:
+            log(f"config: {key} {old or 'default'} -> {new or 'default'}")
+        if changes:
+            save(run_dir, state)
+        # Checked only between turns: a running turn is never killed for the cap, so a run can
+        # overshoot it by at most one turn. Checked before the turn limit and the availability waits:
+        # "over budget" is the more useful answer, and waiting hours for an agent only to stop is not.
+        if cfg.get("max_cost") and budget_spent(state) >= cfg["max_cost"]:
+            return finish(run_dir, state, "over_budget", over_budget_message(run_dir, state))
         if state["turn"] > state["max_turns"]:
             return finish(run_dir, state, "max_turns", "Turn limit reached before both agents agreed.")
 
@@ -1209,12 +1267,6 @@ def loop(run_dir):
             continue
         agent = wanted if wanted in ready else ready[0]
 
-        changes = apply_tuning(state, tuning_files)
-        for key, old, new in changes:
-            log(f"config: {key} {old or 'default'} -> {new or 'default'}")
-        if changes:
-            save(run_dir, state)
-
         # Cleared before the inbox is read: an interruption from a crash, or one that arrived while
         # nothing could be stopped (the check), must not kill this turn; its message is read now.
         (run_dir / "INTERRUPT").unlink(missing_ok=True)
@@ -1234,7 +1286,8 @@ def loop(run_dir):
             PROGRESS.update(turn=turn, agent=agent, since=started)
         entry = {"turn": turn, "agent": agent, "started": now()}
         try:
-            result, cost, *more = call_agent(agent, cfg, state["worktree"], prompt, out_base, TURN_SCHEMA,
+            turn_cfg = dict(cfg, claude_budget=turn_budget(cfg, budget_spent(state)))
+            result, cost, *more = call_agent(agent, turn_cfg, state["worktree"], prompt, out_base, TURN_SCHEMA,
                                              "status", False, state.get("stop_file"), run_dir)
             usage = dict(more[0]) if more and more[0] else {}
             if usage.get("model"):
@@ -1250,6 +1303,7 @@ def loop(run_dir):
             state["cost_usd"] += cost
             state["failures"][agent] = 0
         except (RuntimeError, subprocess.TimeoutExpired, FileNotFoundError) as e:
+            state["cost_usd"] += getattr(e, "cost", 0.0)
             if isinstance(e, TurnInterrupted) or interrupted(run_dir):
                 # The owner's call, not the agent's failure, and not a turn of the budget: the same
                 # agent goes on with the correction and its partial edits.
@@ -1286,6 +1340,11 @@ def loop(run_dir):
 
         append_transcript(run_dir, render_history([entry]) + f"_{entry['seconds']}s_\n")
         report_turn(entry)
+        cap = cfg.get("max_cost")
+        if cap and budget_spent(state) >= BUDGET_WARN * cap and state.get("budget_warned") != cap:
+            state["budget_warned"] = cap  # once per cap: raising it with /budget earns a new warning
+            save(run_dir, state)
+            log(f"spent ${budget_spent(state):.2f} of the ${cap:.2f} cap", "warn")
         note_activity(run_dir, agent, f"= {entry['status']} ({entry['seconds']}s) "
                                       f"{first_line(entry.get('summary') or entry.get('error'))}")
 
@@ -1348,7 +1407,7 @@ def config_from(args):
     chosen = {k: getattr(args, k) if getattr(args, k) is not None else saved.get(k) for k in TUNABLE}
     return {
         "check": getattr(args, "check", None), "timeout": args.timeout,
-        "claude_budget": args.claude_budget,
+        "claude_budget": args.claude_budget, "max_cost": getattr(args, "max_cost", None),
         "claude_permission_mode": args.claude_permission_mode,
         "codex_network": args.codex_network, "codex_role": args.codex_role,
         **chosen,
@@ -1370,6 +1429,9 @@ def plan_next(camp_dir, camp):
     lasting = camp_dir / "notes.md"
     notes = "\n\n".join(camp.get("owner_notes", []) + ([lasting.read_text().strip()] if lasting.exists() else [])) or "(none)"
     for planner in (camp["next_planner"], OTHER[camp["next_planner"]]):
+        cap = camp["config"].get("max_cost")
+        if cap and camp["cost_usd"] >= cap:
+            break
         if unavailable_until(planner):
             continue
         prompt = PLAN_PROMPT.read_text().format(me=NAMES[planner], done=done, blockers=blockers, notes=notes)
@@ -1378,13 +1440,16 @@ def plan_next(camp_dir, camp):
         out_base.with_suffix(".prompt.md").write_text(prompt)
         log(f"planning the next goal: {NAMES[planner]}")
         try:
-            result, cost, *_ = call_agent(planner, camp["config"], camp["worktree"], prompt, out_base,
-                                      PLAN_SCHEMA, "finished", True, camp_dir / "STOP")
+            # The campaign's cap covers planner calls too, so a planner gets only what is left of it.
+            plan_cfg = dict(camp["config"], claude_budget=turn_budget(camp["config"], camp["cost_usd"]))
+            result, cost, *_ = call_agent(planner, plan_cfg, camp["worktree"], prompt, out_base,
+                                          PLAN_SCHEMA, "finished", True, camp_dir / "STOP")
             camp["cost_usd"] += cost
             if result:
                 camp["next_planner"] = OTHER[planner]
                 return result
         except (RuntimeError, subprocess.TimeoutExpired) as e:
+            camp["cost_usd"] += getattr(e, "cost", 0.0)
             log(f"planner {NAMES[planner]} failed: {tail(str(e), 200)}", "error")
     return None
 
@@ -1470,6 +1535,12 @@ def _campaign_loop(camp_dir):
                 state["failures"] = {"claude": 0, "codex": 0}
                 save(run_dir, state)
             outcome = state["outcome"]
+            if outcome == "over_budget":
+                # Not a finished goal: `campaign resume --max-cost` carries on with this same run.
+                camp["outcome"] = "over_budget"
+                write_json(path, camp)
+                log(f"campaign over_budget: {state['outcome_message']}", "warn")
+                return
             if outcome == "stopped":
                 return
             camp["runs"].append({"dir": str(run_dir), "name": state.get("name") or run_dir.name,
@@ -1505,6 +1576,15 @@ def _campaign_loop(camp_dir):
                 log("campaign stopped by the owner")
                 return
 
+        # The cap covers every run and planner call together; /budget may have changed it since.
+        apply_tuning(camp, [camp_dir / "tuning.json"])
+        cap = camp["config"].get("max_cost")
+        if cap and camp["cost_usd"] >= cap:
+            camp["outcome"] = "over_budget"
+            write_json(path, camp)
+            log(f"campaign over_budget: spent ${camp['cost_usd']:.2f} of the ${cap:.2f} cap; "
+                f"`{prog_name()} campaign resume {camp_dir} --max-cost {cap * 2:g}` continues", "warn")
+            return
         if camp["queue"]:
             item = camp["queue"].pop(0)
         elif camp.get("review_backlog") and not away_for_long("codex"):
@@ -1514,6 +1594,14 @@ def _campaign_loop(camp_dir):
         else:
             plan = plan_next(camp_dir, camp)
             write_json(path, camp)
+            if cap and camp["cost_usd"] >= cap and not (plan and plan.get("finished")):
+                # Keep a paid-for goal for resume, but stop before another planner or run starts.
+                if plan:
+                    camp["queue"].append({"goal": plan["goal"], "name": slug(plan["name"]) or "goal",
+                                          "first": plan.get("first") if plan.get("first") in NAMES else "claude",
+                                          "check": plan.get("check", "")})
+                    write_json(path, camp)
+                continue
             if plan is None:
                 waits = [w for w in map(unavailable_until, NAMES) if w]
                 wake = min(waits) if len(waits) == len(NAMES) else \
@@ -1536,6 +1624,7 @@ def _campaign_loop(camp_dir):
                              item["name"], cfg, item.get("max_turns", camp["max_turns"]), item.get("first", "claude"),
                              worktree=camp["worktree"], branch=camp["branch"],
                              extra={"stop_file": str(stop_file), "tuning_files": [str(camp_dir / "tuning.json")],
+                                    "campaign": str(camp_dir), "prior_cost": camp["cost_usd"],
                                     **({"review_goal": True, "review_from": item["review_from"]} if item.get("review") else {}),
                                     "inboxes": [str(camp_dir / f"{n:02d}-{slug(item['name'])}" / "inbox.md"),
                                                 str(camp_dir / "inbox.md")]})
@@ -1558,6 +1647,8 @@ def prepare_campaign_start(args):
         state.setdefault("name", run_dir.name)
         state["inboxes"] = [str(run_dir / "inbox.md"), str(camp_dir / "inbox.md")]
         state["stop_file"] = str(camp_dir / "STOP")
+        # The campaign adds the whole run's cost when it ends, so the cap counts it whole too.
+        state.update(campaign=str(camp_dir), prior_cost=0.0)
         state["tuning_files"] = [str(run_dir / "tuning.json"), str(camp_dir / "tuning.json")]
         state["max_turns"] = state["turn"] - 1 + args.max_turns
         state["failures"] = {"claude": 0, "codex": 0}
@@ -1591,9 +1682,14 @@ def prepare_campaign_resume(args):
     path = camp_dir / "campaign.json"
     camp = json.loads(path.read_text())
     camp["no_progress"] = 0
+    camp.pop("outcome", None)
+    if getattr(args, "max_cost", None):
+        # Later wins in tuning.json, so an older /budget there would undo the new cap.
+        write_tuning(camp_dir, {"max_cost": args.max_cost})
     if args.push is not None:
         camp["push"] = args.push
-    changes = {k: v for k, v in (("codex_effort", args.codex_effort), ("codex_role", args.codex_role)) if v}
+    changes = {k: v for k, v in (("codex_effort", args.codex_effort), ("codex_role", args.codex_role),
+                                 ("max_cost", getattr(args, "max_cost", None))) if v}
     camp["config"].update(changes)
     if args.seed_review:
         sha, _, note = args.seed_review.partition(":")
@@ -1660,7 +1756,7 @@ def cmd_start(args):
 
 
 def outcome_exit_code(outcome):
-    return {"done": 0, "max_turns": 2, "blocked": 3, "stopped": 4, "failed": 5}.get(outcome, 1)
+    return {"done": 0, "max_turns": 2, "blocked": 3, "stopped": 4, "failed": 5, "over_budget": 6}.get(outcome, 1)
 
 
 def headless_result(run_dir, state):
@@ -1670,7 +1766,7 @@ def headless_result(run_dir, state):
         "name": state.get("name"), "repo": state.get("repo"), "branch": state.get("branch"),
         "base": state.get("base"), "outcome": state.get("outcome"),
         "outcome_message": state.get("outcome_message", ""), "turn_count": len(history),
-        "cost_usd": state.get("cost_usd", 0.0),
+        "cost_usd": state.get("cost_usd", 0.0), "max_cost": (state.get("config") or {}).get("max_cost"),
         "transcript": str(run_dir / "transcript.md") if run_dir else None,
         "turns": [{k: h.get(k) for k in ("turn", "agent", "status", "commit", "seconds", "summary")}
                   for h in history],
@@ -1740,6 +1836,11 @@ def cmd_resume(args):
     state = load(run_dir)
     if args.more_turns:
         state["max_turns"] = state["turn"] - 1 + args.more_turns
+    if getattr(args, "max_cost", None):
+        state["config"]["max_cost"] = args.max_cost
+        # The loop re-reads tuning.json every turn, so an older /budget there would undo the new cap.
+        tuning = state.get("tuning_files") or [str(run_dir / "tuning.json")]
+        write_tuning(pathlib.Path(tuning[-1]).parent, {"max_cost": args.max_cost})
     state["failures"] = {"claude": 0, "codex": 0}
     save(run_dir, state)
     # A STOP left by the interactive /stop would end the resumed run at once. Only clear the run's own
@@ -1978,12 +2079,27 @@ def cmd_doctor(args):
     emit("ready")
 
 
+MAX_COST_HELP = ("stop before the next turn once this much is spent; counts the cost the CLIs report, "
+                 "so Claude only (Codex bills through its subscription)")
+
+
+def positive_usd(text):
+    try:
+        value = float(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not an amount: {text!r}")
+    if not 0 < value < float("inf"):  # also refuses nan
+        raise argparse.ArgumentTypeError("must be more than 0 and finite")
+    return value
+
+
 def add_agent_options(p, max_turns):
     p.add_argument("--max-turns", type=int, default=max_turns, help="turns per goal")
     p.add_argument("--timeout", type=int, default=1800, help="seconds per turn")
     p.add_argument("--claude-model")
     p.add_argument("--claude-effort", choices=CLAUDE_EFFORTS, help="Claude effort (default: Claude Code's own)")
     p.add_argument("--claude-budget", type=float, help="max USD per Claude turn")
+    p.add_argument("--max-cost", type=positive_usd, metavar="USD", help=MAX_COST_HELP)
     p.add_argument("--claude-permission-mode", default="acceptEdits")
     p.add_argument("--codex-model")
     p.add_argument("--codex-effort", choices=EFFORTS, help="Codex reasoning effort (default: ~/.codex/config.toml)")
@@ -2014,7 +2130,9 @@ usage shapes:
 
 HELP_EPILOG = """\
 -p takes the options of `start`: --repo --check --max-turns --first --name --base,
---claude-model --claude-effort --codex-model --codex-effort --codex-role --codex-network --claude-budget --timeout.
+--claude-model --claude-effort --codex-model --codex-effort --codex-role --codex-network --claude-budget --timeout,
+--max-cost USD (checked before each turn; counts reported cost only, which is Claude's: Codex reports none).
+-p exit codes: 0 done, 1 error, 2 max_turns, 3 blocked, 4 stopped, 5 failed, 6 over_budget.
 """
 
 
@@ -2059,6 +2177,7 @@ def build_parser():
     r = sub.add_parser("resume", help="continue an interrupted or finished run")
     r.add_argument("run")
     r.add_argument("--more-turns", type=int, help="allow this many more turns")
+    r.add_argument("--max-cost", type=positive_usd, metavar="USD", help="set or raise the run's spending cap")
     r.set_defaults(fn=cmd_resume)
 
     m = sub.add_parser("say", help="leave a message for the next turn (run or campaign directory)")
@@ -2100,6 +2219,8 @@ def build_parser():
                            help="turn pushing after every goal on or off")
             x.add_argument("--codex-effort", choices=EFFORTS, help="change Codex reasoning effort from now on")
             x.add_argument("--codex-role", choices=["peer", "reviewer"], help="change how Codex takes part from now on")
+            x.add_argument("--max-cost", type=positive_usd, metavar="USD",
+                           help="set or raise the spending cap for all the campaign's goals together")
             x.add_argument("--seed-review", metavar="FROM_SHA:NOTE", help="add a review backlog item from FROM_SHA to HEAD")
         x.set_defaults(fn=fn)
     x = csub.add_parser("say")
@@ -2126,6 +2247,7 @@ SLASH = [
     ("status", "", "one line per turn of the current run"),
     ("board", "", "what the agents agree on, what is open, models and cost"),
     ("models", "", "pick Claude and Codex model and effort"),
+    ("budget", "[USD|off]", "show or change the reported-cost cap from the next turn"),
     ("say", "TEXT", "leave a message the next turn reads"),
     ("paste", "", "attach the clipboard's image to your next goal or /say"),
     ("stop", "", "stop after the current turn"),
@@ -3387,6 +3509,8 @@ class Session:
                     self.images.clear()
             elif name == "queue":
                 self.queue(target, rest)
+            elif name == "budget":
+                self.guarded(lambda _: self.budget(target, rest), None)
             elif name == "now":
                 if not rest and not self.images:
                     emit("usage: /now TEXT")
@@ -3434,7 +3558,7 @@ class Session:
             except (OSError, ValueError, KeyError, TypeError):
                 cfg = {}
             current.update({k: cfg[k] for k in TUNABLE if k in cfg})
-            current.update(read_tuning(target / "tuning.json"))
+            current.update({k: v for k, v in read_tuning(target / "tuning.json").items() if k in TUNABLE})
         return current
 
     def models(self):
@@ -3462,6 +3586,28 @@ class Session:
         except OSError as exc:
             return emit(f"could not save the models: {exc}")
         emit("saved: " + models_line(values) + (" (applies from the next turn)" if self.busy() else ""))
+
+    def budget(self, target, rest):
+        if rest:
+            try:
+                cap = None if rest == "off" else positive_usd(rest)
+            except argparse.ArgumentTypeError as exc:
+                return emit(f"usage: /budget [USD|off] ({exc})")
+            write_tuning(target, {"max_cost": cap})
+            label = "off" if cap is None else f"${cap:.2f}"
+            return emit(f"budget: {label} (applies from the next turn)")
+        run, camp = self.current_run(target)
+        state = camp if camp is not None else load(run)
+        spent = state.get("cost_usd", 0.0)
+        if camp is not None and camp.get("current"):
+            spent += load(pathlib.Path(camp["current"])).get("cost_usd", 0.0)
+        elif camp is None:
+            spent = budget_spent(state)
+        cfg = dict(state.get("config") or {})
+        cfg.update(read_tuning(target / "tuning.json"))
+        cap = cfg.get("max_cost")
+        label = f"${cap:.2f} cap" if cap is not None else "no cap"
+        emit(f"spent ${spent:.2f}; {label} (reported cost only)")
 
     def queue(self, target, rest):
         if rest == "clear":

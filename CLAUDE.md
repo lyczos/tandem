@@ -63,7 +63,7 @@ Quitting waits for the worker; leaving an agent running could race with a later 
 
 `build_parser()` builds the CLI without dispatching it. `prepare_run()` shares run creation
 between `start` and the session entry points. Headless `-p` uses the same `loop()` and done rule;
-`outcome_exit_code()` maps done/error/max_turns/blocked/stopped/failed to 0/1/2/3/4/5. Usage
+`outcome_exit_code()` maps done/error/max_turns/blocked/stopped/failed/over_budget to 0/1/2/3/4/5/6. Usage
 errors exit 1 so they cannot be confused with the turn limit. `--output-format json` emits one
 result object on stdout and sends logs to stderr; `--quiet` hides progress, not the result.
 
@@ -111,7 +111,7 @@ refuses past `MAX_QUEUED` unless forced (`/now` and the answer to the stop quest
 the next agent reads the whole backlog at once.
 
 `tuning.json` (in a run or campaign directory) is how the session changes the models and effort of
-a running run: `write_tuning()` merges into it, and `loop` re-reads it at the start of every turn
+a running run, plus its reported-cost cap (`/budget`, `max_cost`; `null` removes the cap): `write_tuning()` merges into it, and `loop` re-reads it at the start of every turn
 (`apply_tuning()`, later file wins, `null` means default). A campaign run reads the campaign's file.
 Never write `state.json` from the session: the loop holds a copy in memory and would overwrite it.
 

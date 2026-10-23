@@ -2,6 +2,13 @@
 
 ## 0.1.0
 
+- Add `--max-cost USD` for runs and campaigns, with a shared campaign cap, remaining-budget
+  limits for Claude turns, and `over_budget` (headless exit 6). The cap counts reported cost
+  only; Codex reports none. `/budget [USD|off]` changes the cap from the next turn. Show
+  spent/cap in the status bar, warn at 80%, and include `max_cost` in headless JSON.
+  Reported costs from failed attempts, retries, and campaign planners also count; retries
+  and planners receive only the remaining budget.
+
 - The interactive session is easier to read back: submitted lines stay as `› line` on a band,
   log lines carry a short `HH:MM` stamp and a symbol by kind instead of the full date, paths
   show with `~` or relative to the run and long log entries fit on one row. Each run opens and

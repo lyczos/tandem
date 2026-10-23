@@ -165,6 +165,8 @@ terminal the session uses Python's `input()` with readline instead, without the 
 - `/help`, `/status`, `/runs`, `/transcript` (prints the transcript path), `/doctor`
 - `/board` shows where the run stands: what both agents agree on, what is still open, the models in use
   and the cost. Each finished turn appears in the session as a small card with its summary, handoff and checks.
+- `/budget [USD|off]` shows spent cost and the cap, sets a positive dollar cap, or removes it.
+  Changes apply from the next turn of the current run or campaign.
 - `/models` picks the Claude and Codex model and effort: ↑↓ move, ←→ change the value, Tab goes
   to the next row, Enter saves, Esc cancels. The choice is saved as the default in
   `~/.tandem/config.json`, and a running run takes it from its next turn. Codex models and the
@@ -289,6 +291,7 @@ in either format; the final result and errors remain. For example, `result.json`
   "outcome_message": "Turn limit reached before both agents agreed.",
   "turn_count": 1,
   "cost_usd": 0.12,
+  "max_cost": null,
   "transcript": "/home/me/.tandem/runs/20261023-120000-parser/transcript.md",
   "turns": [
     {"turn": 1, "agent": "claude", "status": "continue", "commit": "a12bc34", "seconds": 14, "summary": "Added parser tests."}
@@ -309,9 +312,32 @@ continue the run.
 | 3 | Blocked |
 | 4 | Stopped |
 | 5 | Both agents failed |
+| 6 | Reported-cost cap reached (`over_budget`) |
 
 These outcome exit codes apply to `-p`; the existing `start` and `resume` commands keep their
 previous exit behavior.
+
+## Limit reported spending
+
+Pass `--max-cost 5` to `start`, headless `-p`, or the interactive session to give its runs a
+$5 cap. `campaign start --max-cost 5` shares one cap across all goals in that campaign.
+The cap is saved in the run or campaign config. Amounts must be greater than zero; invalid
+amounts are usage errors (exit 1).
+
+Only cost reported by the CLIs counts: Claude reports dollar cost; Codex reports none and
+bills through its subscription. Tandem does not estimate Codex cost. Before each turn,
+tandem checks the total and stops with `over_budget` if the cap has been reached. It never
+kills a running turn for this cap, so spending can overshoot by at most one turn. Claude
+receives the remaining amount as `--max-budget-usd`, or the smaller of that amount and
+`--claude-budget` when both are set. Turns that fail or are retried after a network error
+still count what they spent, and in a campaign so do the calls that plan the next goal.
+
+Raise the cap and continue with `tandem resume RUN --max-cost 10` or
+`tandem campaign resume CAMPAIGN --max-cost 10`. In a session, `/budget 10` changes the
+current run or campaign's cap from the next turn; `/budget off` removes it and `/budget`
+shows spent cost and the cap. The status bar shows `$2.83/$5.00` when capped, and a log
+warning appears when 80% is spent. Headless JSON includes `max_cost` (`null` when unset);
+`over_budget` exits with code 6 in headless mode.
 
 ## Campaign: keep going after one goal
 
