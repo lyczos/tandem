@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Full guide
+    url: https://github.com/lyczos/tandem/blob/main/docs/usage.md
+    about: Every command, key and option, run storage, configuration, auth and costs.
+  - name: Report a security problem
+    url: https://github.com/lyczos/tandem/security/advisories/new
+    about: Report it privately here, not in a public issue.

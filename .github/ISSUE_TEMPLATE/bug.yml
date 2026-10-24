@@ -1,0 +1,61 @@
+name: Bug report
+description: Something in tandem does not work the way it should
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Short and concrete beats long. The exact command, the exact error text and the output of `tandem doctor` let us reproduce it in minutes; a guess at the cause does not. Transcripts and logs can contain your code: remove anything private before pasting.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: One or two sentences. Paste the exact message if tandem printed one.
+      placeholder: "After turn 3 the session printed 'no structured result in the agent's reply' and the run ended as failed."
+    validations:
+      required: true
+  - type: textarea
+    id: command
+    attributes:
+      label: How you ran it
+      description: The command, or the session and what you typed. Interactive session, `start`, `-p` or a campaign.
+      placeholder: "tandem -p --goal-file goal.md --max-turns 6 --codex-role reviewer"
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: What you did, in order, with the values you used.
+      placeholder: |
+        1. Run `tandem` in a repository with one commit
+        2. Type a goal and wait for the first card
+        3. Press Tab on the empty line and ↓ twice
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected instead
+      placeholder: "The Claude effort changes to high and the bar shows it."
+    validations:
+      required: true
+  - type: textarea
+    id: doctor
+    attributes:
+      label: Output of `tandem doctor`
+      description: Run it in the repository where it happened. It shows the versions of tandem, Python, Node, Git and both agent CLIs.
+      render: text
+    validations:
+      required: true
+  - type: input
+    id: terminal
+    attributes:
+      label: Operating system and terminal
+      placeholder: "macOS 27, iTerm2; Ubuntu 24.04, tmux in GNOME Terminal"
+  - type: textarea
+    id: extra
+    attributes:
+      label: Transcript, screenshot, anything else
+      description: The relevant part of `transcript.md` or `activity.log` from the run directory, or a screenshot. Say if you found a way around it.

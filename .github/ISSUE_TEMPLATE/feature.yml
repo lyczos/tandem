@@ -1,0 +1,37 @@
+name: Feature request
+description: Something you need tandem to do, or to do differently
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        One request per issue, in your own words. A real example from your own runs is the most useful part.
+  - type: textarea
+    id: need
+    attributes:
+      label: What you need
+      description: One or two sentences.
+      placeholder: "A way to run the check command only every other turn, because my test suite takes ten minutes."
+    validations:
+      required: true
+  - type: textarea
+    id: why
+    attributes:
+      label: Why, and what it saves
+      description: The situation it fixes, how often it comes up, what you do today instead.
+      placeholder: "Every run on our monorepo spends half its time in the check; today I pass a faster --check and run the full suite myself at the end."
+    validations:
+      required: true
+  - type: input
+    id: where
+    attributes:
+      label: Where in tandem
+      placeholder: "the interactive session; `tandem -p`; campaigns; the status bar"
+  - type: textarea
+    id: done
+    attributes:
+      label: How you would know it is done
+      description: What you would type and what you would see, with an example.
+      placeholder: "`--check-every 2` runs the check after every second turn and always before a run can end."
+    validations:
+      required: true
