@@ -434,6 +434,19 @@ def slug(text):
     return re.sub(r"[^a-z0-9-]+", "-", (text or "").lower()).strip("-")[:40]
 
 
+def goal_name(goal, limit=30):
+    """A run name from typed goal text, the way a goal file's name: line names one: its first words,
+    lowercase ASCII. Accents fall off their letters; letters with no ASCII form (Polish ł) drop."""
+    text = unicodedata.normalize("NFKD", IMAGE_MARK.sub(" ", goal or ""))
+    text = "".join(c for c in text if c.isascii() or not (c.isalnum() or unicodedata.combining(c)))
+    name = ""
+    for word in re.findall(r"[a-z0-9]+", text.lower()):
+        if name and len(name) + 1 + len(word) > limit:
+            break
+        name = f"{name}-{word}" if name else word[:limit]
+    return name
+
+
 def tail(text, n=600):
     text = (text or "").strip()
     return text if len(text) <= n else "..." + text[-n:]
@@ -859,7 +872,9 @@ def status_bar(state, now, width, fancy, progress=None, session_start=None, defa
         return models + keys if editing else \
             [fit_segments(first + [sep, (hint or "/models to change", dim)], width, fancy)]
 
-    second = [("turn ", dim), (f"{min(state['turn'], state['max_turns'])}/{state['max_turns']}", None),
+    # The turn under way, or once the run has ended the turns it took: "3/12" after two would read as one more.
+    shown = state["turn"] - 1 if state.get("outcome") else min(state["turn"], state["max_turns"])
+    second = [("turn ", dim), (f"{shown}/{state['max_turns']}", None),
               sep, (cost_text(state), None)]
     tokens = sum(usage_tokens(h["usage"]) for h in history if h.get("usage"))  # only what was reported
     if tokens:
@@ -2128,7 +2143,8 @@ def prepare_run(args):
     item = read_goal_file(args.goal_file) if args.goal_file else {"goal": args.goal, "name": args.name}
     if not item["goal"]:
         sys.exit("give a goal: --goal TEXT or --goal-file PATH")
-    name = args.name or item.get("name")
+    # A typed goal names its run too: an id of digits alone says nothing in /runs or the header.
+    name = args.name or item.get("name") or goal_name(item["goal"]) or None
     run_id = datetime.datetime.now().strftime("%Y%m%d-%H%M%S") + (f"-{slug(name)}" if name else "")
     cfg = dict(config_from(args), base=args.base)
     cfg["check"] = args.check or item.get("check") or None

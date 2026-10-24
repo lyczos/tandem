@@ -31,6 +31,9 @@
   errors and the end of a run wrap whole. Each run opens and
   closes with a rule across the width (the closing one in the outcome's color), and the "talk to the agents"
   hint is gone there. `start`, `resume`, `-p` and non-terminal output are unchanged.
+- A run started from a typed goal is named after its first words (`add-a-json-flag`), as one
+  from a goal file is, instead of carrying a bare date. Once a run ends, the status bar counts the
+  turns it took.
 - Tab on an empty prompt line edits the models and effort on the status bar: Tab and Shift+Tab
   pick a field, ↑↓ change it through the values `/models` offers, Enter saves only what changed,
   Esc cancels, and any other key leaves the mode and is then handled as usual.

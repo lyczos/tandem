@@ -97,7 +97,8 @@ tandem start \
 ```
 
 `--repo` defaults to the current directory. `--goal "..."` works instead of `--goal-file` for
-short goals. A good goal says what "done" means in checkable terms;
+short goals; without `--name` the run is named after the goal's first words, so
+`--goal "Add a --json flag"` gives `add-a-json-flag`. A good goal says what "done" means in checkable terms;
 [`examples/todo-cli.md`](examples/todo-cli.md) in the source repository shows the
 shape. A goal file may start
 with a header: `---`, then `name:`, `first: codex|claude`, `check:`, then `---`.

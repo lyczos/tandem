@@ -579,6 +579,18 @@ class Headless(unittest.TestCase):
                     if first == "codex":
                         self.assertEqual(state["config"]["check"], "git status --porcelain")
 
+    def test_a_typed_goal_names_its_run(self):
+        with mock.patch.object(tandem, "call_agent", return_value=({"status": "continue"}, 0)):
+            code, out, err = self.invoke("-p", "Napraw błąd w logowaniu użytkowników przez Google", "--max-turns", "1",
+                                         "--output-format", "json")
+        result = json.loads(out)
+        self.assertEqual(result["name"], "napraw-bad-w-logowaniu")
+        self.assertRegex(result["run_id"], r"^\d{8}-\d{6}-napraw-bad-w-logowaniu$")
+        self.assertEqual(tandem.goal_name("[image: /tmp/a.png] Café: add a --json flag to the todo CLI"),
+                         "cafe-add-a-json-flag-to-the")
+        self.assertEqual(tandem.goal_name("ł ż"), "z")
+        self.assertEqual(tandem.goal_name("łłł"), "")
+
     def test_text_stream_and_quiet_final_result(self):
         with mock.patch.object(tandem, "call_agent", return_value=({"status": "continue"}, 0)):
             for quiet in (False, True):
@@ -1648,6 +1660,12 @@ class StatusBar(unittest.TestCase):
         self.assertNotIn("tok", tandem.status_bar(self.state(history=[]), now, 200, False, progress={})[1])
         idle = tandem.status_bar(None, now, 200, False, progress={}, defaults={"codex_model": "o3"})
         self.assertEqual(idle, ["claude default/default   codex o3/default · /models to change"])
+
+    def test_an_ended_run_shows_the_turns_it_took(self):
+        _, second = tandem.status_bar(self.state(outcome="max_turns"), 0, 200, False, progress={})
+        self.assertTrue(second.startswith("turn 2/12 "), second)
+        _, second = tandem.status_bar(self.state(turn=13, outcome="max_turns"), 0, 200, False, progress={})
+        self.assertTrue(second.startswith("turn 12/12 "), second)
 
     def test_bar_fits_and_degrades(self):
         state = self.state()
