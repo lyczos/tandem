@@ -150,6 +150,7 @@ CHILD_POPEN = {}
 CHILDREN = set()
 CHILDREN_LOCK = threading.Lock()
 KILL_GRACE = 5  # seconds between asking those processes to stop and killing them
+PIPE_GRACE = 2  # seconds an exited agent's pipes may stay open while the rest of its output drains
 
 
 def run_child(cmd, input=None, timeout=None, kind="agent", on_line=None, **kwargs):
@@ -162,6 +163,7 @@ def run_child(cmd, input=None, timeout=None, kind="agent", on_line=None, **kwarg
         # In its own session the process leads a group, and killing the group takes its tools along.
         proc.tandem_group = bool(CHILD_POPEN.get("start_new_session")) and hasattr(os, "killpg")
         proc.tandem_kind = kind
+        proc.tandem_done = False
         with CHILDREN_LOCK:
             CHILDREN.add(proc)
         try:
@@ -174,45 +176,77 @@ def run_child(cmd, input=None, timeout=None, kind="agent", on_line=None, **kwarg
             proc.wait()
             raise
         finally:
+            # A late signal_child (the interrupt's second try) must not reach a group id reused by now.
+            proc.tandem_done = True
             with CHILDREN_LOCK:
                 CHILDREN.discard(proc)
     return subprocess.CompletedProcess(cmd, proc.returncode, out, err)
 
 
 def follow_output(proc, input, timeout, on_line):
-    """communicate() that also hands every line to on_line while the process runs."""
+    """communicate() that also hands every line to on_line while the process runs.
+
+    Bounded by timeout like communicate(), even when a tool the agent started keeps its pipes open."""
     deadline = None if timeout is None else time.monotonic() + timeout
     lines = {"stdout": [], "stderr": []}
+    pipes = {"stdout": proc.stdout, "stderr": proc.stderr}
+    stdin = proc.stdin
+    # The threads own the pipes from here. Popen's exit would close a pipe a reader is blocked on,
+    # and that close waits for the read: forever, while a leftover tool still holds the other end.
+    proc.stdin = proc.stdout = proc.stderr = None
+    failed = []
+
+    def left(limit=None):
+        ends = [t for t in (deadline, limit) if t is not None]
+        return max(min(ends) - time.monotonic(), 0) if ends else None
 
     def pump(name):
         # A killed agent's pipe can close under the reader; a traceback here would garble the session.
         with contextlib.suppress(ValueError, OSError):
-            for line in getattr(proc, name):
-                lines[name].append(line)
-                try:
-                    on_line(name, line.rstrip("\n"))
-                except Exception:  # a broken activity log must never cost the agent's output
-                    pass
+            with pipes[name]:
+                for line in pipes[name]:
+                    lines[name].append(line)
+                    try:
+                        on_line(name, line.rstrip("\n"))
+                    except Exception:  # a broken activity log must never cost the agent's output
+                        pass
+
+    def feed():
+        # Off the calling thread: a CLI that stalls before reading a prompt bigger than the pipe
+        # buffer would otherwise block the call before the timeout is ever looked at.
+        try:
+            with stdin:
+                stdin.write(input)
+        except OSError:
+            pass  # the agent exited or was stopped without reading it all
+        except Exception as exc:
+            failed.append(exc)
 
     readers = [threading.Thread(target=pump, args=(name,), daemon=True) for name in lines]
+    if stdin:
+        readers.append(threading.Thread(target=feed, daemon=True))
     for reader in readers:
         reader.start()
-    if proc.stdin:
-        with contextlib.suppress(BrokenPipeError, OSError):
-            proc.stdin.write(input)
-        with contextlib.suppress(BrokenPipeError, OSError):
-            proc.stdin.close()
-    # Like communicate(): done when the process has exited and both pipes are closed, within timeout.
-    proc.wait(None if deadline is None else max(deadline - time.monotonic(), 0))
+    proc.wait(left())  # TimeoutExpired here: run_child stops the agent and its group
+    # The agent has exited, so its reply is in the pipes. Anything still holding them is a tool it
+    # left running; in its own group it goes now, outside one it is left with the pipe it holds.
+    grace = time.monotonic() + PIPE_GRACE
     for reader in readers:
-        reader.join(None if deadline is None else max(deadline - time.monotonic(), 0))
-        if reader.is_alive():
-            raise subprocess.TimeoutExpired(proc.args, timeout)
+        reader.join(left(grace))
+    if any(reader.is_alive() for reader in readers):
+        signal_child(proc, hard=True)
+        for reader in readers:
+            reader.join(left(time.monotonic() + 1))
+    if failed:
+        raise failed[0]
     return "".join(lines["stdout"]), "".join(lines["stderr"])
 
 
 def signal_child(proc, hard=False):
-    if proc.returncode is not None:
+    if getattr(proc, "tandem_done", False):
+        return
+    # An exited leader's group can still hold its tools, and killpg reaches them while any is alive.
+    if proc.returncode is not None and not proc.tandem_group:
         return
     try:
         if proc.tandem_group:

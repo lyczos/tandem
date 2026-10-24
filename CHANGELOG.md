@@ -32,7 +32,8 @@
   Esc cancels, and any other key leaves the mode and is then handled as usual.
 - `tandem watch` follows what the agents do during a turn, one line per command, file or
   message, from the run's new `activity.log`; `/watch` opens it in a pane on the right in tmux
-  or iTerm2. Claude Code now runs with `--output-format stream-json`.
+  or iTerm2. Claude Code now runs with `--output-format stream-json`. `--timeout` still bounds
+  every agent call, and a tool an agent leaves running on its output no longer holds up the turn.
 - Messages typed during a turn ask about stopping it once per turn and then queue, showing how
   many wait. At most five wait at a time; `/queue` lists them and `/queue clear` drops them.
 - → at the end of the line accepts the highlighted slash command, like Tab.

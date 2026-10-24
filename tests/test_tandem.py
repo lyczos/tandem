@@ -1939,7 +1939,7 @@ class Correction(unittest.TestCase):
     @contextlib.contextmanager
     def agent_running(self):
         """A fake agent process in CHILDREN for the block; stopping it only records the call."""
-        proc = mock.Mock(returncode=None, tandem_group=False, tandem_kind="agent")
+        proc = mock.Mock(returncode=None, tandem_group=False, tandem_kind="agent", tandem_done=False)
         with tandem.CHILDREN_LOCK:
             tandem.CHILDREN.add(proc)
         try:
@@ -3289,6 +3289,39 @@ class Children(unittest.TestCase):
             tandem.run_child([sys.executable, "-c", script], timeout=1)
         self.assertTrue(self.wait_gone(int(pid_file.read_text())))
         self.assertFalse(tandem.CHILDREN)
+
+    @unittest.skipUnless(os.name == "posix", "needs sh")
+    def test_timeout_holds_while_following_a_wrapper_that_keeps_the_pipe(self):
+        # Outside the session there is no group: killing the wrapper leaves its program on the pipe.
+        pid_file = self.dir / "program"
+        cmd = ["sh", "-c", f"sleep 6 & echo $! > {shlex.quote(str(pid_file))}; wait"]
+        start = time.monotonic()
+        with self.assertRaises(subprocess.TimeoutExpired):
+            tandem.run_child(cmd, input="prompt", timeout=1, on_line=lambda stream, line: None)
+        self.assertLess(time.monotonic() - start, 4)
+        self.assertFalse(tandem.CHILDREN)
+        with contextlib.suppress(ProcessLookupError, ValueError):
+            os.kill(int(pid_file.read_text()), signal.SIGKILL)
+
+    @unittest.skipUnless(hasattr(os, "killpg"), "process groups are POSIX")
+    def test_an_agent_that_exits_is_done_although_a_tool_it_left_holds_the_pipe(self):
+        pid_file = self.dir / "tool"
+        cmd = ["sh", "-c", f"sleep 30 & echo $! > {shlex.quote(str(pid_file))}; echo reply"]
+        seen = []
+        start = time.monotonic()
+        with mock.patch.dict(tandem.CHILD_POPEN, {"start_new_session": True}):
+            proc = tandem.run_child(cmd, input="prompt", timeout=20, on_line=lambda s, line: seen.append(line))
+        self.assertLess(time.monotonic() - start, tandem.PIPE_GRACE + 3)
+        self.assertEqual((proc.returncode, proc.stdout, seen), (0, "reply\n", ["reply"]))
+        self.assertTrue(self.wait_gone(int(pid_file.read_text())))  # the leftover tool went with its group
+
+    def test_timeout_bounds_writing_a_prompt_nobody_reads(self):
+        # Bigger than any pipe buffer, to a process that never reads stdin.
+        cmd = [sys.executable, "-c", "import time; time.sleep(30)"]
+        start = time.monotonic()
+        with self.assertRaises(subprocess.TimeoutExpired):
+            tandem.run_child(cmd, input="x" * 2_000_000, timeout=1, on_line=lambda stream, line: None)
+        self.assertLess(time.monotonic() - start, 5)
 
     def test_signal_children_stops_what_the_worker_waits_on(self):
         results = []
