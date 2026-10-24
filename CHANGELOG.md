@@ -44,6 +44,11 @@
 - Messages typed during a turn ask about stopping it once per turn and then queue, showing how
   many wait. At most five wait at a time; `/queue` lists them and `/queue clear` drops them.
 - → at the end of the line accepts the highlighted slash command, like Tab.
+- The status bar stops a turn's clock when the agent returns, so the check, usage-limit waits
+  and planning no longer look like a stuck turn. A command that fails unexpectedly is reported
+  and the session goes on; a terminal that is not UTF-8 shows `?` for symbols it lacks instead of
+  crashing; `/board` keeps saying the check failed after the next turn starts; `tandem watch`
+  survives the run it follows being removed. A Ctrl+C while tandem shuts down no longer kills it.
 
 - Add a live bar below the interactive prompt with agent models, effort and activity, reported
   cost and tokens, session time, committed branch changes and check state. Record reported usage
@@ -56,7 +61,8 @@
   while `/quit` waits no longer kill tandem, and the terminal's settings are put back on the way out.
 - Step in during a turn: plain text typed while a run is going is saved for the next turn, and
   `y` to the question that follows stops the turn, keeps its edits in a commit and hands the same
-  agent your correction; any other answer than `n` or Enter is saved as more of the correction.
+  agent your correction; any other answer than `n`, Enter, `q` or a slash command is saved as more
+  of the correction. The question is asked only while an agent is working.
   `/now TEXT` does it without the question. Interrupted turns show as
   `interrupted` and neither count as a failure nor use up a turn.
 - Each turn of an interactive session shows as a card (plain characters with `NO_COLOR`), and

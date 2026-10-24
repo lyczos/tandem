@@ -243,9 +243,11 @@ When you see a turn going wrong, type the correction at the prompt. It is saved 
 before anything else happens, so whatever you answer next, it is not lost. Then tandem asks whether
 to stop the current turn now: `y` stops the agent, commits what it changed so far, and gives the
 same agent the turn again with your message and a note to check its partial edits; Enter, `n` (or
-Ctrl+C) lets the turn finish and the next one reads it. Anything else typed there is taken as more
-of the correction and saved with it. An interrupted turn is not a failure and does not use up a
-turn; `/now TEXT` does the same without asking.
+Ctrl+C) lets the turn finish and the next one reads it, and so do `q` and a slash command (the
+answer gets no slash menu and no Tab mode). Anything else typed there is taken as more of the
+correction and saved with it. Between turns, while the check runs or tandem waits for an agent,
+there is nothing to stop and it does not ask. An interrupted turn is not a failure and does not
+use up a turn; `/now TEXT` does the same without asking.
 
 After a no, tandem does not ask again during that turn: more lines just join the queue, and each
 shows how many wait. The next agent reads them all at once, in order, so at most five wait at a

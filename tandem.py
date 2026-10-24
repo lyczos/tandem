@@ -747,7 +747,9 @@ def board(state, fancy, width, campaign=None):
     rows += [(line, "32" if agreed[0][0] == "\u2713" else None) for text in agreed
              for line in wrap_field(text, inner, max_lines=2)]
     if cfg.get("check"):
-        verdict = ("passed" if outcome == "done" else "failed last time" if state.get("check_feedback")
+        # check_passed, as the bar reads it: check_feedback is gone once the next turn has read it.
+        passed = state.get("check_passed")
+        verdict = ("passed" if outcome == "done" or passed else "failed last time" if passed is False
                    else "not run yet")
         rows += [(line, None) for line in wrap_field(f"check: {cfg['check']} \u00b7 {verdict}", inner)]
     else:
@@ -1678,6 +1680,11 @@ def _loop(run_dir):
                     state["failures"][agent] += 1
                     handoff = f"{NAMES[agent]} failed this turn; continue the goal yourself."
                 entry.update({"status": "error", "error": err, "summary": "", "handoff": handoff})
+        finally:
+            # The check, a wait for a usage limit or the planner come next: none is this agent working,
+            # and a clock still running in the bar would look like a stuck turn.
+            with OUT_LOCK:
+                PROGRESS.clear()
         entry["seconds"] = round(time.time() - started)
         entry["commit"] = commit_turn(state, agent, turn, entry.get("summary") or entry.get("error"),
                                       entry["status"] == "error")
@@ -2337,15 +2344,19 @@ def cmd_watch(args):
                 except OSError:
                     newest = None  # a run directory removed mid-scan; the next scan settles it
                 if newest and newest != current:
-                    current = newest
-                    print(f"\n{current.parent.name}", flush=True)
-                    if current not in offsets:  # first sight: the last few lines, then everything new
-                        size = current.stat().st_size
-                        start = max(size - 4096, 0)
-                        with open(current, "rb") as f:
-                            f.seek(start)
-                            head = f.read(size - start)
-                        offsets[current] = start + (head.find(b"\n") + 1 if start else 0)
+                    try:
+                        if newest not in offsets:  # first sight: the last few lines, then everything new
+                            size = newest.stat().st_size
+                            start = max(size - 4096, 0)
+                            with open(newest, "rb") as f:
+                                f.seek(start)
+                                head = f.read(size - start)
+                            offsets[newest] = start + (head.find(b"\n") + 1 if start else 0)
+                    except OSError:
+                        pass  # removed since the scan; the next one settles it
+                    else:
+                        current = newest
+                        print(f"\n{current.parent.name}", flush=True)
                 elif newest is None and current is None and not offsets:
                     offsets[None] = 0
                     print("waiting for a turn to start", flush=True)
@@ -2355,7 +2366,9 @@ def cmd_watch(args):
                         f.seek(offsets[current])
                         chunk = f.read()
                 except OSError:
-                    current, chunk = None, b""  # its run was removed; the next scan finds another
+                    current = None  # its run was removed; the next scan finds another
+                    time.sleep(0.3)
+                    continue
                 complete = chunk[:chunk.rfind(b"\n") + 1]  # a line still being written waits
                 offsets[current] += len(complete)
                 width = term_width()
@@ -3237,6 +3250,7 @@ class LineEditor:
         self.prompt, self.buffer, self.cursor, self.scroll = "", "", 0, 0
         self.selected, self.menu_closed = 0, False
         self.reading = False
+        self.question = False  # reading an answer: no slash menu, no bar edit mode
         self.touched = False   # a key other than Ctrl+C came during the last read
         self.mid_line = False  # the last read left its line without a newline (Ctrl+C, Ctrl+D)
         self.kept = False      # the last read was an empty Enter: its rows are still on screen, as drawn
@@ -3284,8 +3298,10 @@ class LineEditor:
         """More keys already waiting (typed fast, or a paste without brackets): draw once after them."""
         return self.keys is None and bool(select.select([self.fd], [], [], 0)[0])
 
-    def read(self, prompt, history=True):
-        """One line, like input(): EOFError on Ctrl+D on an empty line, KeyboardInterrupt on Ctrl+C."""
+    def read(self, prompt, history=True, question=False):
+        """One line, like input(): EOFError on Ctrl+D on an empty line, KeyboardInterrupt on Ctrl+C.
+
+        question: an answer to a question, read without the slash menu and the bar's edit mode."""
         # Saved outside the try and changed inside it, as in run_picker: a SIGINT landing right after
         # the switch to raw mode must still put the owner's terminal back.
         saved = termios.tcgetattr(self.fd) if self.keys is None else None
@@ -3302,6 +3318,7 @@ class LineEditor:
                 if not self.kept:
                     self.above = 0
                 self.mid_line, self.kept, self.reading, self.touched = False, False, True, False
+                self.question = question
                 self.write(fresh + "\x1b[?2004h" + self.redraw())
             while line is None:
                 key = self.next_key()
@@ -3336,7 +3353,7 @@ class LineEditor:
         return line
 
     def matches(self):
-        found = [] if self.menu_closed else slash_matches(self.buffer)
+        found = [] if self.menu_closed or self.question else slash_matches(self.buffer)
         self.selected = min(self.selected, max(len(found) - 1, 0))
         return found
 
@@ -3388,7 +3405,7 @@ class LineEditor:
             if matches:  # → at the end of the line accepts the suggestion, as in fish and zsh
                 name = matches[self.selected][0]
                 self.edit(f"/{name} ", len(name) + 2)
-            elif key == "tab" and not b:
+            elif key == "tab" and not b and not self.question:
                 rows = self.models()
                 if rows:
                     self.fields, self.field, self.fields_before = rows, 0, chosen(rows)
@@ -3579,7 +3596,8 @@ class Console:
         try:
             state = self.bar_state()
             # Typing hides the Tab hint, since Tab then completes; a run's bar has no room for the rest.
-            hint = BAR_EDIT_HINT if editing else BAR_HINT if self.editor and not self.editor.buffer \
+            asking = self.editor and self.editor.question  # Tab does nothing in an answer
+            hint = BAR_EDIT_HINT if editing else BAR_HINT if self.editor and not self.editor.buffer and not asking \
                 else None if state else "/models to change"
             return status_bar(state, time.time(), width - 1, self.fancy, PROGRESS if self.running else {},
                               self.started, None if state else load_defaults(), editing, hint)
@@ -3670,10 +3688,10 @@ class Console:
                 sys.stdout.write("\x1b7\x1b[1A\r\x1b[K" + self.status_text() + "\x1b8")
                 sys.stdout.flush()
 
-    def ask(self, prompt, history=True):
+    def ask(self, prompt, history=True, question=False):
         if self.editor:
             self.prompt = prompt
-            return self.editor.read(prompt, history)
+            return self.editor.read(prompt, history, question)
         # Print the prompt under the same lock as logs. input(prompt) prints outside Python's
         # lock, and macOS libedit does not call readline's pre-input hook to release it safely.
         # input() still provides line editing; history redraws may omit the prefix until a log.
@@ -3709,6 +3727,25 @@ class Session:
     def note(self, text, kind=None):
         """A session message in the log's look, so it does not read like the owner's own line."""
         emit(self.console.log_line(text, kind) if in_session() else text)
+
+    def dispatch(self, line):
+        """Act on one submitted line; False when it asks to leave."""
+        try:
+            line, dropped = take_dropped_images(self.expand_inline(line))
+            self.attach(dropped)
+            kind, name, rest = parse_input(line)
+            if kind == "goal":
+                self.typed(name)
+            elif kind == "unknown":
+                emit(f"unknown command /{name}; valid: " + " ".join("/" + c for c in SLASH_COMMANDS))
+            elif kind == "command" and not self.handle(name, rest):
+                return False
+        except KeyboardInterrupt:
+            emit("interrupted")  # Ctrl+C cancels a slow command, never the session or its run
+        except Exception as exc:
+            # A bug in one command must not end the session while a run may be going on in the worker.
+            emit(f"that failed: {type(exc).__name__}: {exc}; the session goes on")
+        return True
 
     def refuse_if_busy(self):
         if self.busy():
@@ -3872,18 +3909,22 @@ class Session:
             return emit("no turn is running; the next turn reads it")
         if ask and self.declined is not None and self.declined == PROGRESS.get("since"):
             return  # already asked during this turn; /now still steps in
+        if ask and not PROGRESS.get("since"):
+            # Between turns (the check, a wait, the planner) there is no agent to stop.
+            return emit("no agent is working right now; the next turn reads it")
         if ask:
             # The worker keeps going while the owner decides, so the turn asked about may end meanwhile.
             since = PROGRESS.get("since")
             try:
-                # A y/N answer is not worth recalling with the up arrow.
+                # A y/N answer is not worth recalling with the up arrow, and gets no menu or bar mode.
                 answer = self.console.ask("  stop the current turn now and hand it over? its edits are kept [y/N] ",
-                                          history=False)
+                                          history=False, question=True)
             except (KeyboardInterrupt, EOFError):
                 answer = ""
             answer = answer.strip()
             if answer.lower() not in ("y", "yes", "t", "tak"):
-                if answer.lower() not in ("", "n", "no", "nie"):
+                # A command or a quit word is the owner reaching for the prompt, not more of the correction.
+                if answer.lower() not in ("", "n", "no", "nie") + EXIT_WORDS and not answer.startswith("/"):
                     # More of the correction, typed where the question was: kept, never dropped.
                     self.guarded(lambda _: leave_message(target, answer, force=True), None)
                 self.declined = since
@@ -4207,6 +4248,14 @@ class SessionEnd(BaseException):
     """SIGHUP or SIGTERM reached the interactive session: leave now and take the agents along."""
 
 
+def replace_unencodable(stream):
+    """On a terminal that is not UTF-8, print what it cannot show as ?. The bar, the menu and the
+    cards use symbols such as · and ✓, and one encoding error would end the prompt or the worker."""
+    if "utf" not in (getattr(stream, "encoding", "") or "").lower() and hasattr(stream, "reconfigure"):
+        with contextlib.suppress(ValueError, OSError, AttributeError):
+            stream.reconfigure(errors="replace")
+
+
 def cmd_interactive(args):
     global CONSOLE
     args.repo = require_repo(args.repo)
@@ -4214,6 +4263,7 @@ def cmd_interactive(args):
         sys.exit("not confirmed; nothing started")
     # The logo and dots need escape codes and UTF-8; anything less gets the plain lines.
     print(banner(args.repo, fancy_terminal() and "utf" in (sys.stdout.encoding or "").lower()))
+    replace_unencodable(sys.stdout)
     console = Console(fancy_terminal(), styled=sys.stdout.isatty())
     session = Session(args, console)
     if editor_terminal():
@@ -4290,18 +4340,8 @@ def cmd_interactive(args):
             armed = None
             if line.strip().lower() in EXIT_WORDS:
                 break  # owner report: typing `exit` started a run whose goal was "exit"
-            try:
-                line, dropped = take_dropped_images(session.expand_inline(line))
-                session.attach(dropped)
-                kind, name, rest = parse_input(line)
-                if kind == "goal":
-                    session.typed(name)
-                elif kind == "unknown":
-                    emit(f"unknown command /{name}; valid: " + " ".join("/" + c for c in SLASH_COMMANDS))
-                elif kind == "command" and not session.handle(name, rest):
-                    break
-            except KeyboardInterrupt:
-                emit("interrupted")  # Ctrl+C cancels a slow command, never the session or its run
+            if not session.dispatch(line):
+                break
     except KeyboardInterrupt:
         # Ctrl+C as a signal while the one before it was still being handled, between two reads of
         # the prompt: the second press of a pair.
@@ -4315,7 +4355,7 @@ def cmd_interactive(args):
         pressed = []
         signal.signal(signal.SIGINT, lambda signum, frame: pressed.append(signum))
         session.quitting = True
-        stopped_turn = by_ctrl_c and session.busy()
+        stopped_turn = by_ctrl_c and session.busy() and bool(PROGRESS.get("since"))  # a turn, not the check
         # A detached agent left running would keep editing the worktree, and a later resume could
         # start a second agent there. Event waits also avoid interrupting Thread.join on 3.9.
         try:
@@ -4332,6 +4372,9 @@ def cmd_interactive(args):
         if terminal is not None:
             with contextlib.suppress(OSError, termios.error):
                 termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, terminal)
+        # Everything is stopped and saved. Python puts the default SIGINT back while it shuts down,
+        # unless the signal is ignored, and one more press then would still end tandem by SIGINT.
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
     if ended_by:
         sys.exit(128 + ended_by[0])
 

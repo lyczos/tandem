@@ -47,6 +47,8 @@ while the main thread reads input. All output must go through `emit()`/`log()` (
 never bare `print` from code that can run during a run, or the prompt redraw breaks. On a POSIX
 terminal `LineEditor` owns the prompt row and the rows around it (status line above, slash-command
 menu and status bar below); `Console.write` must erase and redraw them around every line it prints.
+In the session `log()` cuts an entry to one row unless it is `whole` (warnings and errors are by
+default): pass `whole=True` for anything the owner has to act on, or it may be cut away.
 Tab on an empty line edits the models on that bar: the unsaved values live in the editor
 (`LineEditor.fields`), so redraws keep them, and Enter saves outside `OUT_LOCK` through
 `Session.save_models()`, the same path `/models` takes, with `step_choice()` shared by both. While it

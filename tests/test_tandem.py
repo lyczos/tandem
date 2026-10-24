@@ -965,6 +965,33 @@ class Tuning(unittest.TestCase):
         self.assertEqual(camp["config"]["codex_model"], "gpt-z")
 
 
+class TurnProgress(unittest.TestCase):
+    setUp = Headless.setUp
+    run_dir_with = Tuning.run_dir_with
+
+    def test_the_bar_stops_counting_when_the_agent_returns(self):
+        run_dir = self.run_dir_with(check="true", max_cost=None)
+        during, after = [], []
+
+        def agent(name, *rest):
+            during.append(dict(tandem.PROGRESS))
+            return {"status": "done", "summary": "s"}, 0
+
+        def check(state):
+            after.append(dict(tandem.PROGRESS))  # the check can take minutes; no agent works meanwhile
+            return True, ""
+
+        with mock.patch.object(tandem, "call_agent", side_effect=agent), \
+                mock.patch.object(tandem, "run_check", side_effect=check), mock.patch.object(tandem, "log"):
+            tandem.loop(run_dir)
+        self.assertEqual([p["agent"] for p in during], ["codex", "claude"])
+        self.assertEqual(after, [{}])
+        self.assertEqual(tandem.PROGRESS, {})
+        state = tandem.load(run_dir)
+        first = tandem.status_bar(dict(state, outcome=None), time.time(), 200, False)[0]
+        self.assertNotIn("working", first)
+
+
 class Budget(unittest.TestCase):
     setUp = Headless.setUp
     invoke = Headless.invoke
@@ -1573,7 +1600,8 @@ class Cards(unittest.TestCase):
         none = plain(tandem.board(self.state([self.ENTRY]), True, 80))
         self.assertIn("nothing agreed yet", none)
         self.assertIn("not run yet", none)
-        failed = plain(tandem.board(self.state([self.ENTRY], check_feedback="it failed"), True, 80))
+        # The next turn has already read (and dropped) check_feedback: the saved verdict still says it failed.
+        failed = plain(tandem.board(self.state([self.ENTRY], check_passed=False), True, 80))
         self.assertIn("failed last time", failed)
         self.assertIn("no check", plain(tandem.board(self.state([self.ENTRY], config={}), True, 80)))
 
@@ -2201,7 +2229,35 @@ class Correction(unittest.TestCase):
         session = tandem.Session(argparse.Namespace(), tandem.Console(fancy=False))
         session.thread = mock.Mock()
         session.thread.is_alive.return_value = True
+        patch = mock.patch.dict(tandem.PROGRESS, {"turn": 1, "agent": "claude", "since": 1.0})  # a turn in flight
+        patch.start()
+        self.addCleanup(patch.stop)
         return session
+
+    def test_no_question_between_turns(self):
+        # The check, a usage-limit wait or the planner run with no agent to stop.
+        run = self.run_target()
+        session = self.busy_session()
+        tandem.PROGRESS.clear()
+        with mock.patch.dict(tandem.CURRENT, {"target": run}), \
+                mock.patch.object(session.console, "ask") as asked, mock.patch.object(tandem, "emit") as emit:
+            session.typed("use tabs not spaces")
+        asked.assert_not_called()
+        self.assertEqual(emit.call_args[0][0], "no agent is working right now; the next turn reads it")
+        self.assertEqual((run / "inbox.md").read_text(), "use tabs not spaces\n\n")
+
+    def test_a_command_or_quit_word_at_the_question_is_a_no(self):
+        run = self.run_target()
+        session = self.busy_session()
+        for answer in ("/help", "q", "exit"):
+            (run / "inbox.md").write_text("")
+            session.declined = None
+            with self.subTest(answer=answer), mock.patch.dict(tandem.CURRENT, {"target": run}), \
+                    mock.patch.object(session.console, "ask", return_value=answer), \
+                    mock.patch.object(tandem, "signal_children") as signal_children, mock.patch.object(tandem, "emit"):
+                session.typed("use tabs not spaces")
+            signal_children.assert_not_called()
+            self.assertEqual((run / "inbox.md").read_text(), "use tabs not spaces\n\n")
 
     def run_target(self):
         temp = tempfile.TemporaryDirectory()
@@ -2216,9 +2272,10 @@ class Correction(unittest.TestCase):
         session.images = [pathlib.Path("/tmp/shot.png")]
         seen = []
         for error in (KeyboardInterrupt, EOFError, "", "n", " No ", "nie"):
-            def ask(prompt, history=True):
+            def ask(prompt, history=True, question=False):
                 self.assertEqual(prompt, "  stop the current turn now and hand it over? its edits are kept [y/N] ")
                 self.assertFalse(history)
+                self.assertTrue(question)
                 seen.append((run / "inbox.md").read_text())
                 self.assertIn("use tabs not spaces", seen[-1])
                 if isinstance(error, str):
@@ -2271,7 +2328,7 @@ class Correction(unittest.TestCase):
         run = self.run_target()
         session = self.busy_session()
 
-        def ask(prompt, history=True):
+        def ask(prompt, history=True, question=False):
             tandem.PROGRESS.update(turn=2, agent="codex", since=2.0)  # the next turn began meanwhile
             return "y"
 
@@ -3110,6 +3167,33 @@ class SessionLook(unittest.TestCase):
         self.assertEqual(editor.read("tandem> "), "abc")
         self.assertTrue(out.getvalue().endswith("tandem> abc\n\x1b[?2004l"))
 
+    def test_a_question_gets_no_menu_and_no_bar_mode(self):
+        out = io.StringIO()
+        editor = tandem.LineEditor(None, out, self.history(), keys=iter(["tab", "/", "h", "enter"]))
+        editor.models = mock.Mock(return_value=[{"key": "claude_model"}])
+        self.assertEqual(editor.read("[y/N] ", history=False, question=True), "/h")  # not completed to /help
+        editor.models.assert_not_called()
+        self.assertEqual(editor.history, [])
+        editor.keys = iter(["/", "h", "enter"])
+        self.assertEqual(editor.read("tandem> "), "/help")  # the prompt itself keeps the menu
+
+    def test_a_failing_command_does_not_end_the_session(self):
+        session = tandem.Session(argparse.Namespace(repo="."), self.console(fancy=False))
+        with mock.patch.object(session, "handle", side_effect=TypeError("bad cache")), \
+                mock.patch.object(tandem, "emit") as emit:
+            self.assertTrue(session.dispatch("/models"))
+        self.assertEqual(emit.call_args[0][0], "that failed: TypeError: bad cache; the session goes on")
+        with mock.patch.object(session, "handle", return_value=False):
+            self.assertFalse(session.dispatch("/quit"))
+
+    def test_a_terminal_that_is_not_utf8_gets_question_marks_not_a_crash(self):
+        raw = io.BytesIO()
+        stream = io.TextIOWrapper(raw, encoding="latin-1")
+        tandem.replace_unencodable(stream)
+        stream.write("turn 2/12 \u00b7 check \u2713 \u2013\n")
+        stream.flush()
+        self.assertEqual(raw.getvalue(), "turn 2/12 \xb7 check ? ?\n".encode("latin-1"))
+
     def test_run_rules_fit_the_width_and_close_in_the_outcome_color(self):
         with tempfile.TemporaryDirectory() as d:
             run_dir = pathlib.Path(d)
@@ -3567,6 +3651,7 @@ class SessionProcess(unittest.TestCase):
 
         reader = threading.Thread(target=read, daemon=True)
         reader.start()
+        self.reader = reader
 
         def cleanup(proc=self.proc):  # this session's process: a test may start several
             for pid in self.agent_pids():
@@ -3582,6 +3667,12 @@ class SessionProcess(unittest.TestCase):
 
     def text(self):
         return "".join(self.output)
+
+    def drained(self):
+        """All the session printed, once it has exited: the reader may still be on the last chunk."""
+        if self.proc.poll() is not None:
+            self.reader.join(5)
+        return self.text()
 
     def wait_for(self, predicate, what, timeout=20):
         deadline = time.monotonic() + timeout
@@ -3707,7 +3798,11 @@ class SessionProcess(unittest.TestCase):
         agent = self.start_slow_turn(STUB_TERM_DELAY="1")
         self.type("/quit")
         self.wait_for(lambda: "waiting for the current turn" in self.text(), "the quit wait")
-        presses = 0
+        # The first press, then the message, before any more: each ^C makes the terminal flush output
+        # not yet read from it, which could otherwise drop the very line this test looks for.
+        os.write(self.master, b"\x03")
+        self.wait_for(lambda: "stopping the agent" in self.text(), "the first Ctrl+C stopping the agent")
+        presses = 1
         while self.proc.poll() is None and presses < 100:  # on through the way out, not just the wait
             with contextlib.suppress(OSError):  # the session may have gone since the check
                 os.write(self.master, b"\x03")  # the terminal turns each into a SIGINT now
@@ -3715,10 +3810,11 @@ class SessionProcess(unittest.TestCase):
             time.sleep(.1)
         self.assertGreaterEqual(presses, 3)
         self.assertEqual(self.proc.wait(timeout=20), 0, self.text())
-        self.assertNotIn("Traceback", self.text())
-        self.assertNotIn("continue with resume", self.text())  # main's own KeyboardInterrupt message
+        text = self.drained()
+        self.assertNotIn("Traceback", text)
+        self.assertNotIn("continue with resume", text)  # main's own KeyboardInterrupt message
         self.assertFalse(self.alive(agent))
-        self.assertEqual(self.text().count("stopping the agent"), 1)
+        self.assertEqual(text.count("stopping the agent"), 1)  # later presses never repeat it
 
     def run_dirs(self):
         return [d for d in self.runs.iterdir() if d.is_dir()] if self.runs.exists() else []
@@ -4173,6 +4269,28 @@ class Activity(unittest.TestCase):
         self.assertRegex(lines[3], r"^\d\d:\d\d:\d\d codex  \u2500\u2500 turn 1 \u2500\u2500$")
         self.assertRegex(lines[4], r"^\d\d:\d\d:\d\d check  = passed$")
         self.assertNotIn("$ ls", out.getvalue())
+
+    def test_watch_outlives_the_run_it_follows(self):
+        run = self.dir / "20261001-gone"
+        run.mkdir()
+        tandem.note_activity(run, "claude", "$ ls")
+        out = io.StringIO()
+        steps = iter([lambda: shutil.rmtree(run), None, KeyboardInterrupt])
+
+        def sleep(_):
+            step = next(steps)
+            if step is KeyboardInterrupt:
+                raise step
+            if step:
+                step()
+
+        with mock.patch.object(tandem, "RUNS", self.dir), mock.patch("sys.stdout", out), \
+                mock.patch.object(tandem.time, "sleep", side_effect=sleep), \
+                mock.patch.object(tandem, "term_width", return_value=60):
+            tandem.cmd_watch(argparse.Namespace(run=None))  # no KeyError once the directory is gone
+        self.assertIn("$ ls", out.getvalue())
+        with self.assertRaises(StopIteration):
+            next(steps)  # it kept going until Ctrl+C
 
     def test_watch_pane_opens_in_tmux_or_iterm_or_not_at_all(self):
         cmd = tandem.watch_command()
