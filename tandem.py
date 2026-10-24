@@ -35,7 +35,7 @@ try:
 except ImportError:
     termios = None
 
-__version__ = "0.1.1"  # single source of truth; package.json must match (a test checks)
+__version__ = "0.1.2"  # single source of truth; package.json must match (a test checks)
 
 ROOT = pathlib.Path(__file__).resolve().parent
 TURN_SCHEMA = ROOT / "schema" / "turn.json"

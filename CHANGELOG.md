@@ -1,5 +1,45 @@
 # Changelog
 
+## 0.1.2
+
+Fixes from a review of 0.1.1.
+
+- With `--codex-role reviewer`, Codex's approval closes a goal only after Claude has said done
+  and nothing changed since. Before, Codex could close a goal on turn 1 with nothing built, after
+  a failed Claude turn, or over work it wrote itself while Claude was away; that last case now
+  ends as a solo closure and is queued for review in a campaign.
+- `/stop` and `/quit` now stop a run that was started with `tandem start` or `-p` and later
+  resumed from a session; before, it kept going until its turn limit.
+- Only one process can drive a run at a time. `tandem resume` and `/resume` refuse a run that is
+  still running elsewhere before changing its state. `tandem runs` and `tandem status` say
+  `running` or `interrupted` instead of "running or interrupted".
+- Campaign resume and adoption lock the affected state before changing it; a run already
+  attached to a campaign cannot be adopted again.
+- A turn that times out, or a run stopped with Ctrl+C, SIGTERM or a closed terminal, now kills
+  the tools the agent started (a test run, a dev server) along with the agent, outside the
+  interactive session too.
+- A Claude reply without a usable result still counts its reported cost against `--max-cost`.
+- The orchestrator's commits skip all of the target repository's git hooks; `prepare-commit-msg`
+  and `post-commit` used to run and could stop the run.
+- A usage limit or a network error is recognised only from the CLI's own error message, not from
+  what the agent's commands printed. A failing test named `test_rate_limit` no longer pauses the
+  agent for an hour, and "502.31s" or a 503 from the app under test no longer causes retries.
+- Two runs or campaigns with the same name started in the same second no longer collide; the
+  second gets a `-2` suffix.
+- In a campaign, work Codex finished alone while Claude was away is now reviewed by Claude, not
+  by Codex as if Claude had written it.
+- `/queue clear` in a campaign also removes the dropped messages from the notes every later
+  planner reads.
+- A character typed over a slow connection (SSH) whose bytes arrive separately is no longer
+  turned into two replacement marks.
+- A message sent with `tandem say` from another terminal at the moment the agent's turn starts
+  is no longer lost.
+- A campaign that crashed while starting a goal, or right after a goal finished, resumes cleanly:
+  it reuses the unused goal directory instead of failing, and records a finished goal instead of
+  running it again.
+- A campaign prints the planner's check command in full when a goal starts, since it runs as you
+  outside any sandbox; the docs say so too.
+
 ## 0.1.1
 
 - The README opens with a recording of a real session: a goal, a message typed during the
