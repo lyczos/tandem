@@ -283,6 +283,83 @@ def emit(text):
             pass  # the terminal is gone; the run must still record its turn and stop cleanly
 
 
+# A run takes long enough that the owner looks away; main() turns this on for the commands that
+# start or resume one in front of them. Headless -p stays quiet unless asked: scripts and CI run it.
+NOTIFY = {"on": False}
+NOTIFY_TIMEOUT = 2  # seconds: a hung notifier must not hold up the loop
+# The title and body arrive as arguments, so no quote or backslash in a run name can break the script.
+NOTIFY_SCRIPT = ["on run argv", "display notification (item 2 of argv) with title (item 1 of argv)", "end run"]
+
+
+def notifier():
+    """The desktop notifier notify() uses on this machine, or None when the bell is all there is."""
+    if sys.platform == "darwin":
+        return "osascript" if shutil.which("osascript") else None
+    return "notify-send" if shutil.which("notify-send") else None
+
+
+def notify(title, body):
+    """Tell the owner something happened, best effort: a desktop notification, OSC 9 in iTerm2 and
+    the bell. Never raises; the loop must go on whether or not anyone heard it."""
+    body = CONTROL_CHARS.sub(" ", str(body))[:200]
+    try:
+        tool = notifier()
+        if tool == "osascript":
+            cmd = ["osascript", *[a for line in NOTIFY_SCRIPT for a in ("-e", line)], title, body]
+        elif tool == "notify-send":
+            cmd = ["notify-send", "--", title, body]
+        if tool:
+            subprocess.run(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                           timeout=NOTIFY_TIMEOUT, **CHILD_POPEN)
+    except Exception:  # missing, hung (TimeoutExpired) or refused: the bell below still rings
+        pass
+    # OSC 9 ends with BEL, which iTerm2 takes as the terminator, so the bell is a second BEL.
+    seq = (f"\x1b]9;{title}: {body}\a" if os.environ.get("TERM_PROGRAM") == "iTerm.app" else "") + "\a"
+    with OUT_LOCK:
+        try:
+            if CONSOLE:
+                CONSOLE.alert(seq)
+            else:
+                for stream in (sys.stdout, sys.stderr):
+                    if stream.isatty():
+                        stream.write(seq)
+                        stream.flush()
+                        break
+        except Exception:
+            pass
+
+
+def notifier_report():
+    """What doctor says notify() will use here."""
+    parts = [notifier()] if notifier() else []
+    if os.environ.get("TERM_PROGRAM") == "iTerm.app":
+        parts.append("OSC 9")
+    return " + ".join(parts + ["bell"]) if parts else "bell only"
+
+
+def wants_notify(fn, args):
+    """Whether this command tells the owner when a run ends: --no-notify and a saved "notify": false
+    silence it; headless -p only with --notify."""
+    if getattr(args, "no_notify", False):
+        return False
+    if fn is cmd_headless:
+        return bool(getattr(args, "notify", False))
+    if fn not in (cmd_interactive, cmd_start, cmd_resume, cmd_campaign_start, cmd_campaign_resume):
+        return False
+    return read_config().get("notify", True) is not False
+
+
+def run_notice(run_dir, state):
+    name = state.get("name") or run_dir.name
+    history = state.get("history") or []
+    if state.get("outcome") == "blocked" and history:
+        return f"{name}: blocked, {NAMES[history[-1]['agent']]} needs you"
+    n = len(history)
+    words = {"max_turns": "out of turns", "over_budget": "over budget"}
+    return (f"{name}: {words.get(state.get('outcome'), state.get('outcome'))} in {n} turn{'s' * (n != 1)}, "
+            f"${state.get('cost_usd', 0.0):.2f}")
+
+
 def prog_name():
     """How the user invoked tandem, for advice we print: `tandem` via the npm wrapper, else the script path."""
     return os.environ.get("TANDEM_PROG") or (sys.argv[0] if sys.argv and sys.argv[0] else "./tandem.py")
@@ -1327,6 +1404,9 @@ def finish(run_dir, state, outcome, message):
     log(f"transcript {run_dir / 'transcript.md'}", brief=f"transcript {show_path(run_dir / 'transcript.md', run_dir)}")
     if in_session():
         emit(CONSOLE.rule(f"{outcome} \u00b7 {state.get('name') or run_dir.name}", OUTCOME_COLORS.get(outcome, "1")))
+    # A campaign goes on to its next goal, so only the campaign's own end is worth a notification.
+    if NOTIFY["on"] and not state.get("campaign"):
+        notify("tandem", run_notice(run_dir, state))
 
 
 def budget_spent(state):
@@ -1357,6 +1437,22 @@ CURRENT = {}   # target: the run or campaign directory the session's /say, /stop
 
 
 def loop(run_dir):
+    try:
+        return _loop(run_dir)
+    except Exception as exc:
+        # A crash is a run end too, and the owner who looked away would otherwise never hear of it.
+        # Ctrl+C is not: whoever pressed it is looking.
+        if NOTIFY["on"]:
+            try:
+                state = load(run_dir)
+            except Exception:
+                state = {}
+            if not state.get("campaign"):
+                notify("tandem", f"{state.get('name') or pathlib.Path(run_dir).name}: crashed, {exc}")
+        raise
+
+
+def _loop(run_dir):
     state = load(run_dir)
     state.pop("outcome", None)
     cfg = state["config"]
@@ -1388,6 +1484,9 @@ def loop(run_dir):
         if not ready:
             wake = min(unavailable_until(a) for a in healthy)
             log(f"no agent available (usage limits); waiting until {wake:%H:%M}", "warn")
+            if NOTIFY["on"]:
+                notify("tandem", f"{state.get('name') or run_dir.name}: both agents at usage limits, "
+                                 f"waiting until {wake:%H:%M}")
             wait_until(wake, state.get("stop_file"))
             continue
         if state.get("review_goal") and "codex" in healthy and away_for_long("codex"):
@@ -1641,15 +1740,45 @@ def campaign_loop(camp_dir):
     refuse_if_running(camp_dir)
     lock = camp_dir / ".lock"
     lock.write_text(str(os.getpid()))
+    ended = crash = None
     try:
         _campaign_loop(camp_dir)
+        ended = True
+    except Exception as exc:
+        ended, crash = True, exc
+        raise
     finally:
         lock.unlink(missing_ok=True)
         # Interrupts still leave work to take or resume; release the lock before offering resume.
+        camp = None
         try:
-            show_handoff(campaign_handoff(camp_dir, json.loads((camp_dir / "campaign.json").read_text())))
+            camp = json.loads((camp_dir / "campaign.json").read_text())
+            show_handoff(campaign_handoff(camp_dir, camp))
         except (OSError, ValueError) as exc:
             log(f"cannot sum up the campaign's branch: {exc}", "warn")
+        # Not after Ctrl+C: whoever pressed it is looking.
+        if ended and NOTIFY["on"]:
+            notify("tandem", campaign_notice(camp_dir, camp or {}, crash))
+
+
+def campaign_notice(camp_dir, camp, crash=None):
+    outcome = ("crashed" if crash else camp.get("outcome")
+               or ("stopped" if (camp_dir / "STOP").exists() else "paused"))
+    runs = camp.get("runs") or []
+    n = len(runs)
+    turns = sum(r.get("turns") or 0 for r in runs)
+    cost = camp.get("cost_usd", 0.0)
+    if camp.get("current"):
+        # A stopped or over-budget run stays current, so its turns and cost are not in the totals yet.
+        try:
+            state = load(pathlib.Path(camp["current"]))
+            turns += max(state.get("turn", 1) - 1, 0)
+            cost += state.get("cost_usd", 0.0)
+        except Exception:
+            pass
+    text = (f"campaign {camp_dir.name}: {outcome.replace('_', ' ')} after {n} goal{'s' * (n != 1)}, "
+            f"{turns} turn{'s' * (turns != 1)}, ${cost:.2f}")
+    return f"{text}: {crash}" if crash else text
 
 
 def _campaign_loop(camp_dir):
@@ -1672,7 +1801,10 @@ def _campaign_loop(camp_dir):
                     break
                 waits += 1
                 log(f"both agents failing, probably a usage limit; waiting {FAILED_RUN_WAIT // 60} min ({waits}/{MAX_FAILED_WAITS})", "warn")
-                if not wait_until(datetime.datetime.now() + datetime.timedelta(seconds=FAILED_RUN_WAIT), stop_file):
+                wake = datetime.datetime.now() + datetime.timedelta(seconds=FAILED_RUN_WAIT)
+                if NOTIFY["on"]:
+                    notify("tandem", f"campaign {camp_dir.name}: both agents failing, waiting until {wake:%H:%M}")
+                if not wait_until(wake, stop_file):
                     break
                 state["failures"] = {"claude": 0, "codex": 0}
                 save(run_dir, state)
@@ -1749,6 +1881,9 @@ def _campaign_loop(camp_dir):
                 wake = min(waits) if len(waits) == len(NAMES) else \
                     datetime.datetime.now() + datetime.timedelta(seconds=PLAN_RETRY_WAIT)
                 log(f"neither agent could plan the next goal; retrying at {wake:%H:%M}", "warn")
+                if NOTIFY["on"] and len(waits) == len(NAMES):
+                    notify("tandem", f"campaign {camp_dir.name}: both agents at usage limits, "
+                                     f"waiting until {wake:%H:%M}")
                 wait_until(wake, stop_file)
                 continue
             if plan.get("finished"):
@@ -2233,6 +2368,9 @@ def cmd_doctor(args):
         code, out = probe(["codex", "login", "status"])
         checks.append(("codex logged in", code == 0, out if code == 0 else "run `codex login`"))
     checks.append(("current repo",) + cwd_repo_status(os.getcwd()))
+    off = read_config().get("notify", True) is False
+    checks.append(("notifications", True, "off (\"notify\": false in ~/.tandem/config.json)" if off
+                   else notifier_report()))
     for name, ok, detail in checks:
         emit(f"  {'ok  ' if ok else 'FAIL'}  {name:<18} {detail}")
     if not all(ok for _, ok, _ in checks):
@@ -2278,6 +2416,14 @@ def add_start_options(p):
     p.add_argument("--first", choices=["claude", "codex"], help="who starts (default: the goal file's first:, else claude)")
     p.add_argument("--check", help="shell command that must pass before the run counts as done")
     add_agent_options(p, 12)
+    add_notify_option(p)
+
+
+NO_NOTIFY_HELP = "no desktop notification or bell when the run ends or waits for usage limits"
+
+
+def add_notify_option(p):
+    p.add_argument("--no-notify", action="store_true", help=NO_NOTIFY_HELP)
 
 
 HELP_DESCRIPTION = """\
@@ -2293,6 +2439,7 @@ HELP_EPILOG = """\
 -p takes the options of `start`: --repo --check --max-turns --first --name --base,
 --claude-model --claude-effort --codex-model --codex-effort --codex-role --codex-network --claude-budget --timeout,
 --max-cost USD (checked before each turn; counts reported cost only, which is Claude's: Codex reports none).
+The session, start, resume and campaigns notify when a run ends; --no-notify silences that, -p --notify asks for it.
 -p exit codes: 0 done, 1 error, 2 max_turns, 3 blocked, 4 stopped, 5 failed, 6 over_budget.
 """
 
@@ -2324,6 +2471,7 @@ def build_parser():
                    help="headless: run GOAL (or the goal on stdin, or --goal-file) and exit")
     p.add_argument("--output-format", choices=["text", "json"], default="text", help="with -p")
     p.add_argument("--quiet", action="store_true", help="with -p: no turn stream")
+    p.add_argument("--notify", action="store_true", help="with -p: notify when the run ends, as start does")
     # Options for -p sit at the top level; `start` repeats them after the command.
     shown = len(p._actions)
     add_start_options(p)
@@ -2339,6 +2487,7 @@ def build_parser():
     r.add_argument("run")
     r.add_argument("--more-turns", type=int, help="allow this many more turns")
     r.add_argument("--max-cost", type=positive_usd, metavar="USD", help="set or raise the run's spending cap")
+    add_notify_option(r)
     r.set_defaults(fn=cmd_resume)
 
     m = sub.add_parser("say", help="leave a message for the next turn (run or campaign directory)")
@@ -2375,6 +2524,7 @@ def build_parser():
     cs.add_argument("--base", default="HEAD")
     cs.add_argument("--push", action="store_true", help="push the branch to origin after every goal")
     add_agent_options(cs, 12)
+    add_notify_option(cs)
     cs.set_defaults(fn=cmd_campaign_start)
     for name, fn in (("resume", cmd_campaign_resume), ("stop", cmd_campaign_stop), ("status", cmd_campaign_status)):
         x = csub.add_parser(name)
@@ -2387,6 +2537,7 @@ def build_parser():
             x.add_argument("--max-cost", type=positive_usd, metavar="USD",
                            help="set or raise the spending cap for all the campaign's goals together")
             x.add_argument("--seed-review", metavar="FROM_SHA:NOTE", help="add a review backlog item from FROM_SHA to HEAD")
+            add_notify_option(x)
         x.set_defaults(fn=fn)
     x = csub.add_parser("say")
     x.add_argument("run")
@@ -3344,6 +3495,15 @@ class Console:
             sys.stdout.write(out + self.prompt + self._buffer())
             sys.stdout.flush()
 
+    def alert(self, seq):
+        """The bell and OSC 9 move no cursor, so they go out as they are between two redraws, even
+        while the picker holds the log back."""
+        if self.editor:
+            self.editor.write(seq)
+        else:
+            sys.stdout.write(seq)
+            sys.stdout.flush()
+
     @contextlib.contextmanager
     def hold(self):
         """Keep log lines back until the block ends, then print them. OUT_LOCK guards only the list:
@@ -3421,13 +3581,15 @@ class Session:
             return True
         return False
 
-    def launch(self, label, fn):
+    def launch(self, label, fn, no_notify=False):
         if self.refuse_if_busy():
             return
         with OUT_LOCK:
             PROGRESS.clear()
 
         def work():
+            previous_notify = NOTIFY["on"]
+            NOTIFY["on"] = previous_notify and not no_notify
             try:
                 fn()
             except KeyboardInterrupt:
@@ -3438,6 +3600,7 @@ class Session:
             except Exception as exc:  # the session must survive a failing run
                 self.note(f"{label} failed: {exc}", "error")
             finally:
+                NOTIFY["on"] = previous_notify
                 with OUT_LOCK:
                     self.console.running = False
                 if not self.quitting:
@@ -3822,24 +3985,28 @@ class Session:
         if self.refuse_if_busy():
             return
         try:
-            more = int(rest) if rest else None
+            words = shlex.split(rest)
+            no_notify = "--no-notify" in words
+            words = [word for word in words if word != "--no-notify"]
+            more = int(" ".join(words)) if words else None
             if more is not None and more <= 0:
                 raise ValueError
         except ValueError:
-            emit("usage: /resume [TURNS] (TURNS must be positive)")
+            emit("usage: /resume [TURNS] [--no-notify] (TURNS must be positive)")
             return
         if (target / "campaign.json").exists():
             if more is not None:
                 emit("/resume TURNS applies to a single run; use /resume for a campaign")
                 return
-            self.campaign("resume " + shlex.quote(str(target)))
+            self.campaign("resume " + shlex.quote(str(target)) + (" --no-notify" if no_notify else ""))
         else:
             try:
                 (target / "STOP").unlink(missing_ok=True)
             except OSError as exc:
                 emit(f"cannot resume: {exc}")
                 return
-            self.launch("run", lambda: cmd_resume(argparse.Namespace(run=str(target), more_turns=more)))
+            self.launch("run", lambda: cmd_resume(argparse.Namespace(run=str(target), more_turns=more)),
+                        no_notify=no_notify)
 
     def campaign(self, rest):
         try:
@@ -3867,7 +4034,7 @@ class Session:
             except (SystemExit, GitError, OSError, ValueError) as exc:
                 emit(f"cannot {argv[0]} campaign: {exc}")
                 return
-            self.launch("campaign", lambda: campaign_loop(target))
+            self.launch("campaign", lambda: campaign_loop(target), no_notify=parsed.no_notify)
         else:
             self.guarded(parsed.fn, parsed)
 
@@ -4051,6 +4218,7 @@ def main(argv=None):
     p = build_parser()
     args = p.parse_args(argv)
     fn = pick_command(p, args)
+    NOTIFY["on"] = wants_notify(fn, args)
     previous = None
     if fn is not cmd_interactive and threading.current_thread() is threading.main_thread():
         # SIGTERM (a supervisor, or the npm launcher passing one on) ends a run the way Ctrl+C does,
@@ -4063,6 +4231,7 @@ def main(argv=None):
     except GitError as e:
         sys.exit(f"{e}\nfix it, then continue with resume")
     finally:
+        NOTIFY["on"] = False
         if previous is not None:
             signal.signal(signal.SIGTERM, previous)
 

@@ -22,6 +22,14 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 spec = importlib.util.spec_from_file_location("tandem", ROOT / "tandem.py")
 tandem = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(tandem)
+REAL_NOTIFY = tandem.notify
+
+
+def setUpModule():
+    # `start` and the session notify by default; no test may pop a real notification or ring the bell.
+    patch = mock.patch.object(tandem, "notify", lambda title, body: None)
+    patch.start()
+    unittest.addModuleCleanup(patch.stop)
 
 
 class RunsDirectory(unittest.TestCase):
@@ -1162,7 +1170,247 @@ class Budget(unittest.TestCase):
         self.assertEqual(tandem.cost_text(dict(state, config={})), "$2.83")
 
 
-ANSI = re.compile(r"\x1b\[[0-9;]*m")
+class Notify(unittest.TestCase):
+    setUp = Headless.setUp
+    invoke = Headless.invoke
+    run_dir_with = Tuning.run_dir_with
+    run_with = Handoff.run_with
+
+    def home(self, config=None):
+        home = tempfile.TemporaryDirectory()
+        self.addCleanup(home.cleanup)
+        patch = mock.patch.dict(os.environ, {"HOME": home.name})
+        patch.start()
+        self.addCleanup(patch.stop)
+        if config is not None:
+            tandem.config_path().parent.mkdir(parents=True)
+            tandem.config_path().write_text(json.dumps(config))
+
+    def real(self, title, body, platform, which, run=None, term=""):
+        """The real notify() with the platform, PATH and subprocess.run stubbed; returns (run mock, alerts)."""
+        alerts = []
+        console = mock.Mock(alert=alerts.append)
+        run = run or mock.Mock()
+        with mock.patch.object(tandem.sys, "platform", platform), \
+                mock.patch.object(tandem.shutil, "which", side_effect=lambda name: which.get(name)), \
+                mock.patch.object(tandem.subprocess, "run", run), \
+                mock.patch.object(tandem, "CONSOLE", console), \
+                mock.patch.dict(os.environ, {"TERM_PROGRAM": term}):
+            REAL_NOTIFY(title, body)
+        return run, alerts
+
+    def test_macos_passes_title_and_body_as_arguments(self):
+        body = 'say "hi" \\ and \'bye\''
+        run, alerts = self.real("tandem", body, "darwin", {"osascript": "/usr/bin/osascript"})
+        cmd = run.call_args[0][0]
+        self.assertEqual(cmd[0], "osascript")
+        self.assertEqual(cmd[-2:], ["tandem", body])
+        script = [cmd[i + 1] for i, a in enumerate(cmd[:-2]) if a == "-e"]
+        self.assertEqual(script, tandem.NOTIFY_SCRIPT)
+        self.assertFalse(any("hi" in line or "tandem" in line for line in script))
+        self.assertEqual(run.call_args[1]["timeout"], tandem.NOTIFY_TIMEOUT)
+        self.assertEqual(alerts, ["\a"])
+
+    def test_notify_send_only_when_present(self):
+        run, alerts = self.real("tandem", "r: done", "linux", {})
+        run.assert_not_called()
+        self.assertEqual(alerts, ["\a"])  # the bell alone is fine
+        run, _ = self.real("tandem", "r: done", "linux", {"notify-send": "/usr/bin/notify-send"})
+        self.assertEqual(run.call_args[0][0], ["notify-send", "--", "tandem", "r: done"])
+
+    def test_failing_or_hung_notifier_does_not_propagate(self):
+        for error in (OSError("gone"), subprocess.TimeoutExpired("osascript", 2), ValueError("odd")):
+            with self.subTest(error=error):
+                _, alerts = self.real("tandem", "x", "darwin", {"osascript": "/x"}, mock.Mock(side_effect=error))
+                self.assertEqual(alerts, ["\a"])
+        with mock.patch.object(tandem, "CONSOLE", mock.Mock(alert=mock.Mock(side_effect=OSError))), \
+                mock.patch.object(tandem, "notifier", return_value=None):
+            REAL_NOTIFY("tandem", "x")  # a terminal gone away is no reason to stop the loop
+
+    def test_iterm_gets_osc9_then_the_bell_and_control_characters_go(self):
+        _, alerts = self.real("tandem", "a\x1b]evil\nb", "linux", {}, term="iTerm.app")
+        self.assertEqual(alerts, ["\x1b]9;tandem: a ]evil b\a\a"])
+
+    def test_outside_the_session_the_bell_goes_to_a_terminal_only(self):
+        out = io.StringIO()
+        with mock.patch.object(tandem, "notifier", return_value=None), mock.patch("sys.stdout", out), \
+                mock.patch("sys.stderr", io.StringIO()), mock.patch.dict(os.environ, {"TERM_PROGRAM": ""}):
+            REAL_NOTIFY("tandem", "x")
+            self.assertEqual(out.getvalue(), "")
+            out.isatty = lambda: True
+            REAL_NOTIFY("tandem", "x")
+        self.assertEqual(out.getvalue(), "\a")
+
+    def test_start_notifies_once_with_outcome_turns_and_cost(self):
+        self.home()
+        with mock.patch.object(tandem, "call_agent", return_value=({"status": "continue"}, .5)), \
+                mock.patch.object(tandem, "notify") as notify:
+            code, out, err = self.invoke("start", "--goal", "g", "--name", "bar", "--max-turns", "2")
+        self.assertEqual(code, 0, err)
+        notify.assert_called_once_with("tandem", "bar: out of turns in 2 turns, $1.00")
+        self.assertFalse(tandem.NOTIFY["on"])  # main() leaves no switch on for whatever runs next
+
+    def test_blocked_names_who_needs_the_owner(self):
+        self.home()
+        reply = {"status": "blocked", "summary": "s", "handoff": "Need answer"}
+        with mock.patch.object(tandem, "notify") as notify, \
+                mock.patch.object(tandem, "call_agent", return_value=(reply, 0)):
+            self.invoke("-p", "Work", "--notify", "--name", "nb")
+        notify.assert_called_once_with("tandem", "nb: blocked, Codex needs you")
+
+    def test_headless_only_with_notify_and_silenced_by_flag_or_config(self):
+        self.home()
+        cases = ((("-p", "g"), 0), (("-p", "g", "--notify"), 1), (("start", "--goal", "g", "--no-notify"), 0))
+        for n, (args, calls) in enumerate(cases):
+            with self.subTest(args=args), mock.patch.object(tandem, "notify") as notify, \
+                    mock.patch.object(tandem, "call_agent", return_value=({"status": "continue"}, 0)):
+                self.invoke(*args, "--max-turns", "1", "--name", f"case{n}")
+                self.assertEqual(notify.call_count, calls)
+        self.home({"notify": False})
+        with mock.patch.object(tandem, "notify") as notify, \
+                mock.patch.object(tandem, "call_agent", return_value=({"status": "continue"}, 0)):
+            self.invoke("start", "--goal", "g", "--max-turns", "1", "--name", "saved-off")
+        notify.assert_not_called()
+
+    def test_entry_points_that_notify(self):
+        self.home()
+        quiet, off = argparse.Namespace(no_notify=False), argparse.Namespace(no_notify=True)
+        for fn in (tandem.cmd_interactive, tandem.cmd_start, tandem.cmd_resume,
+                   tandem.cmd_campaign_start, tandem.cmd_campaign_resume):
+            with self.subTest(fn=fn.__name__):
+                self.assertTrue(tandem.wants_notify(fn, quiet))
+                self.assertFalse(tandem.wants_notify(fn, off))
+        self.assertFalse(tandem.wants_notify(tandem.cmd_status, quiet))
+        parser = tandem.build_parser()
+        for argv in (["--no-notify"], ["resume", "r", "--no-notify"], ["campaign", "start", "--no-notify"],
+                     ["campaign", "resume", "d", "--no-notify"]):
+            self.assertTrue(parser.parse_args(argv).no_notify, argv)
+        self.home({"notify": False})
+        self.assertFalse(tandem.wants_notify(tandem.cmd_interactive, quiet))
+        self.assertTrue(tandem.wants_notify(tandem.cmd_headless, argparse.Namespace(notify=True)))
+
+    def test_session_run_end_notifies_once(self):
+        run_dir = self.run_dir_with()
+        console = tandem.Console(fancy=False, styled=True)
+        console.write = lambda text: None
+        with mock.patch.object(tandem, "CONSOLE", console), mock.patch.object(tandem, "NOTIFY", {"on": True}), \
+                mock.patch.object(tandem, "notify") as notify, \
+                mock.patch.object(tandem, "call_agent", return_value=({"status": "continue"}, .25)):
+            tandem.loop(run_dir)
+        notify.assert_called_once_with("tandem", "r1: out of turns in 3 turns, $0.75")
+
+    def test_session_command_silence_lasts_only_for_its_worker(self):
+        target = self.runs / "session-target"
+        target.mkdir(parents=True)
+        session = tandem.Session(argparse.Namespace(repo="."), tandem.Console(fancy=False))
+        seen = []
+
+        def check_switch(*args):
+            seen.append(tandem.NOTIFY["on"])
+
+        with mock.patch.object(tandem, "NOTIFY", {"on": True}), mock.patch.object(tandem, "emit"), \
+                mock.patch.object(tandem, "prepare_campaign_start", return_value=target), \
+                mock.patch.object(tandem, "prepare_campaign_resume", return_value=target), \
+                mock.patch.object(tandem, "campaign_loop", side_effect=check_switch), \
+                mock.patch.object(tandem, "cmd_resume", side_effect=check_switch):
+            for command in ("start --no-notify", "resume x --no-notify", "start"):
+                session.campaign(command)
+                session.thread.join(timeout=2)
+                self.assertFalse(session.busy())
+                self.assertTrue(tandem.NOTIFY["on"])
+            for rest in ("2 --no-notify", "2"):
+                session.resume(target, rest)
+                session.thread.join(timeout=2)
+                self.assertFalse(session.busy())
+                self.assertTrue(tandem.NOTIFY["on"])
+            session.launch("run", lambda: (_ for _ in ()).throw(ValueError("failed")), no_notify=True)
+            session.thread.join(timeout=2)
+            self.assertTrue(tandem.NOTIFY["on"])
+        self.assertEqual(seen, [False, False, True, False, True])
+
+    def test_campaign_end_notifies_once_and_its_runs_do_not(self):
+        out, run_dir, state = self.run_with("done")
+        camp_dir = self.runs / "campaign-x"
+        camp_dir.mkdir()
+        tandem.write_json(camp_dir / "campaign.json", {
+            **{key: state[key] for key in ("repo", "worktree", "branch", "base")},
+            "runs": [{"name": "a", "turns": 3}, {"name": "b", "turns": 1}], "outcome": "finished", "cost_usd": 2.5})
+        with mock.patch("sys.stdout", io.StringIO()), mock.patch.object(tandem, "NOTIFY", {"on": True}), \
+                mock.patch.object(tandem, "notify") as notify:
+            with mock.patch.object(tandem, "_campaign_loop"):
+                tandem.campaign_loop(camp_dir)
+            notify.assert_called_once_with("tandem", "campaign campaign-x: finished after 2 goals, 4 turns, $2.50")
+            notify.reset_mock()
+            with mock.patch.object(tandem, "_campaign_loop", side_effect=KeyboardInterrupt), \
+                    self.assertRaises(KeyboardInterrupt):
+                tandem.campaign_loop(camp_dir)
+            notify.assert_not_called()  # the owner pressed Ctrl+C; they are looking already
+            with mock.patch.object(tandem, "_campaign_loop", side_effect=RuntimeError("disk full")), \
+                    self.assertRaises(RuntimeError):
+                tandem.campaign_loop(camp_dir)
+            notify.assert_called_once_with(
+                "tandem", "campaign campaign-x: crashed after 2 goals, 4 turns, $2.50: disk full")
+            notify.reset_mock()
+            tandem.finish(run_dir, dict(state, campaign=str(camp_dir)), "done", "ok")
+            notify.assert_not_called()
+
+    def test_stopped_campaign_counts_its_current_run(self):
+        run_dir = self.run_dir_with()
+        state = tandem.load(run_dir)
+        tandem.save(run_dir, dict(state, turn=3, cost_usd=1.25))
+        camp_dir = self.runs / "campaign-y"
+        camp_dir.mkdir()
+        (camp_dir / "STOP").write_text("")
+        camp = {"runs": [{"name": "a", "turns": 2}], "cost_usd": 1.0, "current": str(run_dir)}
+        self.assertEqual(tandem.campaign_notice(camp_dir, camp),
+                         "campaign campaign-y: stopped after 1 goal, 4 turns, $2.25")
+        camp["outcome"] = "over_budget"
+        self.assertTrue(tandem.campaign_notice(camp_dir, camp).startswith("campaign campaign-y: over budget"))
+
+    def test_run_crash_notifies_outside_a_campaign_only(self):
+        run_dir = self.run_dir_with()
+        with mock.patch.object(tandem, "NOTIFY", {"on": True}), mock.patch.object(tandem, "log"), \
+                mock.patch.object(tandem, "notify") as notify, \
+                mock.patch.object(tandem, "_loop", side_effect=tandem.GitError("commit failed")):
+            with self.assertRaises(tandem.GitError):
+                tandem.loop(run_dir)
+            notify.assert_called_once_with("tandem", "r1: crashed, commit failed")
+            notify.reset_mock()
+            tandem.save(run_dir, dict(tandem.load(run_dir), campaign="c"))
+            with self.assertRaises(tandem.GitError):
+                tandem.loop(run_dir)
+            notify.assert_not_called()  # the campaign's own end says it
+
+    def test_both_away_wait_notifies_once(self):
+        run_dir = self.run_dir_with()
+        state = tandem.load(run_dir)
+        state["stop_file"] = str(run_dir / "STOP")
+        tandem.save(run_dir, state)
+        later = datetime.datetime.now() + datetime.timedelta(hours=2)
+        stop = lambda when, stop_file: pathlib.Path(stop_file).write_text("")
+        with mock.patch.object(tandem, "unavailable_until", return_value=later), \
+                mock.patch.object(tandem, "wait_until", side_effect=stop) as wait, \
+                mock.patch.object(tandem, "NOTIFY", {"on": True}), mock.patch.object(tandem, "log"), \
+                mock.patch.object(tandem, "notify") as notify:
+            tandem.loop(run_dir)
+        wait.assert_called_once()
+        bodies = [c[0][1] for c in notify.call_args_list]
+        self.assertEqual(bodies, [f"r1: both agents at usage limits, waiting until {later:%H:%M}",
+                                  "r1: stopped in 0 turns, $0.00"])
+
+    def test_doctor_names_the_notifier(self):
+        self.home()
+        for platform, which, term, expected in (
+                ("darwin", {"osascript": "/x"}, "iTerm.app", "osascript + OSC 9 + bell"),
+                ("linux", {"notify-send": "/x"}, "", "notify-send + bell"),
+                ("linux", {}, "", "bell only")):
+            with self.subTest(expected=expected), mock.patch.object(tandem.sys, "platform", platform), \
+                    mock.patch.object(tandem.shutil, "which", side_effect=lambda name: which.get(name)), \
+                    mock.patch.dict(os.environ, {"TERM_PROGRAM": term}):
+                self.assertEqual(tandem.notifier_report(), expected)
+
+
+ANSI =re.compile(r"\x1b\[[0-9;]*m")
 
 
 def plain(text):

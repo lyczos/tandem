@@ -26,7 +26,7 @@ asks you to type `yes` after reading the security warning. For scripts, use
 
 `doctor` reports the tandem version, Python version and interpreter path, Node version when
 launched through npm, the writable runs directory, Git and its author identity, both agent
-CLIs and logins, and the current repository and branch. Every line should say `ok`; a `FAIL`
+CLIs and logins, the current repository and branch, and which notifier tandem will use. Every line should say `ok`; a `FAIL`
 line identifies what needs fixing. It exits 1 if any check fails, including when you run it
 outside a Git repository or before that repository has its first commit.
 
@@ -424,6 +424,28 @@ reviews each goal instead of alternating), `--base` (start from another branch),
 (campaigns: push the branch after every goal). An agent that fails three turns in a row (crash,
 bad output) is benched and the other one finishes alone. `/models` choices are saved in
 `~/.tandem/config.json` and used when a flag is not given.
+
+## Notifications
+
+A run takes long enough that you will look away, so tandem tells you when it needs you: when a
+run ends (any outcome, including a crash) in the interactive session, `start` or `resume`; when
+a campaign ends or crashes; and once each time both agents are on usage limits and the loop
+starts waiting, with the time it resumes. Runs inside a campaign do not notify on their own, only
+the campaign's end does. Ctrl+C does not notify, since whoever pressed it is looking. The
+message is short, such as `status-bar: done in 5 turns, $2.83`,
+`status-bar: blocked, Codex needs you` or `campaign 20261024-0848: stopped after 3 goals, 14 turns, $9.10`.
+
+It uses what the machine already has: `osascript` on macOS, `notify-send` on Linux when it is on
+PATH, the OSC 9 escape in iTerm2, and always the terminal bell. With none of those, the bell is
+all you get. A notifier that hangs is given up after 2 seconds and never stops the run.
+`doctor` says which one will be used.
+
+Headless `-p` stays quiet unless you pass `--notify`, so scripts and CI do not ring. Pass
+`--no-notify` to the session, `start`, `resume`, `campaign start` or `campaign resume` to turn it
+off once, or set `"notify": false` in `~/.tandem/config.json` to turn it off by default.
+Inside the session, `/resume --no-notify`, `/campaign start --no-notify` and
+`/campaign resume DIR --no-notify` silence only that run or campaign; the next command uses
+the session default again.
 
 ## Configuration
 

@@ -2,6 +2,12 @@
 
 ## 0.1.0
 
+- tandem tells you when a run needs you: a desktop notification (`osascript` on macOS,
+  `notify-send` on Linux when present), OSC 9 in iTerm2 and the terminal bell when a run ends
+  or crashes in the session, `start` or `resume`, when a campaign ends or crashes, and once per wait when both agents
+  are on usage limits. Headless `-p` notifies only with `--notify`; `--no-notify` or
+  `"notify": false` in `~/.tandem/config.json` turns it off. `doctor` names the notifier.
+
 - Every run ends with what changed and how to take it: the branch, its commits and diffstat
   over the base, the worktree, and ready-to-copy `git -C REPO diff`, `merge` and cleanup
   commands (a `resume` line first when the run is unfinished). Campaigns print the same for
