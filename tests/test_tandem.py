@@ -174,9 +174,12 @@ class Git(unittest.TestCase):
             run = lambda *a: subprocess.run(["git", *a], cwd=d, check=True, capture_output=True, env=env)
             run("init", "-q")
             run("commit", "-q", "--allow-empty", "-m", "init")
-            hook = pathlib.Path(d) / ".git" / "hooks" / "pre-commit"
-            hook.write_text("#!/bin/sh\nexit 1\n")
-            hook.chmod(0o755)
+            # --no-verify alone skips only pre-commit and commit-msg; prepare-commit-msg still ran.
+            marker = pathlib.Path(d) / ".git" / "ran"
+            for name in ("pre-commit", "prepare-commit-msg", "commit-msg", "post-commit"):
+                hook = pathlib.Path(d) / ".git" / "hooks" / name
+                hook.write_text(f"#!/bin/sh\necho {name} >> {shlex.quote(str(marker))}\nexit 1\n")
+                hook.chmod(0o755)
             (pathlib.Path(d) / "a.txt").write_text("a")
             old = {k: os.environ.get(k) for k in env if k.startswith("GIT_")}
             os.environ.update({k: v for k, v in env.items() if k.startswith("GIT_")})
@@ -186,6 +189,7 @@ class Git(unittest.TestCase):
                 for k, v in old.items():
                     os.environ.pop(k) if v is None else os.environ.__setitem__(k, v)
             self.assertTrue(sha)
+            self.assertFalse(marker.exists(), marker.exists() and marker.read_text())
             self.assertEqual(tandem.git(d, "log", "-1", "--format=%s"), "tandem(claude): t turn 1 - add a.txt")
 
     def test_git_error_says_what_failed(self):
@@ -491,7 +495,7 @@ class ListRuns(unittest.TestCase):
                 self.assertEqual([r["id"] for r in rows], ["campaign-b", "c", "a"])
                 self.assertEqual((rows[0]["outcome"], rows[0]["turns"]), ("campaign, 2 goals", 5))
                 self.assertEqual((rows[2]["outcome"], rows[2]["turns"]), ("done", 3))
-                self.assertEqual(rows[1]["outcome"], "running or interrupted")
+                self.assertEqual(rows[1]["outcome"], "interrupted")  # no live lock
                 self.assertEqual(len(tandem.list_runs(1)), 1)
 
 
@@ -1062,6 +1066,15 @@ class Budget(unittest.TestCase):
             code, out, _ = self.invoke("-p", "Work", "--output-format", "json", "--max-cost", "1")
         self.assertEqual((code, json.loads(out)["turn_count"], json.loads(out)["cost_usd"]), (6, 1, 2.0))
 
+    def test_reply_without_a_result_still_counts_its_cost(self):
+        # A paid reply with no structured output errors the turn, but the money was spent.
+        with mock.patch.object(tandem, "call_agent", return_value=(None, .2)):
+            code, out, _ = self.invoke("-p", "Work", "--output-format", "json", "--max-cost", ".1")
+        result = json.loads(out)
+        self.assertEqual((code, result["outcome"], result["turn_count"], result["cost_usd"]),
+                         (6, "over_budget", 1, .2))
+        self.assertEqual(result["turns"][0]["status"], "error")
+
     def test_zero_negative_or_bad_cap_is_a_usage_error(self):
         for value in ("0", "-1", "abc", "nan", "inf"):
             with self.subTest(value=value):
@@ -1237,7 +1250,7 @@ class Budget(unittest.TestCase):
             self.assertAlmostEqual(cost, .8)
             self.assertEqual(calls, [1.0, .7, .4])
             calls.clear()
-            failing = lambda *a: (_ for _ in ()).throw(type("E", (RuntimeError,), {"cost": .3})("x 503"))
+            failing = lambda *a: (_ for _ in ()).throw(type("E", (RuntimeError,), {"cost": .3})("API Error: 503"))
             with mock.patch.dict(tandem.RUNNERS, claude=failing), self.assertRaises(RuntimeError) as caught:
                 tandem.call_agent("claude", {}, None, "p", None, None, "status", False)
         self.assertAlmostEqual(caught.exception.cost, .3 * (tandem.MAX_TRANSIENT_RETRIES + 1))
@@ -1926,7 +1939,7 @@ class Interactive(unittest.TestCase):
             (run / "STOP").write_text("stop")
             for stop, kept in ((run / "STOP", False), (camp / "STOP", True)):
                 (run / "state.json").write_text(json.dumps({"turn": 3, "max_turns": 9, "stop_file": str(stop)}))
-                with mock.patch.object(tandem, "loop") as loop:
+                with mock.patch.object(tandem, "_loop") as loop:
                     tandem.cmd_resume(argparse.Namespace(run=str(run), more_turns=None))
                 loop.assert_called_once()
                 self.assertEqual(stop.exists(), kept)
@@ -3329,7 +3342,7 @@ class SessionLook(unittest.TestCase):
             with tempfile.TemporaryDirectory() as d, mock.patch.object(tandem, "RUNS", pathlib.Path(d)), \
                     mock.patch.object(tandem, "require_repo", return_value=pathlib.Path(d)), \
                     mock.patch.object(tandem, "config_from", return_value={}), \
-                    mock.patch.object(tandem, "create_run", side_effect=lambda path, *a: path), \
+                    mock.patch.object(tandem, "create_run", side_effect=lambda path, *a, **k: path), \
                     mock.patch.dict(tandem.CURRENT):
                 rows = self.lines(console, lambda: tandem.prepare_run(args))
             self.assertEqual(any("talk to the agents" in r for r in rows), expected)
@@ -3557,7 +3570,6 @@ class Children(unittest.TestCase):
 
     @unittest.skipUnless(os.name == "posix", "needs sh")
     def test_timeout_holds_while_following_a_wrapper_that_keeps_the_pipe(self):
-        # Outside the session there is no group: killing the wrapper leaves its program on the pipe.
         pid_file = self.dir / "program"
         cmd = ["sh", "-c", f"sleep 6 & echo $! > {shlex.quote(str(pid_file))}; wait"]
         start = time.monotonic()
@@ -3567,6 +3579,24 @@ class Children(unittest.TestCase):
         self.assertFalse(tandem.CHILDREN)
         with contextlib.suppress(ProcessLookupError, ValueError):
             os.kill(int(pid_file.read_text()), signal.SIGKILL)
+
+    @unittest.skipUnless(hasattr(os, "killpg"), "process groups are POSIX")
+    def test_timeout_outside_the_session_kills_the_tools_too(self):
+        # `start`, -p, resume and campaigns: no CHILD_POPEN, and still the agent's tools must not
+        # outlive its turn and keep editing the worktree.
+        for on_line in (None, lambda stream, line: None):
+            with self.subTest(follow=bool(on_line)):
+                pid_file = self.dir / "tool"
+                pid_file.unlink(missing_ok=True)
+                cmd = ["sh", "-c", f"sleep 30 & echo $! > {shlex.quote(str(pid_file))}; wait"]
+                self.assertEqual(tandem.CHILD_POPEN, {})
+                with self.assertRaises(subprocess.TimeoutExpired):
+                    tandem.run_child(cmd, input="prompt", timeout=1, on_line=on_line)
+                try:
+                    self.assertTrue(self.wait_gone(int(pid_file.read_text())))
+                finally:
+                    with contextlib.suppress(ProcessLookupError, ValueError):
+                        os.kill(int(pid_file.read_text()), signal.SIGKILL)
 
     @unittest.skipUnless(hasattr(os, "killpg"), "process groups are POSIX")
     def test_an_agent_that_exits_is_done_although_a_tool_it_left_holds_the_pipe(self):
@@ -4370,6 +4400,594 @@ class Activity(unittest.TestCase):
             os.environ.pop("TMUX", None)
             self.assertFalse(tandem.open_watch_pane(cmd))
         run.assert_not_called()
+
+
+class ReviewerMode(unittest.TestCase):
+    """--codex-role reviewer: Codex's done closes the goal only over work Claude called done."""
+    setUp = Headless.setUp
+    run_dir_with = Tuning.run_dir_with
+
+    def play(self, script, first="claude"):
+        """Each turn of script is (status, writes a file); returns the saved state and the agents seen."""
+        run_dir = self.run_dir_with(codex_role="reviewer")
+        state = tandem.load(run_dir)
+        state.update(next=first, max_turns=len(script))
+        tandem.save(run_dir, state)
+        turns, seen = iter(script), []
+
+        def agent(name, cfg, worktree, *rest):
+            seen.append(name)
+            status, writes = next(turns)
+            if writes:
+                (pathlib.Path(worktree) / f"turn-{len(seen)}.txt").write_text(name)
+            if status == "error":
+                raise RuntimeError("exit 1: crashed")
+            return {"status": status, "summary": f"{name} {status}"}, 0
+
+        with mock.patch.object(tandem, "call_agent", side_effect=agent), mock.patch.object(tandem, "log"):
+            tandem.loop(run_dir)
+        return tandem.load(run_dir), seen
+
+    def test_codex_approving_what_claude_called_done_closes_the_goal(self):
+        state, seen = self.play([("continue", True), ("done", True), ("done", False)])
+        self.assertEqual(seen, ["claude", "claude", "codex"])
+        self.assertEqual(state["outcome"], "done")
+        self.assertTrue(state["outcome_message"].startswith("Both agents agree"))
+        self.assertNotIn("needs_review", state)
+
+    def test_codex_first_cannot_close_an_empty_diff(self):
+        state, seen = self.play([("done", False)], first="codex")
+        self.assertEqual((seen, state["outcome"]), (["codex"], "max_turns"))
+
+    def test_codex_cannot_close_a_build_cut_short_by_an_error(self):
+        state, seen = self.play([("continue", True), ("error", False), ("done", False)])
+        self.assertEqual((seen, state["outcome"]), (["claude", "claude", "codex"], "max_turns"))
+
+    def test_a_fix_after_claude_said_done_needs_claude_again(self):
+        state, seen = self.play([("done", True), ("continue", True), ("done", False), ("done", False)])
+        self.assertEqual(seen, ["claude", "codex", "claude", "codex"])
+        self.assertEqual(state["outcome"], "done")
+        self.assertEqual(len(state["history"]), 4)
+
+    def test_codex_alone_is_solo_and_needs_review(self):
+        with mock.patch.object(tandem, "log"):
+            tandem.mark_unavailable("claude", datetime.datetime.now() + datetime.timedelta(hours=3))
+        state, seen = self.play([("continue", True), ("done", False)])
+        self.assertEqual((seen, state["outcome"]), (["codex", "codex"], "done"))
+        self.assertTrue(state["needs_review"])
+        self.assertIn("Codex alone", state["outcome_message"])
+
+    def test_reviewer_turns_are_writable(self):
+        # The code was already writable when the rulebook promised read-only reviewers, so check
+        # the documented contract too: exercising the runner alone would miss that regression.
+        rulebook = " ".join((ROOT / "CLAUDE.md").read_text().split())
+        self.assertIn("Every loop turn is writable, reviewer turns included", rulebook)
+        run_dir = self.run_dir_with(codex_role="reviewer")
+        state = tandem.load(run_dir)
+        state.update(next="codex", max_turns=1)
+        tandem.save(run_dir, state)
+        seen = []
+
+        def agent(name, cfg, worktree, prompt, out_base, schema, key, readonly, *rest, **kw):
+            seen.append((name, readonly))
+            return {"status": "continue", "summary": "s"}, 0
+
+        with mock.patch.object(tandem, "call_agent", side_effect=agent), mock.patch.object(tandem, "log"):
+            tandem.loop(run_dir)
+        self.assertEqual(seen, [("codex", False)])
+        schema = run_dir / "schema.json"
+        schema.write_text("{}")
+        for readonly, sandbox in ((False, "workspace-write"), (True, "read-only")):
+            with mock.patch.object(tandem, "run_child", return_value=subprocess.CompletedProcess([], 0, "", "")) as run:
+                tandem.run_codex(state["config"], str(run_dir), "goal", run_dir / "x", schema, "status", readonly)
+            cmd = run.call_args[0][0]
+            self.assertEqual(cmd[cmd.index("-s") + 1], sandbox)
+
+
+class RunLock(unittest.TestCase):
+    """One process per run: a second loop would lose turns and cost from state.json."""
+    setUp = Headless.setUp
+    run_dir_with = Tuning.run_dir_with
+
+    def test_second_loop_cannot_enter_before_the_first_publishes_its_pid(self):
+        run_dir = self.run_dir_with()
+        pid = os.getpid()
+        checked = []
+
+        def before_pid():
+            if not checked:
+                checked.append(True)
+                with self.assertRaises(SystemExit):
+                    tandem.loop(run_dir)
+            return pid
+
+        with mock.patch.object(tandem.os, "getpid", side_effect=before_pid), \
+                mock.patch.object(tandem, "_loop") as run:
+            tandem.loop(run_dir)
+        run.assert_called_once_with(run_dir)
+
+    def test_resume_holds_lock_before_reading_or_changing_state(self):
+        run_dir = self.run_dir_with()
+        original_load = tandem.load
+        checked = []
+
+        def load(target):
+            if not checked:
+                checked.append(True)
+                with self.assertRaises(SystemExit):
+                    tandem.loop(run_dir)
+            return original_load(target)
+
+        with mock.patch.object(tandem, "load", side_effect=load), \
+                mock.patch.object(tandem, "_loop") as run:
+            tandem.cmd_resume(argparse.Namespace(run=str(run_dir), more_turns=5))
+        run.assert_called_once_with(run_dir)
+        self.assertEqual(original_load(run_dir)["max_turns"], 5)
+
+    def test_session_resume_preserves_stop_until_it_owns_the_run(self):
+        run_dir = self.run_dir_with()
+        stop = run_dir / "STOP"
+        session = tandem.Session(argparse.Namespace(), tandem.Console(fancy=False))
+        for legacy in (False, True):
+            with self.subTest(legacy=legacy):
+                if legacy:
+                    state = tandem.load(run_dir)
+                    del state["stop_file"]
+                    tandem.save(run_dir, state)
+                stop.write_text("stop")
+                with mock.patch.object(session, "launch") as launch:
+                    session.resume(run_dir, "")
+                self.assertTrue(stop.exists())
+                with mock.patch.object(tandem, "_loop") as run:
+                    launch.call_args[0][1]()
+                run.assert_called_once_with(run_dir)
+                self.assertFalse(stop.exists())
+
+    def test_process_lock_refuses_a_peer_and_releases_after_a_crash(self):
+        run_dir = self.run_dir_with()
+        script = """
+import importlib.util, pathlib, sys, time
+spec = importlib.util.spec_from_file_location("tandem", sys.argv[1])
+tandem = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(tandem)
+lock = tandem.hold_lock(pathlib.Path(sys.argv[2]), "run")
+print("ready", flush=True)
+time.sleep(30)
+"""
+        with subprocess.Popen([sys.executable, "-c", script, tandem.__file__, str(run_dir)],
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) as proc:
+            try:
+                self.assertEqual(proc.stdout.readline(), "ready\n")
+                with mock.patch.object(tandem, "_loop") as run:
+                    with self.assertRaises(SystemExit):
+                        tandem.loop(run_dir)
+                    run.assert_not_called()
+            finally:
+                proc.kill()
+                proc.wait()
+        # A killed owner cannot unlink its PID file; the next process must still recover the run.
+        with mock.patch.object(tandem, "_loop") as run:
+            tandem.loop(run_dir)
+        run.assert_called_once_with(run_dir)
+        self.assertIsNone(tandem.lock_owner(run_dir))
+
+    def other_process(self):
+        proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+        self.addCleanup(proc.wait)
+        self.addCleanup(proc.kill)
+        return proc.pid
+
+    def test_a_second_loop_or_resume_is_refused_while_one_runs(self):
+        run_dir = self.run_dir_with()
+        refused = []
+
+        def agent(name, cfg, *rest):
+            if not refused:
+                before = (run_dir / "state.json").read_text()
+                for second in (lambda: tandem.loop(run_dir),
+                               lambda: tandem.cmd_resume(argparse.Namespace(run=str(run_dir), more_turns=5))):
+                    with self.assertRaises(SystemExit) as exit:
+                        second()
+                    refused.append(str(exit.exception.code))
+                self.assertEqual((run_dir / "state.json").read_text(), before)
+                self.assertEqual(tandem.list_runs()[0]["outcome"], "running")
+            return {"status": "continue"}, .1
+
+        with mock.patch.object(tandem, "call_agent", side_effect=agent), mock.patch.object(tandem, "log"):
+            tandem.loop(run_dir)
+        self.assertEqual(refused, [f"run already running (pid {os.getpid()}); stop it first"] * 2)
+        state = tandem.load(run_dir)
+        self.assertEqual((len(state["history"]), round(state["cost_usd"], 2)), (3, .3))
+        self.assertFalse((run_dir / ".lock").exists())
+        self.assertEqual(tandem.list_runs()[0]["outcome"], "max_turns")
+
+    def test_lock_of_another_live_process_is_respected_and_a_dead_ones_is_taken(self):
+        run_dir = self.run_dir_with()
+        (run_dir / ".lock").write_text(str(self.other_process()))
+        with mock.patch.object(tandem, "call_agent") as call, self.assertRaises(SystemExit):
+            tandem.loop(run_dir)
+        call.assert_not_called()
+        dead = subprocess.Popen([sys.executable, "-c", ""])
+        dead.wait()
+        (run_dir / ".lock").write_text(str(dead.pid))
+        self.assertEqual(tandem.list_runs()[0]["outcome"], "interrupted")
+        with mock.patch.object(tandem, "call_agent", return_value=({"status": "continue"}, 0)), \
+                mock.patch.object(tandem, "log"):
+            tandem.loop(run_dir)
+        self.assertEqual(tandem.load(run_dir)["outcome"], "max_turns")
+
+
+class StopFile(unittest.TestCase):
+    """/stop writes <run>/STOP; every run obeys it, however it was started."""
+    setUp = Headless.setUp
+    invoke = Headless.invoke
+    run_dir_with = Tuning.run_dir_with
+
+    def test_a_headless_run_stops_after_the_turn(self):
+        def agent(name, cfg, *rest):
+            (rest[-1] / "STOP").write_text("now")  # rest[-1] is call_agent's run_dir
+            return {"status": "continue"}, 0
+
+        with mock.patch.object(tandem, "call_agent", side_effect=agent):
+            code, out, err = self.invoke("-p", "Work", "--output-format", "json", "--max-turns", "5")
+        self.assertEqual((code, json.loads(out)["outcome"], json.loads(out)["turn_count"]), (4, "stopped", 1), err)
+
+    def test_a_run_from_before_0_1_2_without_a_stop_file_stops_too(self):
+        run_dir = self.run_dir_with()
+        state = tandem.load(run_dir)
+        del state["stop_file"]
+        tandem.save(run_dir, state)
+        (run_dir / "STOP").write_text("now")
+        with mock.patch.object(tandem, "call_agent") as call, mock.patch.object(tandem, "log"):
+            tandem.loop(run_dir)
+        call.assert_not_called()
+        self.assertEqual(tandem.load(run_dir)["outcome"], "stopped")
+
+
+class Classification(unittest.TestCase):
+    """Only the CLI's own error decides limit or retry; the agent's output (test names, app errors) never does."""
+    setUp = Headless.setUp
+
+    def call(self, agent, proc):
+        out = self.base / "out"
+        out.mkdir(exist_ok=True)
+        schema = out / "schema.json"
+        schema.write_text("{}")
+        cfg = {"timeout": 5, "claude_permission_mode": "acceptEdits"}
+        with mock.patch.object(tandem, "run_child", return_value=proc) as child, mock.patch.object(tandem, "log"), \
+                mock.patch.object(tandem, "wait_until", return_value=True), self.assertRaises(RuntimeError):
+            tandem.call_agent(agent, cfg, str(self.repo), "p", out / agent, schema, "status", False)
+        return child.call_count
+
+    def test_codex_command_output_neither_pauses_nor_retries(self):
+        log = ("exec pytest\nFAILED tests/test_api.py::test_rate_limit - AssertionError: rate limit not applied\n"
+               "collected 1503 items; 2 failed in 502.31s\n")
+        self.assertEqual(self.call("codex", subprocess.CompletedProcess([], 1, "", log)), 1)
+        self.assertIsNone(tandem.unavailable_until("codex"))
+        self.assertEqual(self.call("codex", subprocess.CompletedProcess(
+            [], 1, "", log + "ERROR: You've hit your usage limit. Try again at 5:45 PM.\n")), 1)
+        self.assertIsNotNone(tandem.unavailable_until("codex"))
+
+    def test_claude_tool_results_neither_pause_nor_retry(self):
+        event = json.dumps({"type": "user", "message": {"content": [
+            {"type": "tool_result", "content": "HTTPError: 503 Service Unavailable; rate limit not applied"}]}})
+        start = json.dumps({"type": "system", "subtype": "init"})
+        self.assertEqual(self.call("claude", subprocess.CompletedProcess([], 1, f"{start}\n{event}\n", "")), 1)
+        self.assertIsNone(tandem.unavailable_until("claude"))
+
+    def test_status_codes_count_only_when_they_are_the_api_s(self):
+        for text in ("collected 1503 items; 2 failed in 502.31s",
+                     "HTTPError: 503 Service Unavailable from http://localhost:8000"):
+            self.assertEqual(tandem.classify(text), "other", text)
+        for text in ("API Error: 529 overloaded_error", "unexpected status 503 from the API",
+                     "HTTP/1.1 502 Bad Gateway", "status code: 504"):
+            self.assertEqual(tandem.classify(text), "transient", text)
+
+
+class RunIds(unittest.TestCase):
+    """Ids are stamped to the second; a second run with the same name in that second gets a suffix."""
+    setUp = Headless.setUp
+
+    def test_same_second_same_name_gets_a_suffix(self):
+        class Frozen(datetime.datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return cls(2026, 10, 24, 12, 0, 0)
+
+        clock = mock.Mock(wraps=datetime, datetime=Frozen, timedelta=datetime.timedelta)
+        args = tandem.build_parser().parse_args(["start", "--repo", str(self.repo), "--goal", "Build the thing"])
+        with mock.patch.object(tandem, "datetime", clock), mock.patch.object(tandem, "log"), \
+                mock.patch.dict(tandem.CURRENT):
+            first, second = tandem.prepare_run(args), tandem.prepare_run(args)
+        self.assertEqual(second.name, first.name + "-2")
+        self.assertNotEqual(tandem.load(first)["branch"], tandem.load(second)["branch"])
+        self.assertEqual(tandem.claim_dir(self.runs / "x"), self.runs / "x")
+        self.assertEqual(tandem.claim_dir(self.runs / "x"), self.runs / "x-2")
+
+
+class CampaignRecovery(unittest.TestCase):
+    """Campaign bookkeeping that a crash or a solo closure used to get wrong."""
+    setUp = Headless.setUp
+    run_dir_with = Tuning.run_dir_with
+
+    def campaign(self, queue=(), **extra):
+        self.run_dir_with()  # patches HOME
+        camp_dir = self.runs / "campaign-x"
+        camp_dir.mkdir(parents=True)
+        (camp_dir / "inbox.md").write_text("")
+        worktree = self.base / "camp-work"
+        tandem.git(self.repo, "worktree", "add", "-q", "-b", "camp", str(worktree), "HEAD")
+        cfg = {"timeout": 5, "claude_permission_mode": "acceptEdits", "codex_role": "peer", "check": None,
+               **{k: None for k in tandem.TUNABLE}}
+        camp = {"id": "x", "config": cfg, "max_turns": 4, "push": False, "runs": [], "blockers": [],
+                "no_progress": 0, "next_planner": "claude", "cost_usd": 0.0, "current": None,
+                "repo": str(self.repo), "worktree": str(worktree), "branch": "camp",
+                "queue": [{"goal": "g", "name": n, "first": "claude"} for n in queue], **extra}
+        tandem.write_json(camp_dir / "campaign.json", camp)
+        return camp_dir
+
+    def read(self, camp_dir):
+        return json.loads((camp_dir / "campaign.json").read_text())
+
+    def test_goal_directory_left_by_a_crash_is_reused(self):
+        camp_dir = self.campaign(["one"])
+        camp = self.read(camp_dir)
+        # What a crash right after create_run() leaves: the directory, but campaign.json unchanged.
+        with mock.patch.object(tandem, "log"):
+            tandem.create_run(camp_dir / "01-one", self.repo, "g", "one", dict(camp["config"]), 4, "claude",
+                              worktree=camp["worktree"], branch="camp")
+        done = mock.Mock(return_value=({"status": "done", "summary": "ok"}, 0))
+        finished = mock.Mock(return_value={"finished": True, "reason": "all done"})
+        with mock.patch.object(tandem, "call_agent", done), mock.patch.object(tandem, "plan_next", finished), \
+                mock.patch.object(tandem, "log"):
+            tandem._campaign_loop(camp_dir)
+        camp = self.read(camp_dir)
+        self.assertEqual([(r["name"], r["outcome"]) for r in camp["runs"]], [("one", "done")])
+        self.assertEqual(tandem.load(camp_dir / "01-one")["outcome"], "done")
+        self.assertEqual((camp_dir / "01-one" / "transcript.md").read_text().count("# Tandem run"), 1)
+
+    def test_goal_that_finished_before_a_crash_is_recorded_not_run_again(self):
+        camp_dir = self.campaign()
+        camp = self.read(camp_dir)
+        with mock.patch.object(tandem, "log"):
+            run_dir = tandem.create_run(camp_dir / "01-one", self.repo, "g", "one", dict(camp["config"]), 2,
+                                        "claude", worktree=camp["worktree"], branch="camp",
+                                        extra={"stop_file": str(camp_dir / "STOP")})
+        state = tandem.load(run_dir)
+        state.update(turn=3, outcome="done", outcome_message="Both agents agree the goal is met.",
+                     history=[{"turn": n, "agent": a, "status": "done", "summary": "ok", "handoff": "", "commit": None}
+                              for n, a in ((1, "claude"), (2, "codex"))])
+        tandem.save(run_dir, state)
+        camp["current"] = str(run_dir)
+        tandem.write_json(camp_dir / "campaign.json", camp)
+        finished = mock.Mock(return_value={"finished": True, "reason": "all done"})
+        with mock.patch.object(tandem, "call_agent", return_value=({"status": "continue"}, 0)) as call, \
+                mock.patch.object(tandem, "plan_next", finished), mock.patch.object(tandem, "log"):
+            tandem.prepare_campaign_resume(argparse.Namespace(
+                dir=str(camp_dir), push=None, codex_effort=None, codex_role=None, seed_review=None, max_cost=None))
+            tandem._campaign_loop(camp_dir)
+        call.assert_not_called()
+        self.assertEqual([(r["name"], r["outcome"], r["turns"]) for r in self.read(camp_dir)["runs"]],
+                         [("one", "done", 2)])
+        self.assertEqual(tandem.load(run_dir)["outcome"], "done")
+
+    def test_work_codex_closed_alone_is_reviewed_by_claude(self):
+        camp_dir = self.campaign(["one"])
+        with mock.patch.object(tandem, "log"):
+            tandem.mark_unavailable("claude", datetime.datetime.now() + datetime.timedelta(hours=3))
+        turns = iter([("continue", True), ("done", False)])
+
+        def agent(name, cfg, worktree, *rest):
+            status, writes = next(turns)
+            if writes:
+                (pathlib.Path(worktree) / "codex.txt").write_text(name)
+            return {"status": status, "summary": f"{name} {status}"}, 0
+
+        lines = []
+        finished = mock.Mock(return_value={"finished": True, "reason": "all done"})
+        with mock.patch.object(tandem, "call_agent", side_effect=agent), \
+                mock.patch.object(tandem, "plan_next", finished), \
+                mock.patch.object(tandem, "log", side_effect=lambda msg, *a, **k: lines.append(msg)):
+            tandem._campaign_loop(camp_dir)
+        camp = self.read(camp_dir)
+        self.assertEqual([i["by"] for i in camp["review_backlog"]], ["codex"])
+        self.assertIn("one closed without Claude Code; added to the review backlog (1 items)", lines)
+        # Claude is still away, and Codex must not review what it wrote alone.
+        self.assertIsNone(tandem.backlog_reviewer(camp))
+        tandem.write_json(tandem.AVAILABILITY, {})
+        camp["review_backlog"].append({"name": "seeded", "from": "a" * 40, "to": "b" * 40})  # Claude's, as before
+        self.assertEqual(tandem.backlog_reviewer(camp), "codex")
+        item = tandem.review_item(camp, "codex")
+        self.assertEqual(item["first"], "codex")
+        self.assertIn("seeded", item["goal"])
+        self.assertEqual([i["by"] for i in camp["review_backlog"]], ["codex"])
+        item = tandem.review_item(camp, tandem.backlog_reviewer(camp))
+        self.assertEqual((item["first"], item["name"], camp["review_backlog"]), ("claude", "claude-review-backlog", []))
+        self.assertTrue(item["goal"].startswith("Independent review by Claude Code of work Codex finished"))
+
+    def test_planner_check_is_shown_whole_before_the_goal_runs(self):
+        camp_dir = self.campaign()
+        plan = {"finished": False, "goal": "Next", "name": "next", "reason": "r", "check": "make test"}
+        calls = []
+
+        def agent(name, cfg, *rest):
+            (camp_dir / "STOP").write_text("now")
+            return {"status": "continue", "summary": "s"}, 0
+
+        with mock.patch.object(tandem, "call_agent", side_effect=agent), \
+                mock.patch.object(tandem, "plan_next", return_value=plan), \
+                mock.patch.object(tandem, "log", side_effect=lambda msg, *a, **k: calls.append((msg, k))):
+            tandem._campaign_loop(camp_dir)
+        shown = [k for msg, k in calls if "outside any sandbox" in msg and "make test" in msg]
+        self.assertEqual(shown, [{"whole": True}])
+
+    def test_planner_check_queued_at_the_cost_cap_is_shown_when_resumed(self):
+        camp_dir = self.campaign()
+        camp = self.read(camp_dir)
+        camp["config"]["max_cost"] = 1.0
+        tandem.write_json(camp_dir / "campaign.json", camp)
+
+        def plan_next(camp_dir, camp):
+            camp["cost_usd"] += 2.0  # the planner's own call crosses the cap
+            return {"finished": False, "goal": "Next", "name": "next", "reason": "r", "check": "make test"}
+
+        def agent(name, cfg, *rest):
+            (camp_dir / "STOP").write_text("now")
+            return {"status": "continue", "summary": "s"}, 0
+
+        calls = []
+        with mock.patch.object(tandem, "call_agent", side_effect=agent) as call, \
+                mock.patch.object(tandem, "plan_next", side_effect=plan_next), \
+                mock.patch.object(tandem, "log", side_effect=lambda msg, *a, **k: calls.append((msg, k))):
+            tandem._campaign_loop(camp_dir)
+            camp = self.read(camp_dir)
+            self.assertEqual((camp["outcome"], [i["name"] for i in camp["queue"]]), ("over_budget", ["next"]))
+            call.assert_not_called()
+            camp["config"]["max_cost"] = 10.0
+            tandem.write_json(camp_dir / "campaign.json", camp)
+            tandem._campaign_loop(camp_dir)
+        call.assert_called_once()
+        shown = [k for msg, k in calls if "outside any sandbox" in msg and "make test" in msg]
+        self.assertEqual(shown, [{"whole": True}])
+
+
+class CampaignSetupLocks(unittest.TestCase):
+    setUp = Headless.setUp
+    run_dir_with = Tuning.run_dir_with
+    campaign = CampaignRecovery.campaign
+
+    def resume_args(self, camp_dir):
+        return tandem.build_parser().parse_args(["campaign", "resume", str(camp_dir), "--max-cost", "9"])
+
+    def adopt_args(self, run_dir):
+        return tandem.build_parser().parse_args(["campaign", "start", "--adopt", str(run_dir)])
+
+    def assert_refused_unchanged(self, action, paths):
+        before = [p.read_bytes() if p.exists() else None for p in paths]
+        with mock.patch.object(tandem, "log"), self.assertRaises(SystemExit):
+            action()
+        self.assertEqual([p.read_bytes() if p.exists() else None for p in paths], before)
+
+    def test_resume_refuses_campaign_before_its_pid_is_published(self):
+        camp_dir = self.campaign()
+        (camp_dir / "STOP").write_text("stop")
+        guard = tandem.hold_lock(camp_dir, "campaign")
+        try:
+            # Another process acquired the OS lock but has not yet published its PID.
+            (camp_dir / ".lock").unlink()
+            self.assert_refused_unchanged(lambda: tandem.prepare_campaign_resume(self.resume_args(camp_dir)),
+                                         [camp_dir / n for n in ("campaign.json", "STOP", "tuning.json")])
+        finally:
+            tandem.release_lock(camp_dir, guard)
+
+    def test_resume_refuses_active_current_run_before_any_writes(self):
+        camp_dir = self.campaign(current=str(self.runs / "r1"))
+        run_dir = self.runs / "r1"
+        (camp_dir / "STOP").write_text("stop")
+        guard = tandem.hold_lock(run_dir, "run")
+        try:
+            self.assert_refused_unchanged(lambda: tandem.prepare_campaign_resume(self.resume_args(camp_dir)),
+                                         [camp_dir / n for n in ("campaign.json", "STOP", "tuning.json")]
+                                         + [run_dir / "state.json"])
+            self.assertFalse((camp_dir / ".lock").exists())
+        finally:
+            tandem.release_lock(run_dir, guard)
+
+    def test_adopt_refuses_active_run_before_changing_its_state(self):
+        run_dir = self.run_dir_with()
+        guard = tandem.hold_lock(run_dir, "run")
+        try:
+            self.assert_refused_unchanged(lambda: tandem.prepare_campaign_start(self.adopt_args(run_dir)),
+                                         [run_dir / "state.json"])
+        finally:
+            tandem.release_lock(run_dir, guard)
+
+    def test_resume_holds_campaign_and_run_locks_until_state_is_saved(self):
+        camp_dir = self.campaign(current=str(self.runs / "r1"))
+        run_dir = self.runs / "r1"
+        save = tandem.save
+
+        def saving(target, state):
+            self.assertEqual(tandem.lock_owner(camp_dir), os.getpid())
+            self.assertEqual(tandem.lock_owner(run_dir), os.getpid())
+            save(target, state)
+
+        with mock.patch.object(tandem, "save", side_effect=saving), mock.patch.object(tandem, "log"):
+            tandem.prepare_campaign_resume(self.resume_args(camp_dir))
+        self.assertEqual(tandem.load(run_dir)["config"]["max_cost"], 9)
+        self.assertFalse((camp_dir / ".lock").exists())
+        self.assertFalse((run_dir / ".lock").exists())
+
+    def test_adopt_holds_both_locks_through_campaign_save_and_refuses_readoption(self):
+        run_dir = self.run_dir_with()
+        write_json = tandem.write_json
+
+        def writing(path, value):
+            if path.name == "campaign.json":
+                self.assertEqual(tandem.lock_owner(path.parent), os.getpid())
+                self.assertEqual(tandem.lock_owner(run_dir), os.getpid())
+            write_json(path, value)
+
+        with mock.patch.object(tandem, "write_json", side_effect=writing), mock.patch.object(tandem, "log"):
+            camp_dir = tandem.prepare_campaign_start(self.adopt_args(run_dir))
+        self.assertFalse((camp_dir / ".lock").exists())
+        self.assertFalse((run_dir / ".lock").exists())
+        self.assert_refused_unchanged(lambda: tandem.prepare_campaign_start(self.adopt_args(run_dir)),
+                                     [run_dir / "state.json", camp_dir / "campaign.json"])
+
+
+class Inbox(unittest.TestCase):
+    """Campaign notes and messages from other terminals."""
+
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.dir = pathlib.Path(temp.name)
+
+    def test_cleared_message_leaves_the_planner_notes(self):
+        (self.dir / "campaign.json").write_text("{}")
+        tandem.leave_message(self.dir, "do not build billing")
+        tandem.take_inbox([self.dir / "inbox.md"])  # consumed: stays a lasting note
+        tandem.leave_message(self.dir, "keep the API stable")
+        tandem.leave_message(self.dir, "do not build billing")
+        self.assertEqual(tandem.clear_queue(self.dir), 2)
+        notes = (self.dir / "notes.md").read_text()
+        self.assertEqual(notes.count("do not build billing"), 1)
+        self.assertNotIn("keep the API stable", notes)
+
+    def test_say_from_another_process_waits_for_the_inbox_to_be_taken(self):
+        inbox = self.dir / "inbox.md"
+        inbox.write_text("first\n\n")
+        (self.dir / "state.json").write_text("{}")
+        read_text, procs = pathlib.Path.read_text, []
+
+        def reading(path, *a, **k):
+            text = read_text(path, *a, **k)
+            if path == inbox and not procs:
+                # `tandem say` lands between the loop's read and its clear.
+                procs.append(subprocess.Popen([sys.executable, str(ROOT / "tandem.py"), "say", str(self.dir), "late"],
+                                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
+                with contextlib.suppress(subprocess.TimeoutExpired):
+                    procs[0].wait(timeout=2)
+            return text
+
+        with mock.patch.object(pathlib.Path, "read_text", reading):
+            self.assertEqual(tandem.take_inbox([inbox]), "first")
+        self.assertEqual(procs[0].wait(timeout=10), 0)
+        self.assertEqual(tandem.queued(self.dir), ["late"])
+
+
+class SplitUtf8(unittest.TestCase):
+    def test_a_character_split_across_reads_comes_back_whole(self):
+        r, w = os.pipe()
+        self.addCleanup(os.close, r)
+        self.addCleanup(os.close, w)
+        os.write(w, "€".encode()[:2])
+        later = threading.Timer(0.1, lambda: os.write(w, "€".encode()[2:] + b"x"))
+        later.start()
+        self.addCleanup(later.join)
+        self.assertEqual(tandem.read_key(r), "€")
+        self.assertEqual(tandem.read_key(r), "x")
 
 
 if __name__ == "__main__":

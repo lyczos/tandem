@@ -50,6 +50,7 @@ before pointing it at real code.
 ## How a run works
 
 - Each run gets its own git worktree and branch, `tandem/<id>`.
+- Resume and campaign adoption refuse an active run before changing its state.
 - The agents alternate. tandem commits every turn; the agents never commit, push or switch
   branches. Each turn hands the other agent a note: what is left, and what it could not do.
 - A run ends `done`, `blocked` (the agents need you), out of turns, over the cost cap, or when
@@ -122,11 +123,12 @@ Progress goes to stderr; the result goes to stdout, as one JSON object with
 | `--max-cost USD` | stop before a turn that would start past this reported cost; Codex reports none |
 | `--claude-model`, `--codex-model`, `--claude-effort`, `--codex-effort` | models and effort; `/models` saves your defaults |
 | `--first codex` | let Codex take the first turn |
-| `--codex-role reviewer` | Claude builds, Codex only reviews |
+| `--codex-role reviewer` | Claude builds; Codex reviews and can make trivial fixes |
 | `--base BRANCH` | start from another branch |
 
 `tandem campaign start` chains goals on one branch and lets an agent pick the next one from the
 project's own plan. `tandem runs` lists past runs, and `tandem resume <id>` continues one.
+Only one process can drive a run at a time; resume refuses a run that is still running elsewhere.
 
 ## More
 

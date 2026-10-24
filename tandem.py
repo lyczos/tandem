@@ -11,6 +11,7 @@ import argparse
 import concurrent.futures
 import contextlib
 import datetime
+import errno
 import io
 import json
 import os
@@ -116,8 +117,10 @@ IMAGE_MARK = re.compile(r"\[image: ([^\]\n]+)\]")
 LIMIT_MARKERS = ("usage limit", "hit your limit", "limit reached", "rate limit", "quota exceeded",
                  "credit balance is too low")
 TRANSIENT_MARKERS = ("enotfound", "econnreset", "etimedout", "econnrefused", "can't reach the api",
-                     "overloaded", "stream disconnected", "error sending request", "internal server error",
-                     " 502", " 503", " 504", " 529")
+                     "overloaded", "stream disconnected", "error sending request", "internal server error")
+# Only a status code the CLI reports about its own request: "1503 items" or a 503 from the app under
+# test is not the API being down.
+TRANSIENT_STATUS = re.compile(r"\b(?:api error|status(?: code)?|http(?:/[\d.]+)?)[\s:=]*(?:502|503|504|529)\b")
 
 
 def run_path(arg):
@@ -143,8 +146,9 @@ def git(cwd, *args, check=True):
 
 
 # The interactive session sets start_new_session here, so a Ctrl+C at its prompt reaches neither a
-# turn in flight nor the check and git commands around it. Those children never get the terminal
-# on stdin either: a detached shell holding it hangs up the session's terminal when it exits.
+# turn in flight nor the check and git commands around it (run_child starts its own session anyway).
+# Those children never get the terminal on stdin either: a detached shell holding it hangs up the
+# session's terminal when it exits.
 CHILD_POPEN = {}
 # Agents and checks being waited on, so a session that is going away can stop them: an agent left
 # behind keeps editing the worktree with nobody to time it out or commit what it did.
@@ -158,11 +162,14 @@ def run_child(cmd, input=None, timeout=None, kind="agent", on_line=None, **kwarg
     """subprocess.run for the long calls (agents, the check), tracked in CHILDREN while they run.
 
     on_line(stream, line), when given, sees each line of stdout and stderr as it arrives."""
+    # Always in its own session, not only in the interactive one: the process then leads a group, and
+    # a timeout or SIGTERM kills the group, so a test run or dev server the agent started cannot keep
+    # writing to the worktree after its turn is committed. None of these read the terminal.
+    group = hasattr(os, "killpg")
     with subprocess.Popen(cmd, stdin=subprocess.PIPE if input is not None else subprocess.DEVNULL,
                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-                          **CHILD_POPEN, **kwargs) as proc:
-        # In its own session the process leads a group, and killing the group takes its tools along.
-        proc.tandem_group = bool(CHILD_POPEN.get("start_new_session")) and hasattr(os, "killpg")
+                          **dict(CHILD_POPEN, **({"start_new_session": True} if group else {})), **kwargs) as proc:
+        proc.tandem_group = group
         proc.tandem_kind = kind
         proc.tandem_done = False
         with CHILDREN_LOCK:
@@ -230,7 +237,7 @@ def follow_output(proc, input, timeout, on_line):
         reader.start()
     proc.wait(left())  # TimeoutExpired here: run_child stops the agent and its group
     # The agent has exited, so its reply is in the pipes. Anything still holding them is a tool it
-    # left running; in its own group it goes now, outside one it is left with the pipe it holds.
+    # left running; in its own group it goes now (on Windows, with no groups, it keeps the pipe).
     grace = time.monotonic() + PIPE_GRACE
     for reader in readers:
         reader.join(left(grace))
@@ -458,7 +465,7 @@ def classify(err):
     low = (err or "").lower()
     if any(m in low for m in LIMIT_MARKERS):
         return "limit"
-    if any(m in low for m in TRANSIENT_MARKERS):
+    if any(m in low for m in TRANSIENT_MARKERS) or TRANSIENT_STATUS.search(low):
         return "transient"
     return "other"
 
@@ -538,9 +545,12 @@ def call_agent(agent, cfg, worktree, prompt, out_base, schema, key, readonly, st
                 stop = TurnInterrupted("interrupted by the owner")
                 stop.cost = spent
                 raise stop from e
-            kind = classify(str(e))
+            # The runners set reason to the CLI's own error, without the agent's output: a failing
+            # test named test_rate_limit must not bench the agent machine-wide.
+            reason = getattr(e, "reason", str(e))
+            kind = classify(reason)
             if kind == "limit":
-                mark_unavailable(agent, parse_reset(str(e)))
+                mark_unavailable(agent, parse_reset(reason))
                 raise
             if kind != "transient" or attempt == MAX_TRANSIENT_RETRIES:
                 raise
@@ -935,6 +945,16 @@ def reviewer_mode(cfg):
     return cfg.get("codex_role") == "reviewer"
 
 
+def builder_said_done(history):
+    """Reviewer mode: Claude's latest turn that did not error said done, and nothing was committed
+    after it, so what the reviewer approves is exactly what the builder handed over."""
+    for i in range(len(history) - 1, -1, -1):
+        entry = history[i]
+        if entry["agent"] == "claude" and entry["status"] != "error":
+            return entry["status"] == "done" and not any(e.get("commit") for e in history[i + 1:])
+    return False
+
+
 def away_for_long(agent):
     """Away beyond a short wait: the other agent should not sit idle for it."""
     until = unavailable_until(agent)
@@ -1176,7 +1196,10 @@ def run_claude(cfg, worktree, prompt, out_base, schema, key, readonly):
     out_base.with_suffix(".json").write_text(json.dumps(payload) if payload else proc.stdout)
     out_base.with_suffix(".stderr").write_text(proc.stderr)
     if payload is None:
-        raise RuntimeError(f"exit {proc.returncode}, no JSON output: {tail(proc.stderr or proc.stdout)}")
+        err = RuntimeError(f"exit {proc.returncode}, no JSON output: {tail(proc.stderr or proc.stdout)}")
+        # Events on stdout carry tool results; only the CLI's own lines say why it failed.
+        err.reason = "\n".join([proc.stderr] + [l for l in proc.stdout.splitlines() if not l.startswith("{")])
+        raise err
     if payload.get("is_error"):
         err = RuntimeError(f"{payload.get('subtype')}: {tail(str(payload.get('result')))}")
         # A turn stopped by --max-budget-usd still spent money; --max-cost must count it.
@@ -1248,7 +1271,10 @@ def run_codex(cfg, worktree, prompt, out_base, schema, key, readonly):
     out_base.with_suffix(".log").write_text(proc.stdout + "\n--- stderr ---\n" + proc.stderr)
     if proc.returncode != 0:
         errors = [l for l in (proc.stderr + "\n" + proc.stdout).splitlines() if l.startswith("ERROR")]
-        raise RuntimeError(f"exit {proc.returncode}: {tail(errors[-1] if errors else proc.stderr or proc.stdout)}")
+        err = RuntimeError(f"exit {proc.returncode}: {tail(errors[-1] if errors else proc.stderr or proc.stdout)}")
+        # Without an ERROR line the log holds only the commands Codex ran and their output.
+        err.reason = errors[-1] if errors else ""
+        raise err
     return (parse_result(last.read_text() if last.exists() else proc.stdout, key), 0.0,
             codex_usage(proc.stdout + "\n" + proc.stderr))
 
@@ -1266,7 +1292,10 @@ def commit_turn(state, agent, turn, summary, failed):
     title = (summary or "no summary").splitlines()[0][:72]
     label = f"{state['name']} " if state.get("name") else ""
     msg = f"tandem({agent}): {label}turn {turn}{' (failed)' if failed else ''} - {title}"
-    git(work, "commit", "-q", "--no-verify", "-m", msg)
+    # --no-verify skips pre-commit and commit-msg only; prepare-commit-msg and post-commit would still
+    # run, and one that rejects half-done work or waits for input would stop the run. Pointing
+    # core.hooksPath at a path with no hooks in it turns them all off for this one command.
+    git(work, "-c", f"core.hooksPath={os.devnull}", "commit", "-q", "--no-verify", "-m", msg)
     return git(work, "rev-parse", "--short", "HEAD")
 
 
@@ -1475,10 +1504,32 @@ def run_check(state):
 INBOX_LOCK = threading.Lock()
 
 
+@contextlib.contextmanager
+def inbox_lock(directory):
+    """INBOX_LOCK, plus an OS lock for `tandem say` from another terminal: a message appended between
+    the loop's read and its clear would be erased unread."""
+    with INBOX_LOCK, open(pathlib.Path(directory) / ".inbox.lock", "a+b") as f:
+        if os.name == "nt":
+            import msvcrt
+            f.seek(0)
+            msvcrt.locking(f.fileno(), msvcrt.LK_LOCK, 1)  # retries for 10 s, then raises
+            try:
+                yield
+            finally:
+                f.seek(0)
+                msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(f, fcntl.LOCK_EX)
+            yield  # closing the file releases the lock
+
+
 def take_inbox(paths):
     msgs = []
-    with INBOX_LOCK:
-        for p in map(pathlib.Path, paths):
+    for p in map(pathlib.Path, paths):
+        if not p.parent.is_dir():
+            continue
+        with inbox_lock(p.parent):
             text = p.read_text().strip() if p.exists() else ""
             if text:
                 msgs.append(text)
@@ -1573,8 +1624,11 @@ PROGRESS = {}  # turn, agent, since: what the interactive status line shows
 CURRENT = {}   # target: the run or campaign directory the session's /say, /stop and /status act on
 
 
-def loop(run_dir):
+def loop(run_dir, resume_args=None):
+    lock = hold_lock(run_dir, "run")
     try:
+        if resume_args is not None:
+            prepare_resume(run_dir, resume_args)
         return _loop(run_dir)
     except Exception as exc:
         # A crash is a run end too, and the owner who looked away would otherwise never hear of it.
@@ -1587,11 +1641,15 @@ def loop(run_dir):
             if not state.get("campaign"):
                 notify("tandem", f"{state.get('name') or pathlib.Path(run_dir).name}: crashed, {exc}")
         raise
+    finally:
+        release_lock(run_dir, lock)
 
 
 def _loop(run_dir):
     state = load(run_dir)
     state.pop("outcome", None)
+    # Runs made by `start` or -p before 0.1.2 have no stop file, and /stop would not reach them.
+    state.setdefault("stop_file", str(run_dir / "STOP"))
     cfg = state["config"]
     inboxes = state.get("inboxes") or [str(run_dir / "inbox.md")]
     tuning_files = state.get("tuning_files") or [str(run_dir / "tuning.json")]
@@ -1626,9 +1684,11 @@ def _loop(run_dir):
                                  f"waiting until {wake:%H:%M}")
             wait_until(wake, state.get("stop_file"))
             continue
-        if state.get("review_goal") and "codex" in healthy and away_for_long("codex"):
-            # Claude must not review its own work: park the review until Codex is back.
-            return finish(run_dir, state, "parked", f"Codex is away until {unavailable_until('codex'):%H:%M}; "
+        reviewer = state.get("reviewer", "codex")
+        if state.get("review_goal") and reviewer in healthy and away_for_long(reviewer):
+            # The author must not review its own work: park the review until the reviewer is back.
+            return finish(run_dir, state, "parked", f"{NAMES[reviewer]} is away until "
+                                                    f"{unavailable_until(reviewer):%H:%M}; "
                                                     "the review goes back on the backlog.")
         wanted = state["next"]
         away = unavailable_until(wanted) if wanted in healthy else None
@@ -1662,6 +1722,8 @@ def _loop(run_dir):
             turn_cfg = dict(cfg, claude_budget=turn_budget(cfg, budget_spent(state)))
             result, cost, *more = call_agent(agent, turn_cfg, state["worktree"], prompt, out_base, TURN_SCHEMA,
                                              "status", False, state.get("stop_file"), run_dir)
+            # Before the result is looked at: a reply with no structured output was still paid for.
+            state["cost_usd"] += cost
             usage = dict(more[0]) if more and more[0] else {}
             if usage.get("model"):
                 entry["model"] = usage.pop("model")
@@ -1673,7 +1735,6 @@ def _loop(run_dir):
                 raise RuntimeError("no structured result in the agent's reply")
             entry.update({k: str(result.get(k, "")).strip() for k in
                           ("status", "summary", "handoff", "could_not_do", "checks")})
-            state["cost_usd"] += cost
             state["failures"][agent] = 0
         except (RuntimeError, subprocess.TimeoutExpired, FileNotFoundError) as e:
             state["cost_usd"] += getattr(e, "cost", 0.0)
@@ -1734,7 +1795,10 @@ def _loop(run_dir):
         if status == "done":
             peer_agreed = prev and prev["agent"] != agent and prev["status"] == "done" and not entry["commit"]
             if reviewer_mode(cfg) and agent == "codex" and not entry["commit"]:
-                peer_agreed = True  # the reviewer approving unchanged work closes the goal
+                # The reviewer approving unchanged work closes the goal, but only work the builder
+                # called done: not an empty diff on turn 1, nor a build cut short by an error, nor
+                # what Codex built itself while Claude was away (that falls to the solo rule below).
+                peer_agreed = builder_said_done(state["history"])
             # Alone, the agent still needs one fresh-eyes turn that changes nothing before done counts.
             if peer_agreed or (solo and not entry["commit"]):
                 if cfg.get("check"):
@@ -1746,6 +1810,7 @@ def _loop(run_dir):
                 if ok:
                     if not peer_agreed:
                         state["needs_review"] = True
+                        state["closed_by"] = agent  # the backlog review must go to the other agent
                     who = "Both agents agree" if peer_agreed else f"{NAMES[agent]} alone ({NAMES[other]} away) says"
                     return finish(run_dir, state, "done",
                                   f"{who} the goal is met" + (" and the check passed." if cfg.get("check") else "."))
@@ -1757,9 +1822,26 @@ def _loop(run_dir):
             return finish(run_dir, state, "blocked", "Both agents need the owner:\n\n" + entry["handoff"])
 
 
-def create_run(run_dir, repo, goal, name, cfg, max_turns, first, worktree=None, branch=None, extra=None):
-    """New run in run_dir; reuses worktree and branch when given, otherwise makes a fresh pair."""
-    run_dir.mkdir(parents=True)
+def claim_dir(path):
+    """Create path, or path-2, path-3, ... if taken. Ids are stamped to the second, so two runs with
+    the same name started in one second (a script, a CI matrix) would otherwise collide; mkdir
+    either creates or fails, so two processes never claim the same one."""
+    n = 1
+    while True:
+        candidate = path if n == 1 else path.with_name(f"{path.name}-{n}")
+        try:
+            candidate.mkdir(parents=True)
+            return candidate
+        except FileExistsError:
+            n += 1
+
+
+def create_run(run_dir, repo, goal, name, cfg, max_turns, first, worktree=None, branch=None, extra=None,
+               claimed=False):
+    """New run in run_dir; reuses worktree and branch when given, otherwise makes a fresh pair.
+    claimed: run_dir already exists and holds nothing worth keeping (see claim_dir)."""
+    run_dir.mkdir(parents=True, exist_ok=claimed)
+    (run_dir / "transcript.md").unlink(missing_ok=True)
     if worktree is None:
         branch = f"tandem/{run_dir.name}"
         worktree = str(run_dir / "work")
@@ -1769,6 +1851,8 @@ def create_run(run_dir, repo, goal, name, cfg, max_turns, first, worktree=None, 
         "base": git(worktree, "rev-parse", "HEAD"), "turn": 1, "max_turns": max_turns, "next": first,
         "failures": {"claude": 0, "codex": 0}, "cost_usd": 0.0, "history": [], "config": cfg,
         "inboxes": [str(run_dir / "inbox.md")],
+        # Whatever started the run, a session that resumes it later stops it by writing this file.
+        "stop_file": str(run_dir / "STOP"),
     }
     state.update(extra or {})
     save(run_dir, state)
@@ -1832,22 +1916,38 @@ def plan_next(camp_dir, camp):
     return None
 
 
-def review_item(camp):
-    """A goal for Codex to review everything Claude finished alone while Codex was away."""
-    items = camp["review_backlog"]
+def backlog_author(item):
+    # Items saved before 0.1.2, and seeded ones, are Claude's work: the only case older versions knew.
+    return item.get("by") if item.get("by") in NAMES else "claude"
+
+
+def backlog_reviewer(camp):
+    """The agent that can review part of the backlog now; never the one that wrote that part alone."""
+    for reviewer in ("codex", "claude"):
+        if not away_for_long(reviewer) and any(backlog_author(i) != reviewer for i in camp.get("review_backlog") or []):
+            return reviewer
+    return None
+
+
+def review_item(camp, reviewer="codex"):
+    """A goal for reviewer to check what the other agent finished alone; takes those items off the backlog."""
+    author = OTHER[reviewer]
+    items = [i for i in camp["review_backlog"] if backlog_author(i) == author]
+    camp["review_backlog"] = [i for i in camp["review_backlog"] if backlog_author(i) != author]
     start = items[0]["from"]
     lines = "\n".join(f"- {i['name']}: `{i['from'][:10]}..{i['to'][:10]}`" + (f" ({i['note']})" if i.get("note") else "")
                       for i in items)
-    goal = (f"Independent review by Codex of work Claude Code finished while Codex was away:\n\n{lines}\n\n"
-            f"Codex reviews first: the diffs above (`git diff {start[:10]}..HEAD` covers all of it), CLAUDE.md, the "
+    rev, auth = NAMES[reviewer], NAMES[author]
+    goal = (f"Independent review by {rev} of work {auth} finished while {rev} was away:\n\n{lines}\n\n"
+            f"{rev} reviews first: the diffs above (`git diff {start[:10]}..HEAD` covers all of it), CLAUDE.md, the "
             f"relevant parts of the project's docs, and any open review items in the READMEs or review notes. "
             f"Record each finding with the rule it breaks, the location "
             f"and a concrete failing case, in the review notes for that part of the code.\n"
-            f"Claude Code confirms each finding (failing test or live reproduction), fixes it with a regression test or "
-            f"rejects it with the reason, and Codex re-reviews the fixes.\n\n"
-            f"Done means: every finding is fixed or rejected with a reason, Codex approves, and the open "
-            f"'pending Codex review' items covered here are marked reviewed.")
-    return {"goal": goal, "name": "codex-review-backlog", "first": "codex", "check": "",
+            f"{auth} confirms each finding (failing test or live reproduction), fixes it with a regression test or "
+            f"rejects it with the reason, and {rev} re-reviews the fixes.\n\n"
+            f"Done means: every finding is fixed or rejected with a reason, {rev} approves, and the open "
+            f"'pending {rev} review' items covered here are marked reviewed.")
+    return {"goal": goal, "name": f"{reviewer}-review-backlog", "first": reviewer, "check": "",
             "review": True, "review_from": start, "max_turns": REVIEW_MAX_TURNS}
 
 
@@ -1865,23 +1965,70 @@ def push_branch(camp):
         log(f"push failed, continuing: {tail(proc.stderr, 300)}", "warn")
 
 
-def refuse_if_running(camp_dir):
-    lock = camp_dir / ".lock"
-    if not lock.exists():
-        return
+def lock_owner(target):
+    """The pid in target/.lock while that process is alive, else None."""
     try:
-        pid = int(lock.read_text())
+        pid = int((pathlib.Path(target) / ".lock").read_text())
+    except (OSError, ValueError):
+        return None
+    if pid <= 0:
+        return None
+    try:
         os.kill(pid, 0)
-    except (ProcessLookupError, ValueError):
-        return
-    sys.exit(f"campaign already running (pid {pid}); stop it first")
+    except PermissionError:
+        return pid  # alive, under another user
+    except (OSError, ValueError):
+        return None
+    return pid
+
+
+def refuse_if_running(target, what="campaign"):
+    pid = lock_owner(target)
+    if pid:
+        sys.exit(f"{what} already running (pid {pid}); stop it first")
+
+
+def hold_lock(target, what):
+    """One process per run or campaign: a second one would run agents in the same worktree, commit
+    over the first and save its own copy of the state over the other's, losing turns and cost."""
+    target = pathlib.Path(target)
+    # Keep this file: unlinking an OS lock lets another process lock a new inode while a waiter
+    # still holds the old one. The separate PID file is only for status and older tandem processes.
+    guard = (target / ".lock.guard").open("a+b")
+    try:
+        try:
+            if os.name == "nt":
+                import msvcrt
+                if guard.seek(0, os.SEEK_END) == 0:
+                    guard.write(b"\0")
+                    guard.flush()
+                guard.seek(0)
+                msvcrt.locking(guard.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(guard, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            if exc.errno not in (errno.EACCES, errno.EAGAIN, errno.EDEADLK):
+                raise
+            refuse_if_running(target, what)
+            sys.exit(f"{what} {target.name} is being started by another process")
+        refuse_if_running(target, what)
+        (target / ".lock").write_text(str(os.getpid()))
+        return guard
+    except BaseException:
+        guard.close()
+        raise
+
+
+def release_lock(target, guard):
+    try:
+        (pathlib.Path(target) / ".lock").unlink(missing_ok=True)
+    finally:
+        guard.close()  # the OS also releases this lock if tandem crashes
 
 
 def campaign_loop(camp_dir):
-    """One process per campaign: a second one would plan and commit over the first."""
-    refuse_if_running(camp_dir)
-    lock = camp_dir / ".lock"
-    lock.write_text(str(os.getpid()))
+    lock = hold_lock(camp_dir, "campaign")
     ended = crash = None
     try:
         _campaign_loop(camp_dir)
@@ -1890,7 +2037,7 @@ def campaign_loop(camp_dir):
         ended, crash = True, exc
         raise
     finally:
-        lock.unlink(missing_ok=True)
+        release_lock(camp_dir, lock)
         # Interrupts still leave work to take or resume; release the lock before offering resume.
         camp = None
         try:
@@ -1936,7 +2083,11 @@ def _campaign_loop(camp_dir):
             run_dir = pathlib.Path(current)
             state = load(run_dir)
             waits = 0
-            while True:
+            if state.get("outcome") in ("done", "blocked", "parked"):
+                # A crash after the run finished but before the campaign recorded it: running it
+                # again would erase its outcome and spend turns on a closed goal.
+                log(f"{run_dir.name} already ended {state['outcome']}; recording it")
+            while state.get("outcome") not in ("done", "blocked", "parked"):
                 loop(run_dir)
                 state = load(run_dir)
                 if state["outcome"] != "failed" or waits >= MAX_FAILED_WAITS or stop_file.exists():
@@ -1965,11 +2116,14 @@ def _campaign_loop(camp_dir):
             head = git(camp["worktree"], "rev-parse", "HEAD")
             backlog = camp.setdefault("review_backlog", [])
             if state.get("needs_review"):
-                backlog.append({"name": state.get("name") or run_dir.name, "from": state["base"], "to": head})
-                log(f"{state.get('name')} closed without Codex; added to the review backlog ({len(backlog)} items)")
+                by = state.get("closed_by") if state.get("closed_by") in NAMES else "claude"
+                backlog.append({"name": state.get("name") or run_dir.name, "from": state["base"], "to": head, "by": by})
+                log(f"{state.get('name')} closed without {NAMES[OTHER[by]]}; "
+                    f"added to the review backlog ({len(backlog)} items)")
             if outcome == "parked" or (state.get("review_goal") and outcome in ("max_turns", "failed")):
                 backlog.append({"name": state.get("name") or run_dir.name, "from": state.get("review_from") or state["base"],
-                                "to": head, "note": f"review unfinished ({outcome}); continue from the review notes"})
+                                "to": head, "by": OTHER[state.get("reviewer", "codex")],
+                                "note": f"review unfinished ({outcome}); continue from the review notes"})
             elif outcome == "done":
                 camp["no_progress"] = 0
             else:
@@ -2005,19 +2159,21 @@ def _campaign_loop(camp_dir):
             return
         if camp["queue"]:
             item = camp["queue"].pop(0)
-        elif camp.get("review_backlog") and not away_for_long("codex"):
-            item = review_item(camp)
-            camp["review_backlog"] = []
-            log(f"Codex is available: reviewing the backlog before building ({item['review_from'][:10]}..HEAD)")
+        elif backlog_reviewer(camp):
+            item = review_item(camp, backlog_reviewer(camp))
+            log(f"{NAMES[item['first']]} is available: reviewing the backlog before building "
+                f"({item['review_from'][:10]}..HEAD)")
         else:
             plan = plan_next(camp_dir, camp)
             write_json(path, camp)
+            item = plan and not plan.get("finished") and {
+                "goal": plan["goal"], "name": slug(plan["name"]) or "goal",
+                "first": plan.get("first") if plan.get("first") in NAMES else "claude",
+                "check": plan.get("check", ""), "planned": True}
             if cap and camp["cost_usd"] >= cap and not (plan and plan.get("finished")):
                 # Keep a paid-for goal for resume, but stop before another planner or run starts.
-                if plan:
-                    camp["queue"].append({"goal": plan["goal"], "name": slug(plan["name"]) or "goal",
-                                          "first": plan.get("first") if plan.get("first") in NAMES else "claude",
-                                          "check": plan.get("check", "")})
+                if item:
+                    camp["queue"].append(item)
                     write_json(path, camp)
                 continue
             if plan is None:
@@ -2035,20 +2191,36 @@ def _campaign_loop(camp_dir):
                 write_json(path, camp)
                 log(f"campaign finished: {plan.get('reason')}", "ok")
                 return
-            item = {"goal": plan["goal"], "name": slug(plan["name"]) or "goal",
-                    "first": plan.get("first") if plan.get("first") in NAMES else "claude",
-                    "check": plan.get("check", "")}
             log(f"next goal: {item['name']} - {plan.get('reason')}", "run")
+        if item.get("planned") and item.get("check"):
+            # The planner ran read-only, but text in the repo can steer what it writes here, and the
+            # check runs with the shell as the owner: say so where they can see it. Here rather than
+            # at planning, so a goal queued at the cost cap still warns when resume starts it.
+            log(f"the planner's check runs as you, outside any sandbox, once the agents agree: "
+                f"{item['check']}", whole=True)
         n = len(camp["runs"]) + 1
         # The next run starts from whatever /models set since the last one began.
         apply_tuning(camp, [camp_dir / "tuning.json"])
         cfg = dict(camp["config"], check=item.get("check") or None)
-        run_dir = create_run(camp_dir / f"{n:02d}-{slug(item['name'])}", camp["repo"], item["goal"],
+        run_dir = camp_dir / f"{n:02d}-{slug(item['name'])}"
+        unused = False
+        if run_dir.exists():
+            # Left by a crash before campaign.json below named it current, so the goal is still
+            # queued. No turn ran in it (only `current` starts one); a directory with turns must
+            # not be overwritten, and create_run() refuses it.
+            try:
+                unused = not load(run_dir)["history"]
+            except (OSError, ValueError, KeyError):
+                unused = True
+            if unused:
+                log(f"reusing {run_dir.name}, left unused by an earlier crash")
+        run_dir = create_run(run_dir, camp["repo"], item["goal"],
                              item["name"], cfg, item.get("max_turns", camp["max_turns"]), item.get("first", "claude"),
-                             worktree=camp["worktree"], branch=camp["branch"],
+                             worktree=camp["worktree"], branch=camp["branch"], claimed=unused,
                              extra={"stop_file": str(stop_file), "tuning_files": [str(camp_dir / "tuning.json")],
                                     "campaign": str(camp_dir), "prior_cost": camp["cost_usd"],
-                                    **({"review_goal": True, "review_from": item["review_from"]} if item.get("review") else {}),
+                                    **({"review_goal": True, "review_from": item["review_from"], "reviewer": item["first"]}
+                                       if item.get("review") else {}),
                                     "inboxes": [str(camp_dir / f"{n:02d}-{slug(item['name'])}" / "inbox.md"),
                                                 str(camp_dir / "inbox.md")]})
         camp["current"] = str(run_dir)
@@ -2057,36 +2229,43 @@ def _campaign_loop(camp_dir):
 
 def prepare_campaign_start(args):
     camp_id = datetime.datetime.now().strftime("%Y%m%d-%H%M%S") + (f"-{slug(args.name)}" if args.name else "")
-    camp_dir = RUNS / f"campaign-{camp_id}"
-    camp_dir.mkdir(parents=True)
-    (camp_dir / "inbox.md").write_text("")
-    cfg = config_from(args)
-    camp = {"id": camp_id, "config": cfg, "max_turns": args.max_turns, "push": args.push, "queue": [], "runs": [],
-            "blockers": [], "no_progress": 0, "next_planner": "claude", "cost_usd": 0.0, "current": None}
-    if args.adopt:
-        run_dir = run_path(args.adopt)
-        state = load(run_dir)
-        camp.update(repo=state["repo"], worktree=state["worktree"], branch=state["branch"], base=state["base"])
-        state.setdefault("name", run_dir.name)
-        state["inboxes"] = [str(run_dir / "inbox.md"), str(camp_dir / "inbox.md")]
-        state["stop_file"] = str(camp_dir / "STOP")
-        # The campaign adds the whole run's cost when it ends, so the cap counts it whole too.
-        state.update(campaign=str(camp_dir), prior_cost=0.0)
-        state["tuning_files"] = [str(run_dir / "tuning.json"), str(camp_dir / "tuning.json")]
-        state["max_turns"] = state["turn"] - 1 + args.max_turns
-        state["failures"] = {"claude": 0, "codex": 0}
-        state["config"].update({k: v for k, v in cfg.items() if v is not None and k != "check"})
-        save(run_dir, state)
-        camp["current"] = str(run_dir)
-    else:
-        repo = require_repo(args.repo)
-        branch = f"tandem/campaign-{camp_id}"
-        worktree = str(camp_dir / "work")
-        base = git(repo, "rev-parse", args.base)
-        git(repo, "worktree", "add", "-q", "-b", branch, worktree, base)
-        camp.update(repo=str(repo), worktree=worktree, branch=branch, base=base)
-    camp["queue"] = [read_goal_file(p) for p in args.goal_file or []]
-    write_json(camp_dir / "campaign.json", camp)
+    camp_dir = claim_dir(RUNS / f"campaign-{camp_id}")
+    # Keep adoption and the campaign record under both locks: a running standalone loop must
+    # not overwrite the adopted state, and another campaign must not adopt the same worktree.
+    with contextlib.ExitStack() as locks:
+        locks.callback(release_lock, camp_dir, hold_lock(camp_dir, "campaign"))
+        camp_id = camp_dir.name[len("campaign-"):]
+        (camp_dir / "inbox.md").write_text("")
+        cfg = config_from(args)
+        camp = {"id": camp_id, "config": cfg, "max_turns": args.max_turns, "push": args.push, "queue": [], "runs": [],
+                "blockers": [], "no_progress": 0, "next_planner": "claude", "cost_usd": 0.0, "current": None}
+        camp["queue"] = [read_goal_file(p) for p in args.goal_file or []]
+        if args.adopt:
+            run_dir = run_path(args.adopt)
+            locks.callback(release_lock, run_dir, hold_lock(run_dir, "run"))
+            state = load(run_dir)
+            if state.get("campaign"):
+                sys.exit(f"run already belongs to campaign {state['campaign']}; resume that campaign instead")
+            camp.update(repo=state["repo"], worktree=state["worktree"], branch=state["branch"], base=state["base"])
+            state.setdefault("name", run_dir.name)
+            state["inboxes"] = [str(run_dir / "inbox.md"), str(camp_dir / "inbox.md")]
+            state["stop_file"] = str(camp_dir / "STOP")
+            # The campaign adds the whole run's cost when it ends, so the cap counts it whole too.
+            state.update(campaign=str(camp_dir), prior_cost=0.0)
+            state["tuning_files"] = [str(run_dir / "tuning.json"), str(camp_dir / "tuning.json")]
+            state["max_turns"] = state["turn"] - 1 + args.max_turns
+            state["failures"] = {"claude": 0, "codex": 0}
+            state["config"].update({k: v for k, v in cfg.items() if v is not None and k != "check"})
+            save(run_dir, state)
+            camp["current"] = str(run_dir)
+        else:
+            repo = require_repo(args.repo)
+            branch = f"tandem/campaign-{camp_id}"
+            worktree = str(camp_dir / "work")
+            base = git(repo, "rev-parse", args.base)
+            git(repo, "worktree", "add", "-q", "-b", branch, worktree, base)
+            camp.update(repo=str(repo), worktree=worktree, branch=branch, base=base)
+        write_json(camp_dir / "campaign.json", camp)
     CURRENT["target"] = camp_dir
     log(f"campaign {camp_dir.name} on {camp['branch']} ({camp['worktree']})", brief="")
     log(f"talk: {prog_name()} campaign say {camp_dir} \"...\"   stop: {prog_name()} campaign stop {camp_dir}", brief="")
@@ -2101,32 +2280,38 @@ def cmd_campaign_start(args):
 
 def prepare_campaign_resume(args):
     camp_dir = run_path(args.dir)
-    refuse_if_running(camp_dir)
-    (camp_dir / "STOP").unlink(missing_ok=True)
-    path = camp_dir / "campaign.json"
-    camp = json.loads(path.read_text())
-    camp["no_progress"] = 0
-    camp.pop("outcome", None)
-    if getattr(args, "max_cost", None):
-        # Later wins in tuning.json, so an older /budget there would undo the new cap.
-        write_tuning(camp_dir, {"max_cost": args.max_cost})
-    if args.push is not None:
-        camp["push"] = args.push
-    changes = {k: v for k, v in (("codex_effort", args.codex_effort), ("codex_role", args.codex_role),
-                                 ("max_cost", getattr(args, "max_cost", None))) if v}
-    camp["config"].update(changes)
-    if args.seed_review:
-        sha, _, note = args.seed_review.partition(":")
-        camp.setdefault("review_backlog", []).append({"name": "seeded", "from": git(camp["worktree"], "rev-parse", sha),
-                                                      "to": git(camp["worktree"], "rev-parse", "HEAD"), "note": note})
-    if camp.get("current"):
-        state = load(pathlib.Path(camp["current"]))
-        state["config"].update(changes)
-        if state.get("outcome"):
-            state["max_turns"] = max(state["max_turns"], state["turn"] - 1 + camp["max_turns"] // 2)
-        state["failures"] = {"claude": 0, "codex": 0}
-        save(pathlib.Path(camp["current"]), state)
-    write_json(path, camp)
+    # Acquire every affected lock before clearing STOP or writing tuning and state. A PID check
+    # alone races with loop startup, and the current run may be running through `resume` itself.
+    with contextlib.ExitStack() as locks:
+        locks.callback(release_lock, camp_dir, hold_lock(camp_dir, "campaign"))
+        path = camp_dir / "campaign.json"
+        camp = json.loads(path.read_text())
+        if camp.get("current"):
+            run_dir = pathlib.Path(camp["current"])
+            locks.callback(release_lock, run_dir, hold_lock(run_dir, "run"))
+        (camp_dir / "STOP").unlink(missing_ok=True)
+        camp["no_progress"] = 0
+        camp.pop("outcome", None)
+        if getattr(args, "max_cost", None):
+            # Later wins in tuning.json, so an older /budget there would undo the new cap.
+            write_tuning(camp_dir, {"max_cost": args.max_cost})
+        if args.push is not None:
+            camp["push"] = args.push
+        changes = {k: v for k, v in (("codex_effort", args.codex_effort), ("codex_role", args.codex_role),
+                                     ("max_cost", getattr(args, "max_cost", None))) if v}
+        camp["config"].update(changes)
+        if args.seed_review:
+            sha, _, note = args.seed_review.partition(":")
+            camp.setdefault("review_backlog", []).append({"name": "seeded", "from": git(camp["worktree"], "rev-parse", sha),
+                                                          "to": git(camp["worktree"], "rev-parse", "HEAD"), "note": note})
+        if camp.get("current"):
+            state = load(pathlib.Path(camp["current"]))
+            state["config"].update(changes)
+            if state.get("outcome"):
+                state["max_turns"] = max(state["max_turns"], state["turn"] - 1 + camp["max_turns"] // 2)
+            state["failures"] = {"claude": 0, "codex": 0}
+            save(pathlib.Path(camp["current"]), state)
+        write_json(path, camp)
     CURRENT["target"] = camp_dir
     if in_session():
         emit(CONSOLE.rule(f"campaign {camp_dir.name} · {camp['branch']} · resumed"))
@@ -2167,8 +2352,9 @@ def prepare_run(args):
     run_id = datetime.datetime.now().strftime("%Y%m%d-%H%M%S") + (f"-{slug(name)}" if name else "")
     cfg = dict(config_from(args), base=args.base)
     cfg["check"] = args.check or item.get("check") or None
-    run_dir = create_run(RUNS / run_id, repo, item["goal"], name or run_id,
-                         cfg, args.max_turns, args.first or item.get("first") or "claude")
+    run_dir = claim_dir(RUNS / run_id)
+    run_dir = create_run(run_dir, repo, item["goal"], name or run_dir.name,
+                         cfg, args.max_turns, args.first or item.get("first") or "claude", claimed=True)
     CURRENT["target"] = run_dir
     # The only hint for start; in the session typing and /say already talk to the agents.
     log(f"talk to the agents: {prog_name()} say {run_dir} \"...\"", brief="")
@@ -2262,7 +2448,12 @@ def cmd_headless(args):
 
 
 def cmd_resume(args):
-    run_dir = run_path(args.run)
+    loop(run_path(args.run), resume_args=args)
+
+
+def prepare_resume(run_dir, args):
+    # Called under the run lock: a separate check before loading would allow two resumes to save
+    # over each other's turns before either enters the loop.
     state = load(run_dir)
     if args.more_turns:
         state["max_turns"] = state["turn"] - 1 + args.more_turns
@@ -2275,10 +2466,9 @@ def cmd_resume(args):
     save(run_dir, state)
     # A STOP left by the interactive /stop would end the resumed run at once. Only clear the run's own
     # file; a run inside a campaign points at the campaign's STOP, which the owner controls.
-    stop = state.get("stop_file")
+    stop = state.get("stop_file", str(run_dir / "STOP"))
     if stop and pathlib.Path(stop).resolve().parent == run_dir.resolve():
         pathlib.Path(stop).unlink(missing_ok=True)
-    loop(run_dir)
 
 
 def queued(target):
@@ -2296,7 +2486,7 @@ def leave_message(target, message, force=False):
     likely to contradict itself than to help. /now (forced) ends the wait instead."""
     # Blank lines separate the messages in the inbox, so a message keeps none of its own.
     message = re.sub(r"\n\s*\n", "\n", message.strip())
-    with INBOX_LOCK:
+    with inbox_lock(target):
         if not force and len(queued(target)) >= MAX_QUEUED:
             raise ValueError(f"{MAX_QUEUED} messages already wait for the next turn; /queue shows them, "
                              f"/queue clear drops them, /now hands them over now (\u2191 brings your line back)")
@@ -2310,11 +2500,21 @@ def leave_message(target, message, force=False):
 
 
 def clear_queue(target):
-    with INBOX_LOCK:
-        dropped = len(queued(target))
+    with inbox_lock(target):
+        dropped = queued(target)
         if dropped:
             (target / "inbox.md").write_text("")
-    return dropped
+        notes = target / "notes.md"
+        if dropped and notes.exists():
+            # leave_message() copied each one to the campaign's lasting notes, and every later planner
+            # reads those: a dropped message must go from there too. The latest copy is the queued one.
+            text = notes.read_text()
+            for message in dropped:
+                found = list(re.finditer(r"^- \([\d :-]+\) " + re.escape(message) + r"\n", text, re.M))
+                if found:
+                    text = text[:found[-1].start()] + text[found[-1].end():]
+            notes.write_text(text)
+    return len(dropped)
 
 
 def cmd_say(args):
@@ -2395,8 +2595,9 @@ def cmd_watch(args):
 def cmd_status(args):
     run_dir = run_path(args.run)
     state = load(run_dir)
+    outcome = state.get("outcome") or ("running" if lock_owner(run_dir) else "interrupted")
     emit(f"{state.get('name') or run_dir.name}: branch {state['branch']}  turn {state['turn'] - 1}/{state['max_turns']}  "
-          f"outcome {state.get('outcome', 'running or interrupted')}  claude cost ${state['cost_usd']:.2f}")
+          f"outcome {outcome}  claude cost ${state['cost_usd']:.2f}")
     for h in state["history"]:
         emit(f"  {h['turn']:>2} {h['agent']:<6} {h['status']:<8} {h.get('commit') or '-':<8} "
               f"{(h.get('summary') or h.get('error') or '')[:100]}")
@@ -2433,7 +2634,8 @@ def list_runs(limit=None):
     rows = []
     for _, kind, d, data in found[:limit]:
         if kind == "run":
-            outcome = data.get("outcome") or "running or interrupted"
+            # The lock tells a live run from one that crashed or was stopped with Ctrl+C.
+            outcome = data.get("outcome") or ("running" if lock_owner(d) else "interrupted")
             turns = max(data.get("turn", 1) - 1, 0)
             name = data.get("name") or d.name
         else:
@@ -3140,7 +3342,14 @@ def read_key(fd):
                 pasted += c
             return ("paste", pasted[:-len(PASTE_END)].decode(errors="replace"))
     elif data and data[0] >= 0xc0:
-        data += os.read(fd, 3 if data[0] >= 0xf0 else 2 if data[0] >= 0xe0 else 1)  # rest of a UTF-8 char
+        # The rest of a UTF-8 character. A read returns what has arrived, which over SSH can be part of
+        # it; decoding then would turn one character into two replacement marks.
+        size = 4 if data[0] >= 0xf0 else 3 if data[0] >= 0xe0 else 2
+        while len(data) < size:
+            c = os.read(fd, size - len(data))
+            if not c:
+                break
+            data += c
     text = data.decode(errors="replace")
     return KEYS.get(text, text)
 
@@ -3966,9 +4175,6 @@ class Session:
         except (SystemExit, GitError, OSError, ValueError) as exc:
             emit(f"cannot start: {exc}")
             return
-        state = load(run_dir)
-        state["stop_file"] = str(run_dir / "STOP")
-        save(run_dir, state)
         if text:
             self.images.clear()
         self.launch("run", lambda: loop(run_dir))
@@ -3991,7 +4197,7 @@ class Session:
         target = self.target()
         if not target:
             return
-        # A campaign watches <dir>/STOP; a run watches the stop_file in its state (set in start_goal).
+        # A campaign watches <dir>/STOP; so does a run (its stop_file, set in create_run).
         stop = target / "STOP"
         stop.write_text(now())
         emit("stopping after the current turn")
@@ -4194,7 +4400,6 @@ class Session:
             self.campaign("resume " + shlex.quote(str(target)) + (" --no-notify" if no_notify else ""))
         else:
             try:
-                (target / "STOP").unlink(missing_ok=True)
                 if more is None and load(target).get("outcome") == "max_turns":
                     more = RESUME_TURNS  # without more turns the run would stop again at once
             except (OSError, ValueError) as exc:
@@ -4418,11 +4623,15 @@ def main(argv=None):
     args = p.parse_args(argv)
     fn = pick_command(p, args)
     NOTIFY["on"] = wants_notify(fn, args)
-    previous = None
+    previous = {}
     if fn is not cmd_interactive and threading.current_thread() is threading.main_thread():
         # SIGTERM (a supervisor, or the npm launcher passing one on) ends a run the way Ctrl+C does,
-        # so run_child kills the agent instead of leaving it running in the worktree.
-        previous = signal.signal(signal.SIGTERM, signal.default_int_handler)
+        # so run_child kills the agent instead of leaving it running in the worktree. So does a closed
+        # terminal's SIGHUP: agents run in their own session and would not get it themselves. Under
+        # nohup SIGHUP is ignored, and stays ignored.
+        previous["SIGTERM"] = signal.signal(signal.SIGTERM, signal.default_int_handler)
+        if hasattr(signal, "SIGHUP") and signal.getsignal(signal.SIGHUP) == signal.SIG_DFL:
+            previous["SIGHUP"] = signal.signal(signal.SIGHUP, signal.default_int_handler)
     try:
         fn(args)
     except KeyboardInterrupt:
@@ -4431,8 +4640,8 @@ def main(argv=None):
         sys.exit(f"{e}\nfix it, then continue with resume")
     finally:
         NOTIFY["on"] = False
-        if previous is not None:
-            signal.signal(signal.SIGTERM, previous)
+        for name, handler in previous.items():
+            signal.signal(getattr(signal, name), handler)
 
 
 if __name__ == "__main__":

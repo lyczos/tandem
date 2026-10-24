@@ -108,6 +108,10 @@ tandem runs --limit 10
 ```
 
 Lists recent runs and campaigns, newest first: id, name, branch, outcome, turns, and path.
+A run with no outcome yet shows `running` while a process is working on it and `interrupted`
+otherwise. Only one process drives a run at a time: `resume` refuses a run that is still
+running elsewhere before changing its state, budget or stop file, so two loops never commit
+over each other or lose each other's turns. A crashed process releases its lock automatically.
 Run storage uses the precedence described in [Configuration](#configuration), with
 `~/.tandem/runs` as the default for npm installs.
 
@@ -204,8 +208,8 @@ terminal the session uses Python's `input()` with readline instead, without the 
   Claude Code. `/paste` attaches it to your next goal or `/say` instead, and so does dragging
   image files onto the terminal; `/paste clear` drops what is waiting. Cmd+V stays the
   terminal's own text paste
-- `/stop` stops after the current turn; `/resume [TURNS]` continues the last run (in a new
-  session, the latest run in this repo)
+- `/stop` stops after the current turn, also for a run started with `tandem start` or `-p`;
+  `/resume [TURNS]` continues the last run (in a new session, the latest run in this repo)
 - `/goal FILE` starts a run from a goal file; `/campaign ARGS...` is `tandem campaign ARGS...`
 - `/quit`, Ctrl+D, or `exit`, `quit` or `q` alone on the line leaves after the current turn finishes;
   Ctrl+C twice leaves at once (see below)
@@ -375,7 +379,11 @@ warning appears when 80% is spent. Headless JSON includes `max_cost` (`null` whe
 
 A campaign chains goals on one branch and one worktree. Queued goal files go first; after that,
 one agent (read-only, alternating) reads the project's plan and code and picks the next goal,
-with its own check command. It keeps going until the planner says the plan is done, you stop
+with its own check command. The planner only reads, but its check runs like yours: in a shell, as
+you, outside any sandbox, once the agents agree. Anything the planner reads (the plan, docs, an
+issue pasted into the repository) can steer that command, so tandem prints each planner check in
+full when the goal starts; queue goal files with your own check when that matters.
+It keeps going until the planner says the plan is done, you stop
 it, or three goals in a row end blocked or out of turns (then read `BLOCKERS.md` and resume).
 This works best when the repository has a written plan or roadmap for the planner to follow.
 
@@ -393,6 +401,10 @@ six times. An agent that hits its usage limit is paused until the reset time it 
 other one carries on alone. In a campaign, work closed by one agent alone is reviewed by the
 other once it is back.
 
+Campaign resume locks both the campaign and its current run before changing state, budget or
+the stop file. `campaign start --adopt` refuses an active run or one that already belongs to a
+campaign; resume that campaign instead.
+
 Runs and campaigns are independent (own worktree, branch and run directory), so several can run
 at once in separate terminals, on one project or many. They share your usage limits, and Docker
 ports, which the agents are told to pick freely.
@@ -408,8 +420,11 @@ ports, which the agents are told to pick freely.
 - **Codex**: `codex exec` in the `workspace-write` sandbox with approvals off. No network
   unless `--codex-network`, which is exactly the kind of gap the other agent covers.
 - Neither agent commits, pushes or switches branches; the orchestrator owns git. Its commits
-  skip the target repository's git hooks, since a lint hook failing on half-done work must not
-  stop a turn.
+  skip all of the target repository's git hooks (`prepare-commit-msg` and `post-commit` too),
+  since a lint hook failing on half-done work must not stop a turn.
+- Each agent and check runs in its own process group. When a turn times out or tandem is
+  stopped (Ctrl+C, SIGTERM, a closed terminal), the whole group is killed, so a test run or dev
+  server the agent started cannot keep changing the worktree after its turn.
 
 **The Claude allow-list is a guard rail, not a sandbox**: `python3` or `npm` can run any code
 with your user's permissions. Only Codex's side is sandboxed. Run it on repositories you trust,
@@ -431,7 +446,8 @@ available ones are in `~/.codex/models_cache.json`.
 
 `--first codex` to let Codex start, `--claude-model` / `--codex-model`, `--claude-effort` /
 `--codex-effort`, `--timeout` (seconds per turn, default 1800), `--codex-role reviewer` (Claude builds, Codex
-reviews each goal instead of alternating), `--base` (start from another branch), `--push`
+reviews each goal instead of alternating; Codex's approval closes the goal only once Claude has
+said done and nothing changed since), `--base` (start from another branch), `--push`
 (campaigns: push the branch after every goal). An agent that fails three turns in a row (crash,
 bad output) is benched and the other one finishes alone. `/models` choices are saved in
 `~/.tandem/config.json` and used when a flag is not given.

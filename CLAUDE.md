@@ -57,10 +57,12 @@ on stdin (`CHILD_POPEN`) so Ctrl+C at the prompt cannot kill a turn or fail a ch
 the terminal's reach, agents and checks go through `run_child()`, which tracks them in `CHILDREN`:
 SIGHUP, SIGTERM or Ctrl+C during `/quit` stop them with `signal_children()`, because an agent left
 behind keeps editing the worktree with nobody to commit or time it out. Long subprocesses started
-from the worker must use `run_child()`. First-run consent lives in `~/.tandem/config.json`.
+from the worker must use `run_child()`, which starts every child in its own session outside the
+session too, so a timeout or SIGTERM kills the agent's whole group. First-run consent lives in `~/.tandem/config.json`.
 Check `Session.refuse_if_busy()` before creating a run or changing a stop file. Campaign setup
 finishes before launching the worker so `/say` and `/stop` always have the right target.
-`INBOX_LOCK` protects messages sent within the session from a simultaneous inbox read and clear.
+`inbox_lock()` (`INBOX_LOCK` plus an OS lock on `.inbox.lock`) protects messages sent within the
+session or by `tandem say` from another terminal from a simultaneous inbox read and clear.
 Quitting waits for the worker; leaving an agent running could race with a later resume.
 
 `build_parser()` builds the CLI without dispatching it. `prepare_run()` shares run creation
@@ -80,7 +82,13 @@ Two nested loops over state that lives entirely on disk, so every command is res
 
 - `loop(run_dir)` — **one run, one goal.** Picks the agent, builds the prompt, calls the agent,
   commits, appends to the transcript, decides whether the goal is closed. Exits by calling
-  `finish()`, which writes `outcome` into `state.json`.
+  `finish()`, which writes `outcome` into `state.json`. Holds a run lock (`hold_lock()`, as
+  campaigns do) so a second process cannot drive the same run. The PID in `.lock` is for status;
+  an OS lock on the persistent `.lock.guard` file protects acquisition and stale-PID recovery.
+  Never unlink `.lock.guard`: another process may still have the old file open. Resume changes
+  to a run's state, tuning and stop file happen under the same lock as its loop. Campaign setup
+  locks the campaign and its current or adopted run before changing either; adoption refuses a
+  run that already belongs to a campaign.
 - `_campaign_loop(camp_dir)` — **many goals on one branch.** Calls `loop()` for the current run,
   records the outcome, then takes the next goal from the queue, from the review backlog, or from
   `plan_next()` (one agent, read-only, picks the next goal from the project's own plan).
@@ -120,18 +128,24 @@ Never write `state.json` from the session: the loop holds a copy in memory and w
 ### Invariants worth protecting
 
 - **The orchestrator owns git.** Agents never commit, push or switch branches: `commit_turn()` does
-  it after every turn with `--no-verify` (a lint hook failing on half-done work must not stop a
-  turn), and `CLAUDE_DISALLOWED` plus Codex's sandbox block the agents from trying. Each run or
+  it after every turn with `--no-verify` and `core.hooksPath` pointed at nothing (a lint hook
+  failing on half-done work must not stop a turn, and `--no-verify` alone still runs
+  `prepare-commit-msg`), and `CLAUDE_DISALLOWED` plus Codex's sandbox block the agents from trying. Each run or
   campaign works in its own `git worktree`, so the owner's checkout is never touched.
 - **Neither agent closes a goal alone.** In peer mode, `done` counts only when the previous turn
   was also `done`, by the *other* agent, and the current turn produced no commit (`entry["commit"]`
-  is None) — a fresh-eyes turn that changes nothing. Reviewer mode (`--codex-role reviewer`) and
+  is None) — a fresh-eyes turn that changes nothing. Reviewer mode (`--codex-role reviewer`: Codex's
+  `done` counts only over work Claude's latest turn called done, `builder_said_done()`) and
   solo mode (the other agent benched or away long) relax this in specific, commented ways; solo
-  closure sets `needs_review`, which the campaign turns into a `codex-review-backlog` goal later.
+  closure sets `needs_review` and `closed_by`, which the campaign turns into a review goal for the
+  *other* agent later (`review_item()`, `codex-review-backlog` or `claude-review-backlog`).
 - **Failures are classified, not just raised.** `classify()` sorts an agent error into `limit`
   (pause that agent until `parse_reset()`'s time, let the other carry on), `transient` (retry the
   same turn in `call_agent`) or `other` (count against `MAX_FAILURES_PER_AGENT`, bench the agent at
   three). The tuning constants are the block near the top of the file; change them there, not inline.
+  It reads only the CLI's own error (`err.reason`: Claude's non-event output, Codex's `ERROR`
+  lines), never what the agent's commands printed: a test named `test_rate_limit` must not bench
+  an agent machine-wide.
 - **An owner interruption is not a failure.** `interrupt_turn()` writes `INTERRUPT` in the run dir
   and stops only agents, never the check. `call_agent` and `loop` look for that file before
   classifying an error, so the killed agent is recorded as `interrupted`: no failure counted, no
@@ -159,8 +173,10 @@ exactly. A new result field means editing three places together: the schema in `
 list in the prompt's "Fields" section, and the code that reads it (`loop`'s `entry.update`, plus
 `render_history` if it should show in the transcript).
 
-The read-only path matters: planners and reviewers get `CLAUDE_READ` / Codex's `read-only` sandbox
-via the `readonly` argument. Widening `CLAUDE_ALLOWED` widens what unsandboxed agents can run on the
+The read-only path matters: planners get `CLAUDE_READ` / Codex's `read-only` sandbox via the
+`readonly` argument. Every loop turn is writable, reviewer turns included (`--codex-role reviewer`
+gives Codex `workspace-write` and lets it make trivial fixes). A planner's `check` still runs
+unsandboxed as the user, so the campaign logs it whole when the goal starts. Widening `CLAUDE_ALLOWED` widens what unsandboxed agents can run on the
 user's machine — it is a guard rail, not a sandbox, and the README and `docs/usage.md` say so.
 
 ## Conventions
