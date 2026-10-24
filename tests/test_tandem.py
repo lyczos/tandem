@@ -684,7 +684,8 @@ class Handoff(unittest.TestCase):
         self.assertIn(f"worktree  {state['worktree']}\n", after)
         self.assertIn(f"git -C {repo} diff {state['base'][:12]}..{branch}\n", after)
         self.assertIn(f"git -C {repo} merge {branch}\n", after)
-        self.assertIn(f"git -C {repo} worktree remove {work} && git -C {repo} branch -d {branch}\n", after)
+        self.assertIn(f"clean up  git -C {repo} worktree remove {work}\n            git -C {repo} branch -d {branch}\n",
+                      after)
         self.assertNotIn("resume", after.split("transcript")[0])
         # The commands really work: the merge brings the run's file into the owner's checkout.
         tandem.git(self.repo, "merge", "-q", branch)
@@ -699,7 +700,7 @@ class Handoff(unittest.TestCase):
     def test_blocked_run_offers_resume_before_the_merge(self):
         out, run_dir, state = self.run_with("blocked")
         self.assertEqual(state["outcome"], "blocked")
-        resume = out.index(f"resume    {tandem.prog_name()} resume {run_dir}")
+        resume = out.index(f"resume    {shlex.quote(tandem.prog_name())} resume {run_dir}\n")
         self.assertLess(resume, out.index(f"merge {state['branch']}"))
 
     def test_diff_command_with_bare_id_and_newest(self):
@@ -764,17 +765,89 @@ class Handoff(unittest.TestCase):
         self.assertIn("campaign resume", text)
         self.assertIn("merge tandem/campaign-x", text)
 
-    def test_campaign_run_finish_prints_summary_after_finished(self):
+    def test_campaign_goal_prints_only_what_it_added(self):
+        # The campaign goes on to its next goal in the same worktree: no merge, clean up or resume yet.
         _, run_dir, state = self.run_with("done")
         state["campaign"] = str(self.runs / "campaign-x")
         out = io.StringIO()
         with mock.patch("sys.stdout", out):
             tandem.finish(run_dir, state, "blocked", "Need owner input")
-        text = out.getvalue()
-        lines = text.splitlines()
+        lines = out.getvalue().splitlines()
         finished = next(i for i, line in enumerate(lines) if "FINISHED" in line)
-        self.assertIn(f"{state['branch']}: 1 commit over", lines[finished + 1])
-        self.assertIn(f"campaign resume {state['campaign']}", text)
+        self.assertEqual(lines[finished + 1], f"  goal      {state['branch']}: 1 commit over {state['base'][:12]}, "
+                                              f"1 file changed, +2 -0")
+        self.assertIn("transcript", lines[finished + 2])
+        for word in ("resume", "merge", "worktree", "branch -d"):
+            self.assertNotIn(word, "\n".join(lines[finished + 1:finished + 2]))
+
+    def resume_line(self, out):
+        line = next(line for line in out.splitlines() if line.startswith("  resume    "))
+        return shlex.split(line[len("  resume    "):])
+
+    def test_resume_line_after_the_turn_limit_really_continues(self):
+        with mock.patch.object(tandem, "call_agent", return_value=({"status": "continue", "summary": "s"}, 0)):
+            code, out, err = self.invoke("-p", "Work", "--max-turns", "2")
+            self.assertEqual(code, 2, err)
+            argv = self.resume_line(out)
+            self.assertEqual(argv[1:2] + argv[3:], ["resume", "--more-turns", str(tandem.RESUME_TURNS)])
+            run_dir = pathlib.Path(argv[2])
+            out = self.command(*argv[1:])
+        state = tandem.load(run_dir)
+        self.assertEqual((state["outcome"], len(state["history"])), ("max_turns", 2 + tandem.RESUME_TURNS))
+
+    def test_resume_line_after_the_cap_raises_it_past_what_was_spent(self):
+        with mock.patch.object(tandem, "call_agent", return_value=({"status": "continue", "summary": "s"}, 2.5)):
+            code, out, err = self.invoke("-p", "Work", "--max-turns", "3", "--max-cost", "1")
+            self.assertEqual(code, 6, err)
+            argv = self.resume_line(out)
+            self.assertEqual(argv[1:2] + argv[3:], ["resume", "--max-cost", "3.5"])  # $2.50 spent: a $1 cap's worth more
+            out = self.command(*argv[1:])
+        state = tandem.load(pathlib.Path(argv[2]))
+        self.assertEqual((state["outcome"], len(state["history"])), ("over_budget", 2))
+        self.assertEqual(tandem.raised_cap(5, 5.2), 10.2)
+
+    def test_session_resume_after_the_turn_limit_adds_turns(self):
+        _, run_dir, state = self.run_with("continue")
+        self.assertEqual(state["outcome"], "max_turns")
+        session = tandem.Session.__new__(tandem.Session)
+        session.thread, launched = None, []
+        session.launch = lambda kind, fn, no_notify=False: launched.append(fn)
+        with mock.patch.object(tandem, "cmd_resume") as resume:
+            for rest in ("", "2"):
+                session.resume(run_dir, rest)
+                launched[-1]()
+                self.assertEqual(resume.call_args[0][0].more_turns, int(rest or tandem.RESUME_TURNS))
+        state["outcome"] = "blocked"
+        tandem.save(run_dir, state)
+        with mock.patch.object(tandem, "cmd_resume") as resume:
+            session.resume(run_dir, "")
+            launched[-1]()
+        self.assertIsNone(resume.call_args[0][0].more_turns)
+
+    def test_campaign_over_budget_resume_line_raises_the_cap(self):
+        camp_dir = self.runs / "campaign-x"
+        camp_dir.mkdir(parents=True)
+        camp = {"outcome": "over_budget", "config": {"max_cost": 2.0}, "cost_usd": 4.5, "current": None}
+        self.assertTrue(tandem.campaign_handoff(camp_dir, camp)["resume"].endswith(
+            f"campaign resume {camp_dir} --max-cost 6.5"))
+
+    def test_session_summary_keeps_commands_whole_on_a_narrow_terminal(self):
+        _, run_dir, state = self.run_with("max_turns")
+        home = str(self.base)
+        console = tandem.Console(fancy=False, styled=True, utf=True)
+        out = []
+        with mock.patch.object(tandem, "CONSOLE", console), mock.patch.object(tandem, "term_width", return_value=50), \
+                mock.patch.object(pathlib.Path, "home", return_value=self.base), \
+                mock.patch.object(tandem, "emit", side_effect=out.append):
+            tandem.show_handoff(tandem.run_handoff(run_dir, state))
+        rows = {line[:12].strip(): line[12:] for line in out}
+        work = "~/" + state["worktree"][len(home) + 1:]
+        self.assertEqual(rows["worktree"], work)
+        self.assertEqual(rows["clean up"], f"git -C ~/repo worktree remove {work}")
+        self.assertEqual(out[-1][12:], f"git -C ~/repo branch -d {state['branch']}")
+        self.assertTrue(rows["resume"].endswith(f"resume ~/runs/{run_dir.name} --more-turns {tandem.RESUME_TURNS}"))
+        for line in out[1:]:  # longer than 50 columns, and never cut
+            self.assertNotIn("\u2026", line)
 
     def test_campaign_exit_prints_summary_even_on_interrupt(self):
         _, run_dir, state = self.run_with("done")
@@ -903,7 +976,7 @@ class Budget(unittest.TestCase):
         self.assertEqual((result["outcome"], result["turn_count"], result["max_cost"]), ("over_budget", 3, 1.0))
         self.assertTrue(all(t["status"] == "continue" for t in result["turns"]))
         self.assertIn("spent $1.20 of the $1.00 cap", result["outcome_message"])
-        self.assertIn(f"resume {self.runs / result['run_id']} --max-cost 2", result["outcome_message"])
+        self.assertIn(f"resume {self.runs / result['run_id']} --max-cost 2.2`", result["outcome_message"])
         # Each Claude turn may spend at most what is left of the cap.
         self.assertEqual(seen, [1.0, .6, .2])
 
@@ -3030,7 +3103,8 @@ class SessionLook(unittest.TestCase):
                 self.assertTrue(plain(rows[-1]).startswith("\u2500\u2500 failed \u00b7 bar-controls"))
                 self.assertEqual(tandem.display_width(plain(rows[-1])), width - 1)
                 self.assertIn("\x1b[31mfailed", rows[-1])
-                self.assertIn("transcript transcript.md", plain(rows[-2]))
+                self.assertEqual(plain(rows[-2]).split()[-1], str(run_dir / "transcript.md"))  # whole, never cut
+                self.assertIn("transcript", plain(rows[-3] + rows[-2]))
                 self.assertNotIn("FINISHED", "".join(rows))
 
     def test_long_path_is_shortened_and_never_split(self):
@@ -3049,15 +3123,44 @@ class SessionLook(unittest.TestCase):
             self.assertEqual(tandem.show_path(run / "transcript.md", run), "transcript.md")
             self.assertEqual(tandem.show_path("/elsewhere/x"), "/elsewhere/x")
 
-    def test_long_logs_fit_one_row_and_keep_error_color(self):
+    def test_long_logs_fit_one_row_and_keep_turn_color(self):
         for utf, more in ((True, "…"), (False, "...")):
             console = tandem.Console(fancy=True, styled=True, utf=utf)
-            rows = self.lines(console, lambda: tandem.log("界 word " * 30, "error"), 40)
+            rows = self.lines(console, lambda: tandem.log("界 word " * 30, "turn"), 40)
             self.assertEqual(len(rows), 1)
             self.assertLessEqual(tandem.display_width(rows[0]), 39)
             self.assertTrue(plain(rows[0]).endswith(more))
-            self.assertIn("\x1b[31m界", rows[0])
+            self.assertIn("\x1b[2m界", rows[0])
             self.assertTrue(rows[0].endswith(more + "\x1b[0m"))
+
+    def test_errors_warnings_and_whole_entries_wrap_instead_of_being_cut(self):
+        text = " ".join(f"word{i}" for i in range(30))
+        for kind, whole in (("error", None), ("warn", None), (None, True)):
+            with self.subTest(kind=kind):
+                rows = self.lines(self.console(), lambda: tandem.log(text, kind, whole=whole), 40)
+                self.assertGreater(len(rows), 1)
+                self.assertTrue(all(tandem.display_width(r) <= 39 for r in rows))
+                self.assertEqual(" ".join(plain(r)[8:].strip() for r in rows), text)
+                self.assertTrue(all(plain(r).startswith(" " * 8) for r in rows[1:]))
+        # The owner's lines stay apart, and a word longer than the row is left whole for the terminal.
+        path = "/" + "x" * 60
+        rows = self.lines(self.console(), lambda: tandem.log(f"Both agents need the owner:\n\nkey at {path}", "warn"), 40)
+        self.assertEqual([plain(r)[8:] for r in rows], ["Both agents need the owner:", "key at", path])
+
+    def test_no_color_session_still_shows_the_blocked_question(self):
+        state = {"name": "r", "history": [], "repo": None}
+        entry = {"turn": 2, "agent": "codex", "status": "blocked", "seconds": 5, "commit": None, "summary": "s",
+                 "handoff": "Need the staging API key in .env (STRIPE_SECRET) before the webhook test can run"}
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(tandem, "save"), \
+                mock.patch.object(tandem, "append_transcript"):
+            rows = self.lines(self.console(fancy=False), lambda: (
+                tandem.report_turn(entry),
+                tandem.finish(pathlib.Path(d), state, "blocked", "Both agents need the owner:\n\n" + entry["handoff"])))
+        text = " ".join(" ".join(plain(r).strip(" |").split()) for r in rows)
+        self.assertIn("\u2192 Claude Code: Need the staging API key", text)  # the card, without color
+        self.assertIn("Both agents need the owner: Need the staging API key in .env (STRIPE_SECRET) before the "
+                      "webhook test can run", text)
+        self.assertNotIn("\x1b", "".join(rows))
 
     def test_talk_hint_only_outside_the_session(self):
         args = argparse.Namespace(repo=".", goal_file=None, goal="g", name="n", base="HEAD", check=None,
@@ -3083,10 +3186,12 @@ class SessionLook(unittest.TestCase):
         with mock.patch.object(tandem, "term_width", return_value=30):
             self.assertEqual(ascii_console.rule("done"), "-- done " + "-" * 21)
 
-    def test_no_color_turn_line_marks_an_error(self):
+    def test_no_color_turn_is_a_plain_card_with_its_error(self):
         entry = {"turn": 2, "agent": "codex", "status": "error", "seconds": 5, "commit": None, "error": "boom"}
         rows = self.lines(self.console(fancy=False), lambda: tandem.report_turn(entry))
-        self.assertRegex(rows[0], r"^\d\d:\d\d \u2717 turn 2: Codex -> error")
+        self.assertTrue(rows[0].startswith("+- turn 2 \u00b7 Codex -"))
+        self.assertIn("| error: boom", "\n".join(rows))
+        self.assertNotIn("\x1b", "\n".join(rows))
 
     def test_campaign_resume_opens_with_a_rule(self):
         args = argparse.Namespace(push=None, codex_effort=None, codex_role=None, seed_review=None)
@@ -3525,7 +3630,7 @@ class SessionProcess(unittest.TestCase):
         self.wait_for(started.exists, "the check starting")
         os.killpg(self.proc.pid, signal.SIGINT)
         self.wait_for(lambda: "press Ctrl+C again to exit" in self.text(), "the exit hint")
-        self.wait_for(lambda: "transcript transcript.md" in self.text(), "the run finishing")
+        self.wait_for(lambda: "/transcript.md" in self.text(), "the run finishing")
         self.assertTrue(done.exists())
         self.assertEqual((self.state()["outcome"], self.state()["turn"]), ("done", 3))
         self.type("/quit")
@@ -3612,7 +3717,7 @@ class SessionProcess(unittest.TestCase):
         self.start()
         self.wait_for(self.screen_ends_with_prompt(), "the prompt")
         self.type("exit now please")
-        self.wait_for(lambda: "transcript transcript.md" in self.text(), "the run finishing")
+        self.wait_for(lambda: "/transcript.md" in self.text(), "the run finishing")
         self.assertEqual(self.state()["goal"], "exit now please")
         self.type("/quit")
         self.assertEqual(self.proc.wait(timeout=10), 0, self.text())
@@ -3652,7 +3757,7 @@ class SessionProcess(unittest.TestCase):
         os.write(self.master, b"\x16")
         self.wait_for(lambda: "[image #1]" in self.text(), "the image in the line")
         self.type("please")
-        self.wait_for(lambda: "transcript transcript.md" in self.text(), "the run finishing")
+        self.wait_for(lambda: "/transcript.md" in self.text(), "the run finishing")
         goal = self.state()["goal"]
         image = tandem.IMAGE_MARK.search(goal).group(1)
         self.assertEqual(goal, f"fix the layout in [image: {image}] please")

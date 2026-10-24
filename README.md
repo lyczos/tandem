@@ -145,14 +145,22 @@ paths filled in:
   worktree  /home/me/.tandem/runs/20261024-120000-parser/work
   read      git -C /home/me/project diff f89ce5c3f217..tandem/20261024-120000-parser
   merge     git -C /home/me/project merge tandem/20261024-120000-parser
-  clean up  git -C /home/me/project worktree remove /home/me/.tandem/runs/20261024-120000-parser/work && git -C /home/me/project branch -d tandem/20261024-120000-parser
+  clean up  git -C /home/me/project worktree remove /home/me/.tandem/runs/20261024-120000-parser/work
+            git -C /home/me/project branch -d tandem/20261024-120000-parser
 ```
+
+Each command is on a line of its own and is never cut, so it copies whole; in the session the
+paths start with `~`.
 
 The merge is a plain one, so each turn's commit stays in your history; squash it yourself if you
 prefer. Clean up only after merging: `branch -d` refuses a branch that is not merged. A run that
 ended `blocked`, `failed`, `max_turns`, `stopped` or `over_budget` shows a `resume` line first,
-because its work is not finished. A run with no commits says `no changes` and prints no commands.
-A campaign prints the same summary for its branch when it ends.
+because its work is not finished. After the turn limit it carries `--more-turns 6`, and after the
+cap a `--max-cost` of what was spent plus one more cap, so copying it really continues; in the
+session `/resume` alone gives a run out of turns six more, and `/budget USD` then `/resume`
+continues past the cap. A run with no commits says `no changes` and prints no commands.
+A campaign prints the same summary for its branch when it ends. Each of its goals prints only a
+`goal` line with what it added, because the next goal goes on in the same worktree.
 
 `tandem diff [RUN]` (default: the newest run or campaign) and `/diff` in the session print it again
 at any time, followed by `git diff --stat` of the branch (its first 20 files). If the worktree or
@@ -180,7 +188,8 @@ terminal the session uses Python's `input()` with readline instead, without the 
 - `/diff` shows what the current or last run changed and the commands to read, merge and clean
   it up (see [After a run](#after-a-run))
 - `/board` shows where the run stands: what both agents agree on, what is still open, the models in use
-  and the cost. Each finished turn appears in the session as a small card with its summary, handoff and checks.
+  and the cost. Each finished turn appears in the session as a small card with its summary, handoff and
+  checks, drawn in plain characters with `NO_COLOR`.
 - `/budget [USD|off]` shows spent cost and the cap, sets a positive dollar cap, or removes it.
   Changes apply from the next turn of the current run or campaign.
 - `/models` picks the Claude and Codex model and effort: ↑↓ move, ←→ change the value, Tab goes
@@ -206,8 +215,9 @@ Scrolling back, three kinds of lines are easy to tell apart. What you typed stay
 `› your line`, bold on a dark band across the row. tandem's own lines are quiet: a dim `HH:MM`
 stamp, a symbol where it helps (`▸` a new goal, `·` a turn starting, `✓` done, `!` a warning,
 `✗` an error, the last two in yellow and red) and paths shortened with `~` or relative to the
-run directory. Long log entries fit on one row with an ellipsis; `/transcript` prints the full
-transcript path when you need it. Each run opens with a rule such as
+run directory. Ordinary log entries fit on one row with an ellipsis; warnings, errors and the
+end of a run (a blocked run's question, the way past a cap, the transcript path) wrap and are
+never cut. Each run opens with a rule such as
 `── bar-controls · tandem/20261024-071612-bar-controls ───` and closes with one carrying the
 outcome in its color, and the turn cards sit in between. With `NO_COLOR` the marker, symbols and
 rules stay, without color. Only the session looks like this: `start`, `resume`, `-p` and any

@@ -14,6 +14,9 @@
   their branch at the end. `tandem diff [RUN]` and `/diff` show it at any time with
   `git diff --stat`. Headless JSON gains `worktree`, `commits` and `diffstat`, and the
   diffstat now includes `files`. tandem still never merges, pushes or deletes anything itself.
+  Each command sits on its own line and is never cut. The `resume` line after the turn limit
+  carries `--more-turns 6`, and after the cap a `--max-cost` above what was spent. A campaign's
+  goals print only what they added; merge and clean up wait for the campaign's own end.
 
 - Add `--max-cost USD` for runs and campaigns, with a shared campaign cap, remaining-budget
   limits for Claude turns, and `over_budget` (headless exit 6). The cap counts reported cost
@@ -24,7 +27,8 @@
 
 - The interactive session is easier to read back: submitted lines stay as `› line` on a band,
   log lines carry a short `HH:MM` stamp and a symbol by kind instead of the full date, paths
-  show with `~` or relative to the run and long log entries fit on one row. Each run opens and
+  show with `~` or relative to the run, and ordinary log entries fit on one row while warnings,
+  errors and the end of a run wrap whole. Each run opens and
   closes with a rule across the width (the closing one in the outcome's color), and the "talk to the agents"
   hint is gone there. `start`, `resume`, `-p` and non-terminal output are unchanged.
 - Tab on an empty prompt line edits the models and effort on the status bar: Tab and Shift+Tab
@@ -52,8 +56,9 @@
   agent your correction; any other answer than `n` or Enter is saved as more of the correction.
   `/now TEXT` does it without the question. Interrupted turns show as
   `interrupted` and neither count as a failure nor use up a turn.
-- Each turn of an interactive session shows as a card, and `/board` summarizes what the agents agree
-  on, what is open, the models and the cost. Plain output (pipes, `NO_COLOR`) keeps the one-line log.
+- Each turn of an interactive session shows as a card (plain characters with `NO_COLOR`), and
+  `/board` summarizes what the agents agree on, what is open, the models and the cost. Pipes and
+  log files keep the one-line log.
 - The session's prompt has its own line editor: typing `/` shows the matching slash commands with
   a short description under the prompt, and earlier lines come back with ↑ from `~/.tandem/history`.
   Log lines and the status line no longer garble what is being typed, and an empty Enter prints nothing.

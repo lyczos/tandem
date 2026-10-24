@@ -103,6 +103,7 @@ MAX_TRANSIENT_RETRIES = 6
 LIMIT_FALLBACK_WAIT = 3600      # usage limit without a readable reset time
 PLAN_RETRY_WAIT = 600
 MAX_QUEUED = 5                  # owner messages waiting for one turn; the agent reads them all at once
+RESUME_TURNS = 6                # what resuming a run out of turns offers: a round of building and review
 
 # Accounts are shared by every run on this machine, so availability is too: it lives beside the
 # user's config, not in RUNS, so a source checkout and an npm install see the same usage limits.
@@ -276,13 +277,17 @@ OUT_LOCK = threading.RLock()  # every line the orchestrator prints goes through 
 CONSOLE = None                # the interactive session's Console, when one is running
 
 
-def log(msg, kind=None, brief=None):
+def log(msg, kind=None, brief=None, whole=None):
     """One line of the orchestrator's log. Scripts and log files parse the dated form, so it never
     changes outside the terminal session; there the date is noise, and the line gets a short stamp,
-    a symbol by kind (LOG_MARKS) and brief instead of msg when given ("" prints nothing)."""
+    a symbol by kind (LOG_MARKS) and brief instead of msg when given ("" prints nothing).
+
+    The session keeps an entry to one row unless it is whole: warnings, errors and whatever else the
+    owner has to act on (a blocked run's question, the way past a cap) are wrapped, never cut."""
     if in_session():
         if brief != "":
-            emit(CONSOLE.log_line(msg if brief is None else brief, kind))
+            emit(CONSOLE.log_line(msg if brief is None else brief, kind,
+                                  kind in ("warn", "error") if whole is None else whole))
         return
     emit(f"[{now()}] {msg}")
 
@@ -303,6 +308,16 @@ def show_path(path, base=None):
         if root and text.startswith(root + os.sep):
             return prefix + text[len(root) + 1:]
     return text
+
+
+def shell_path(path):
+    """A path inside a command printed for copying: quoted where the shell needs it, and in the
+    session with ~ for the home directory, left outside the quotes so the shell still expands it."""
+    text = str(path)
+    home = str(pathlib.Path.home()).rstrip(os.sep)
+    if in_session() and os.name == "posix" and home and text.startswith(home + os.sep):
+        return "~/" + shlex.quote(text[len(home) + 1:])
+    return shlex.quote(text)
 
 
 def emit(text):
@@ -866,9 +881,10 @@ def status_bar(state, now, width, fancy, progress=None, session_start=None, defa
 
 
 def report_turn(entry):
-    """One finished turn: a card in a fancy session, the single log line everywhere else (logs, pipes, NO_COLOR)."""
-    if CONSOLE and CONSOLE.fancy:
-        return emit(turn_card(entry, True, card_width()))
+    """One finished turn: a card in the session (plain lines without color), the single log line
+    everywhere else (logs, pipes). Under NO_COLOR the card is still the only place the handoff shows."""
+    if in_session():
+        return emit(turn_card(entry, CONSOLE.fancy, card_width()))
     log(f"turn {entry['turn']}: {NAMES[entry['agent']]} -> {entry['status']} ({entry['seconds']}s"
         f"{', commit ' + entry['commit'] if entry['commit'] else ''}) {entry.get('summary') or entry.get('error', '')}",
         "error" if entry["status"] == "error" else "warn" if entry["status"] == "blocked" else None)
@@ -1258,13 +1274,34 @@ def branch_facts(repo, branch, base, worktree=None):
     return facts
 
 
+def raised_cap(cap, spent):
+    """The --max-cost a resume after over_budget offers: another cap's worth on top of what is spent,
+    since a run can overshoot its cap by a turn and doubling the cap may then buy nothing."""
+    return round(spent + cap, 2)
+
+
+def resume_command(run_dir, state):
+    """The resume line for an unfinished run, with what it needs to get past the reason it stopped:
+    a bare resume after the turn limit or the cap would only stop again at once."""
+    extra = ""
+    if state.get("outcome") == "max_turns":
+        extra = f" --more-turns {RESUME_TURNS}"
+    elif state.get("outcome") == "over_budget" and (state.get("config") or {}).get("max_cost"):
+        extra = f" --max-cost {raised_cap(state['config']['max_cost'], budget_spent(state)):g}"
+    return f"{shell_path(prog_name())} resume {shell_path(run_dir)}{extra}"
+
+
 def run_handoff(run_dir, state):
     """The branch a run left behind, as handoff_lines() takes it."""
-    camp = state.get("campaign")
-    again = f"campaign resume {shlex.quote(camp)}" if camp else f"resume {shlex.quote(str(run_dir))}"
-    return {"repo": state.get("repo"), "worktree": state.get("worktree"), "branch": state.get("branch"),
-            "base": state.get("base"),
-            "resume": f"{prog_name()} {again}" if state.get("outcome") in UNFINISHED else None}
+    h = {"repo": state.get("repo"), "worktree": state.get("worktree"), "branch": state.get("branch"),
+         "base": state.get("base"), "resume": None}
+    if state.get("campaign"):
+        # The campaign's worktree and branch are still in use by its next goal: merging or removing
+        # them now would pull half a campaign or crash it. The campaign's own end offers all that.
+        h["goal_only"] = True
+    elif state.get("outcome") in UNFINISHED:
+        h["resume"] = resume_command(run_dir, state)
+    return h
 
 
 def campaign_base(camp):
@@ -1279,12 +1316,29 @@ def campaign_base(camp):
     return None
 
 
+def campaign_spent(camp):
+    """What a campaign has spent: its finished runs, plus the current one, which is not in the total yet."""
+    spent = camp.get("cost_usd", 0.0)
+    if camp.get("current"):
+        with contextlib.suppress(OSError, ValueError, KeyError, TypeError):
+            spent += load(pathlib.Path(camp["current"])).get("cost_usd", 0.0)
+    return spent
+
+
+def campaign_resume_command(camp_dir, camp):
+    extra = ""
+    cap = (camp.get("config") or {}).get("max_cost")
+    if camp.get("outcome") == "over_budget" and cap:
+        extra = f" --max-cost {raised_cap(cap, campaign_spent(camp)):g}"
+    return f"{shell_path(prog_name())} campaign resume {shell_path(camp_dir)}{extra}"
+
+
 def campaign_handoff(camp_dir, camp):
     # A running campaign holds its lock; offering resume then would only meet "already running".
     unfinished = camp.get("outcome") != "finished" and not (camp_dir / ".lock").exists()
     return {"repo": camp.get("repo"), "worktree": camp.get("worktree"), "branch": camp.get("branch"),
             "base": campaign_base(camp),
-            "resume": f"{prog_name()} campaign resume {shlex.quote(str(camp_dir))}" if unfinished else None}
+            "resume": campaign_resume_command(camp_dir, camp) if unfinished else None}
 
 
 def handoff_lines(h):
@@ -1309,21 +1363,28 @@ def handoff_lines(h):
         else:
             what += (f"{stat['files']} file{'' if stat['files'] == 1 else 's'} changed, "
                      f"+{stat['added']} -{stat['removed']}")
-    rows = [("branch", what, False), ("worktree", str(work or "?"), True)]
+    rows = [("branch", what, False)]
+    if h.get("goal_only"):
+        # One goal of a campaign: what it added is enough; the commands come at the campaign's end.
+        return [paint("2", "  goal      ") + (fit_width(what, max(term_width() - 13, 8)) if in_session() else what)]
+    rows.append(("worktree", show_path(work) if work else "?", True))
     if h.get("resume"):
         rows.append(("resume", h["resume"], True))
     if n:
         q = shlex.quote
-        r = q(str(repo))
+        r = shell_path(repo)
+        # One command per line, so a narrow terminal never has to break one in the middle.
         rows += [("read", f"git -C {r} diff {short}..{q(branch)}", True),
                  ("merge", f"git -C {r} merge {q(branch)}", True),
-                 ("clean up", f"git -C {r} worktree remove {q(str(work))} && git -C {r} branch -d {q(branch)}", True)]
+                 ("clean up", f"git -C {r} worktree remove {shell_path(work)}", True),
+                 ("", f"git -C {r} branch -d {q(branch)}", True)]
     if facts["note"]:
         rows.append(("note", facts["note"], False))
     width = max(term_width() - 1, 20)
     lines = []
     for label, text, whole in rows:
         head = paint("2", f"  {label:<9} ")
+        # Commands are never cut: a cut one cannot be copied, and the terminal's own wrap keeps it whole.
         lines.append(head + (text if whole or not in_session() else fit_width(text, width - 12)))
     return lines
 
@@ -1433,9 +1494,12 @@ def finish(run_dir, state, outcome, message):
     save(run_dir, state)
     append_transcript(run_dir, f"\n## Finished: {outcome}\n\n{message}\n")
     log(f"FINISHED {state.get('name') or run_dir.name}: {outcome} - {message}",
-        "error" if outcome == "failed" else "ok" if outcome == "done" else None, brief=message)
+        "error" if outcome == "failed" else "ok" if outcome == "done" else None, brief=message, whole=True)
+    if in_session() and session_hint(state):
+        log(session_hint(state), "warn")
     show_handoff(run_handoff(run_dir, state))
-    log(f"transcript {run_dir / 'transcript.md'}", brief=f"transcript {show_path(run_dir / 'transcript.md', run_dir)}")
+    log(f"transcript {run_dir / 'transcript.md'}", brief=f"transcript {show_path(run_dir / 'transcript.md')}",
+        whole=True)
     if in_session():
         emit(CONSOLE.rule(f"{outcome} \u00b7 {state.get('name') or run_dir.name}", OUTCOME_COLORS.get(outcome, "1")))
     # A campaign goes on to its next goal, so only the campaign's own end is worth a notification.
@@ -1461,9 +1525,19 @@ def turn_budget(cfg, spent):
 def over_budget_message(run_dir, state):
     cap = state["config"]["max_cost"]
     camp = state.get("campaign")
-    again = f"campaign resume {camp}" if camp else f"resume {run_dir}"
+    again = f"campaign resume {shell_path(camp)}" if camp else f"resume {shell_path(run_dir)}"
     return (f"spent ${budget_spent(state):.2f} of the ${cap:.2f} cap; "
-            f"`{prog_name()} {again} --max-cost {cap * 2:g}` continues")
+            f"`{shell_path(prog_name())} {again} --max-cost {raised_cap(cap, budget_spent(state)):g}` continues")
+
+
+def session_hint(state):
+    """How to carry on from inside the session, where /resume alone would stop again at once."""
+    cap = (state.get("config") or {}).get("max_cost")
+    if state.get("outcome") == "over_budget" and cap:
+        return f"/budget {raised_cap(cap, budget_spent(state)):g}, then /resume, continues"
+    if state.get("outcome") == "max_turns" and not state.get("campaign"):
+        return f"/resume {RESUME_TURNS} gives it {RESUME_TURNS} more turns"
+    return None
 
 
 PROGRESS = {}  # turn, agent, since: what the interactive status line shows
@@ -1891,7 +1965,9 @@ def _campaign_loop(camp_dir):
             camp["outcome"] = "over_budget"
             write_json(path, camp)
             log(f"campaign over_budget: spent ${camp['cost_usd']:.2f} of the ${cap:.2f} cap; "
-                f"`{prog_name()} campaign resume {camp_dir} --max-cost {cap * 2:g}` continues", "warn")
+                f"`{campaign_resume_command(camp_dir, camp)}` continues", "warn")
+            if in_session():
+                log(f"/budget {raised_cap(cap, camp['cost_usd']):g}, then /resume, continues", "warn")
             return
         if camp["queue"]:
             item = camp["queue"].pop(0)
@@ -3442,15 +3518,24 @@ class Console:
         text = ("› " if self.utf else "> ") + line
         return f"\x1b[{OWNER_STYLE}m{text}\x1b[K\x1b[0m" if self.fancy else text
 
-    def log_line(self, msg, kind=None):
-        """Keep each session log entry on one row, with an explicit mark when text is clipped."""
+    def log_line(self, msg, kind=None, whole=False):
+        """Keep each session log entry on one row, with an explicit mark when text is clipped; a whole
+        entry keeps its own line breaks and wraps at spaces under the stamp instead."""
         symbol, plain, style = LOG_MARKS.get(kind, (" ", " ", None))
         symbol = symbol if self.utf else plain
         width = max(term_width() - 1, 20)
         text_style = style if kind in ("turn", "warn", "error") else None
         head = self.paint("2", datetime.datetime.now().strftime("%H:%M")) + " " + self.paint(style, symbol) + " "
-        text = CONTROL_CHARS.sub(" ", msg)
         room = width - display_width(head)
+        if whole:
+            # Words longer than the row (a path, a command) stay whole for the terminal to wrap: a
+            # break inside one would not copy back.
+            rows = [row for part in msg.splitlines() if part.strip()
+                    for row in textwrap.wrap(CONTROL_CHARS.sub(" ", part), max(room, 10),
+                                             break_long_words=False, break_on_hyphens=False)]
+            indent = " " * display_width(head)
+            return "\n".join((indent if i else head) + self.paint(text_style, row) for i, row in enumerate(rows or [""]))
+        text = CONTROL_CHARS.sub(" ", msg)
         if display_width(text) > room:
             more = "…" if self.utf else "..."
             text = fit_width(text, room - len(more)) + more
@@ -3963,11 +4048,7 @@ class Session:
             return emit(f"budget: {label} (applies from the next turn)")
         run, camp = self.current_run(target)
         state = camp if camp is not None else load(run)
-        spent = state.get("cost_usd", 0.0)
-        if camp is not None and camp.get("current"):
-            spent += load(pathlib.Path(camp["current"])).get("cost_usd", 0.0)
-        elif camp is None:
-            spent = budget_spent(state)
+        spent = campaign_spent(camp) if camp is not None else budget_spent(state)
         cfg = dict(state.get("config") or {})
         cfg.update(read_tuning(target / "tuning.json"))
         cap = cfg.get("max_cost")
@@ -4036,7 +4117,9 @@ class Session:
         else:
             try:
                 (target / "STOP").unlink(missing_ok=True)
-            except OSError as exc:
+                if more is None and load(target).get("outcome") == "max_turns":
+                    more = RESUME_TURNS  # without more turns the run would stop again at once
+            except (OSError, ValueError) as exc:
                 emit(f"cannot resume: {exc}")
                 return
             self.launch("run", lambda: cmd_resume(argparse.Namespace(run=str(target), more_turns=more)),
