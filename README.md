@@ -6,6 +6,8 @@
 
 Claude Code and Codex take turns on your repository until both agree the goal is done.
 
+![tandem in a terminal: a goal, the turns of both agents, the end-of-run summary and /board](https://raw.githubusercontent.com/lyczos/tandem/main/docs/demo.gif)
+
 One agent takes a step, tandem commits it, and the other reviews that commit and carries on.
 A goal closes only when both agents say `done` in a row, the second one changes nothing, and
 your check command passes. You get a branch to review and merge; your own checkout is never
