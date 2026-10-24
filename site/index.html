@@ -1,0 +1,325 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>tandem: Claude Code and Codex, taking turns</title>
+<meta name="description" content="tandem makes Claude Code and Codex take turns on your repository until both agree the goal is done and your check passes. Open source, MIT.">
+<meta property="og:type" content="website">
+<meta property="og:url" content="https://lyczos.github.io/tandem/">
+<meta property="og:title" content="tandem: Claude Code and Codex, taking turns">
+<meta property="og:description" content="One agent takes a step, tandem commits it, the other reviews that commit and carries on. A goal closes only when both agree it is done and your check passes.">
+<meta property="og:image" content="https://lyczos.github.io/tandem/og.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ccircle cx='10' cy='16' r='7' fill='%23ff8a3d'/%3E%3Ccircle cx='22' cy='16' r='7' fill='%2362b2ff'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wdth,wght@12..96,75..100,500..800&family=Instrument+Sans:wght@400;500;600&family=JetBrains+Mono:wght@400;600&display=swap">
+<style>
+/* Two lanes, Claude left and Codex right, joined by one git rail: the page reads like a run.
+   The agent colours are the ones the terminal uses (256-colour 208 and 75). */
+:root {
+  --bg: #0e131d; --surface: #151c29; --line: #263044; --fg: #e7eaf0; --muted: #8d96a9;
+  --claude: #ff8a3d; --codex: #62b2ff; --ok: #5fd39a;
+  --display: "Bricolage Grotesque", "Avenir Next Condensed", "Arial Narrow", sans-serif;
+  --body: "Instrument Sans", "Helvetica Neue", Arial, sans-serif;
+  --mono: "JetBrains Mono", ui-monospace, Menlo, monospace;
+  color-scheme: dark;
+}
+@media (prefers-color-scheme: light) {
+  :root {
+    --bg: #f3f5f9; --surface: #ffffff; --line: #d8dde7; --fg: #111827; --muted: #586276;
+    --claude: #c9560f; --codex: #1b6fc4; --ok: #17834d; color-scheme: light;
+  }
+}
+
+* { box-sizing: border-box }
+html { -webkit-text-size-adjust: 100% }
+body { margin: 0; background: var(--bg); color: var(--fg); font: 400 17px/1.6 var(--body);
+  padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px)) }
+img { max-width: 100%; height: auto; display: block }
+.wrap { max-width: 1080px; margin: 0 auto }
+a { color: inherit }
+a:focus-visible, button:focus-visible { outline: 2px solid var(--codex); outline-offset: 3px }
+code, pre { font-family: var(--mono); font-size: .86em }
+h1, h2, h3 { font-family: var(--display); text-wrap: balance; margin: 0 }
+h2 { font-size: clamp(1.8rem, 4vw, 2.6rem); font-weight: 700; font-variation-settings: "wdth" 80; line-height: 1.05; letter-spacing: -.01em }
+.eyebrow { font: 600 .74rem/1 var(--mono); letter-spacing: .14em; text-transform: uppercase; color: var(--muted) }
+section { padding-block: clamp(56px, 9vw, 104px); border-top: 1px solid var(--line) }
+.intro { display: grid; gap: 18px; margin-bottom: 36px }
+.lede { max-width: 62ch; color: var(--muted); font-size: 1.08rem; margin: 0 }
+.c { color: var(--claude) } .x { color: var(--codex) }
+
+nav { display: flex; justify-content: space-between; align-items: center; gap: 16px; padding-block: 22px; flex-wrap: wrap }
+.logo { font: 800 1.3rem/1 var(--display); font-variation-settings: "wdth" 75; display: flex; align-items: center; gap: 10px; text-decoration: none }
+.logo i { display: inline-flex; gap: 3px }
+.logo i b { width: 10px; height: 10px; border-radius: 50% }
+.logo i b:first-child { background: var(--claude) }
+.logo i b:last-child { background: var(--codex) }
+nav ul { display: flex; gap: 22px; list-style: none; margin: 0; padding: 0; font-size: .95rem; color: var(--muted); flex-wrap: wrap }
+nav a { text-decoration: none }
+nav a:hover { color: var(--fg) }
+
+.hero { padding-block: clamp(40px, 8vw, 96px) clamp(48px, 7vw, 80px); display: grid; grid-template-columns: minmax(0, 1fr); gap: 28px }
+.hero h1 { font-size: clamp(2.9rem, 9vw, 6.4rem); font-weight: 800; font-variation-settings: "wdth" 75; line-height: .92; letter-spacing: -.02em; max-width: 13ch }
+.hero p { max-width: 56ch; font-size: clamp(1.05rem, 2vw, 1.25rem); color: var(--muted); margin: 0 }
+.cta { display: flex; flex-wrap: wrap; gap: 12px; align-items: center }
+.install { display: flex; align-items: center; gap: 14px; background: var(--surface); border: 1px solid var(--line); border-radius: 10px; padding: 12px 12px 12px 18px; font: 400 .95rem var(--mono); min-width: 0; max-width: 100% }
+.install span { color: var(--muted) }
+.install code { font-size: 1em; overflow-x: auto; white-space: nowrap; min-width: 0; flex: 1 }
+button { font: 600 .82rem var(--body); color: var(--fg); background: transparent; border: 1px solid var(--line); border-radius: 7px; padding: 7px 12px; cursor: pointer }
+button:hover { border-color: var(--fg) }
+.btn { text-decoration: none; font-weight: 600; padding: 12px 18px; border-radius: 10px; border: 1px solid var(--line) }
+.btn:hover { border-color: var(--fg) }
+.meta { font: 400 .8rem var(--mono); color: var(--muted); display: flex; gap: 18px; flex-wrap: wrap }
+
+.run-head { display: flex; justify-content: space-between; align-items: end; gap: 24px; flex-wrap: wrap; margin-bottom: 40px }
+.run-head > div:first-child { display: grid; gap: 14px }
+.goal { font: 400 .88rem/1.5 var(--mono); background: var(--surface); border: 1px solid var(--line); border-radius: 10px; padding: 14px 18px; max-width: 100%; overflow-x: auto; white-space: pre }
+.goal b { color: var(--muted); font-weight: 400 }
+.lanes { display: grid; grid-template-columns: minmax(0, 1fr) 64px minmax(0, 1fr) }
+.lane-label { font: 600 .74rem/1 var(--mono); letter-spacing: .14em; text-transform: uppercase; padding-bottom: 18px }
+.lane-label.c { grid-column: 1; text-align: right }
+.lane-label.x { grid-column: 3 }
+.rail { grid-column: 2; grid-row: 2 / span 3; justify-self: center; width: 2px; background: var(--line) }
+.turn { grid-column: 1; display: grid; gap: 8px; padding: 18px 20px; border: 1px solid var(--line); border-radius: 12px; background: var(--surface); position: relative; margin-bottom: 18px; min-width: 0 }
+.turn::after { content: ""; position: absolute; top: 24px; width: 12px; height: 12px; border-radius: 50%; background: var(--bg); border: 2px solid currentColor }
+.turn.by-c { color: var(--claude); border-top: 3px solid var(--claude) }
+.turn.by-c::after { right: -39px }
+.turn.by-x { grid-column: 3; color: var(--codex); border-top: 3px solid var(--codex) }
+.turn.by-x::after { left: -39px }
+.turn.nocommit::after { border-style: dashed }
+.turn > * { color: var(--fg); margin: 0 }
+.turn h3 { font: 600 .8rem/1 var(--mono); letter-spacing: .06em; color: inherit; display: flex; justify-content: space-between; gap: 12px }
+.turn h3 span { color: var(--muted); font-weight: 400 }
+.turn p { font-size: .96rem }
+.turn .note { font-size: .86rem; color: var(--muted) }
+.tag { display: inline-block; font: 600 .72rem/1 var(--mono); padding: 5px 8px; border-radius: 6px; border: 1px solid var(--line); color: var(--muted) }
+.tag.done { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 45%, transparent) }
+.close { grid-column: 1 / -1; justify-self: center; text-align: center; display: grid; gap: 10px; padding: 22px 26px; border: 1px solid color-mix(in srgb, var(--ok) 45%, transparent); border-radius: 12px; background: color-mix(in srgb, var(--ok) 8%, var(--surface)); max-width: 100%; min-width: 0 }
+.close strong { font: 700 1.3rem/1.1 var(--display); color: var(--ok) }
+.close code { color: var(--muted); overflow-x: auto; white-space: nowrap; display: block }
+
+.rule { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.2fr); gap: clamp(28px, 6vw, 72px); align-items: start }
+.rule .intro { margin: 0 }
+.checks { list-style: none; margin: 0; padding: 0; display: grid; border-top: 1px solid var(--line) }
+.checks li { display: grid; grid-template-columns: 34px 1fr; gap: 14px; padding-block: 18px; border-bottom: 1px solid var(--line) }
+.checks li::before { content: "\2713"; font: 600 1rem/1.5 var(--mono); color: var(--ok) }
+.checks b { display: block; font-weight: 600 }
+.checks span { color: var(--muted); font-size: .95rem }
+
+.term { border: 1px solid var(--line); border-radius: 12px; overflow: hidden; background: #272822; max-width: 100% }
+.term-bar { display: flex; gap: 7px; padding: 12px 14px; background: #33342c }
+.term-bar b { width: 11px; height: 11px; border-radius: 50%; background: #55564c }
+.term img { width: 100% }
+
+.compare { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); border: 1px solid var(--line); border-radius: 14px; overflow: hidden }
+.compare > div { padding: clamp(22px, 4vw, 36px); display: grid; gap: 14px; align-content: start }
+.compare > div + div { border-left: 1px solid var(--line); background: var(--surface) }
+.compare h3 { font-size: 1.35rem; font-weight: 700; font-variation-settings: "wdth" 85 }
+.compare ul { margin: 0; padding-left: 1.1em; display: grid; gap: 8px; color: var(--muted) }
+.compare li::marker { color: var(--line) }
+.compare > div + div li { color: var(--fg) }
+.compare > div + div li::marker { color: var(--ok) }
+
+.grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 1px; background: var(--line); border: 1px solid var(--line); border-radius: 14px; overflow: hidden; margin-top: 40px }
+.grid > div { background: var(--bg); padding: 26px; display: grid; gap: 8px; align-content: start }
+.grid h3 { font: 600 1rem/1.3 var(--body) }
+.grid p { margin: 0; color: var(--muted); font-size: .95rem }
+.grid code { color: var(--fg) }
+
+.steps { counter-reset: s; display: grid; gap: 14px; margin-top: 36px }
+.step { display: grid; grid-template-columns: 56px minmax(0, 1fr); gap: 16px; align-items: start }
+.step::before { counter-increment: s; content: counter(s); font: 800 2rem/1 var(--display); font-variation-settings: "wdth" 75; color: var(--muted) }
+.step pre { margin: 6px 0 0; background: var(--surface); border: 1px solid var(--line); border-radius: 10px; padding: 14px 18px; overflow-x: auto; line-height: 1.6 }
+.step pre .k { color: var(--muted) }
+.step p { margin: 0; font-weight: 600 }
+
+.warn { margin: 36px 0 0; padding: 18px 22px; border: 1px solid color-mix(in srgb, var(--claude) 45%, transparent); border-radius: 12px; max-width: 72ch; font-size: .95rem }
+.warn b { color: var(--claude) }
+
+footer { border-top: 1px solid var(--line); padding-block: 32px 48px; display: flex; justify-content: space-between; gap: 16px; flex-wrap: wrap; color: var(--muted); font-size: .9rem }
+
+@media (max-width: 760px) {
+  .lanes { grid-template-columns: minmax(0, 1fr) }
+  .rail, .lane-label { display: none }
+  .turn, .turn.by-x { grid-column: 1; grid-row: auto !important }
+  .turn::after { display: none }
+  .close { grid-row: auto !important }
+  .rule, .compare, .grid { grid-template-columns: minmax(0, 1fr) }
+  .compare > div + div { border-left: 0; border-top: 1px solid var(--line) }
+  nav ul { gap: 16px }
+  .install code { white-space: normal; overflow-wrap: anywhere }
+}
+@media (min-width: 761px) and (max-width: 980px) { .grid { grid-template-columns: repeat(2, minmax(0, 1fr)) } }
+@media (prefers-reduced-motion: no-preference) {
+  .turn { transition: transform .2s ease }
+  .turn:hover { transform: translateY(-2px) }
+}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <nav>
+    <a class="logo" href="./"><i><b></b><b></b></i>tandem</a>
+    <ul>
+      <li><a href="#rule">How it decides</a></li>
+      <li><a href="#start">Install</a></li>
+      <li><a href="https://github.com/lyczos/tandem/blob/main/docs/usage.md">Guide</a></li>
+      <li><a href="https://github.com/lyczos/tandem">GitHub</a></li>
+    </ul>
+  </nav>
+
+  <header class="hero">
+    <span class="eyebrow">open source · MIT</span>
+    <h1><span class="c">Claude Code</span> and <span class="x">Codex</span>, taking turns.</h1>
+    <p>One agent takes a step, tandem commits it, the other reviews that commit and carries on. The goal closes only when both agree it is done and your check passes. You get a branch to merge.</p>
+    <div class="cta">
+      <div class="install"><span>$</span><code id="cmd">npm install -g @lyczos/tandem</code><button id="copy" type="button">Copy</button></div>
+      <a class="btn" href="https://github.com/lyczos/tandem">Source on GitHub</a>
+    </div>
+    <div class="meta"><span>Python 3.9+ · Node 18+ · Git</span><span>one Python file, no dependencies</span></div>
+  </header>
+
+  <section aria-labelledby="run-title">
+    <div class="run-head">
+      <div>
+        <span class="eyebrow">An example run</span>
+        <h2 id="run-title">Three turns, one branch.</h2>
+      </div>
+      <div class="goal"><b>goal </b> Add a command-line todo list: add, list, done
+<b>check</b> python3 -m unittest discover -s tests</div>
+    </div>
+    <div class="lanes">
+      <div class="lane-label c">Claude Code</div>
+      <div class="lane-label x">Codex</div>
+      <div class="rail"></div>
+
+      <article class="turn by-c" style="grid-row:2">
+        <h3>turn 1 · claude <span>3f1a2c0</span></h3>
+        <p>Wrote <code>todo.py</code> with the three commands and tests for each.</p>
+        <p class="note">Left open: a bad number for <code>done</code> exits 0.</p>
+        <div><span class="tag">continue</span></div>
+      </article>
+      <article class="turn by-x" style="grid-row:3">
+        <h3>turn 2 · codex <span>9b7e41d</span></h3>
+        <p>Reviewed turn 1. Made a bad number exit 1 with a clear message, added the error tests.</p>
+        <p class="note">Nothing left from the goal.</p>
+        <div><span class="tag done">done</span></div>
+      </article>
+      <article class="turn by-c nocommit" style="grid-row:4">
+        <h3>turn 3 · claude <span>no commit</span></h3>
+        <p>Read Codex's change with fresh eyes and ran the tests. Nothing to change.</p>
+        <p class="note">Agrees the goal is met.</p>
+        <div><span class="tag done">done</span></div>
+      </article>
+      <div class="close" style="grid-row:5">
+        <strong>done · check passed</strong>
+        <code>git merge tandem/20261024-120000-todo-cli</code>
+      </div>
+    </div>
+  </section>
+
+  <section id="rule">
+    <div class="rule">
+      <div class="intro">
+        <span class="eyebrow">The done rule</span>
+        <h2>Neither agent closes a goal alone.</h2>
+        <p class="lede">The agent that wrote the code is the worst judge of it. tandem ends a run only when the other agent has looked and found nothing to fix.</p>
+      </div>
+      <ul class="checks">
+        <li><div><b>Both say done, back to back</b><span>One agent's <code>done</code>, then the other's on the very next turn.</span></div></li>
+        <li><div><b>The second turn changes nothing</b><span>A fresh look that produces no commit. If it fixes something, the count starts over.</span></div></li>
+        <li><div><b>Your check passes</b><span>Tests, a linter, a build: any command you give with <code>--check</code> or in the goal file.</span></div></li>
+      </ul>
+    </div>
+  </section>
+
+  <section>
+    <div class="intro">
+      <span class="eyebrow">In the terminal</span>
+      <h2>Keep typing while they work.</h2>
+      <p class="lede">Each turn arrives as a card. Type a message and the next agent reads it; <code>/now</code> stops the turn and hands it your correction. <code>/board</code> shows what the agents agree on, what is open, models and cost.</p>
+    </div>
+    <div class="term">
+      <div class="term-bar"><b></b><b></b><b></b></div>
+      <img src="demo.gif" width="1152" height="784" loading="lazy" alt="A real tandem session: a goal, a message typed during the turn, both agents' cards, changing a model from the status bar, the end-of-run summary and /board">
+    </div>
+  </section>
+
+  <section>
+    <div class="intro">
+      <span class="eyebrow">Why two CLIs</span>
+      <h2>Two peers, not an agent with a tool.</h2>
+      <p class="lede">Plugins and skills already let Claude Code call Codex, or run Claude inside Codex. That keeps one agent in charge, judging its own work. tandem gives both the same job and puts the referee outside them.</p>
+    </div>
+    <div class="compare">
+      <div>
+        <h3>One agent calls the other</h3>
+        <ul>
+          <li>The driver decides when to ask for a second opinion, and whether to listen.</li>
+          <li>The driver says when the work is finished.</li>
+          <li>Edits land in your checkout; you commit.</li>
+          <li>When the driver's account hits its limit, everything stops.</li>
+        </ul>
+      </div>
+      <div>
+        <h3>tandem</h3>
+        <ul>
+          <li>Every turn is reviewed by the other agent, by design.</li>
+          <li>Only both agents plus your check can end a run.</li>
+          <li>Own worktree and branch, one commit per turn. Your checkout is never touched.</li>
+          <li>One agent hits its limit, the other carries on alone, and the work gets reviewed later.</li>
+        </ul>
+      </div>
+    </div>
+    <div class="grid">
+      <div><h3>Resume anything</h3><p>All state is on disk. After a crash, a closed laptop or Ctrl+C twice, <code>tandem resume</code> continues the run.</p></div>
+      <div><h3>Scripts and CI</h3><p><code>tandem -p "goal" --output-format json</code>. Exit codes say how it ended: 0 done, 2 out of turns, 3 blocked, 6 over budget.</p></div>
+      <div><h3>A cost cap</h3><p><code>--max-cost 5</code> stops before a turn that would start past five dollars of reported spend.</p></div>
+      <div><h3>Campaigns</h3><p>Chain goals on one branch. An agent picks the next one from your project's own plan.</p></div>
+      <div><h3>Models per agent</h3><p>Tab on an empty line changes model and effort from the next turn. <code>/models</code> saves your defaults.</p></div>
+      <div><h3>Notifications</h3><p>A desktop notification when a run ends or both agents are waiting for their limits.</p></div>
+    </div>
+  </section>
+
+  <section id="start">
+    <div class="intro">
+      <span class="eyebrow">Install</span>
+      <h2>Three steps to a first run.</h2>
+      <p class="lede">You need Python 3.9+, Node 18+, Git, and both agent CLIs logged in with your own accounts.</p>
+    </div>
+    <div class="steps">
+      <div class="step"><div><p>Install the agents, if you do not have them</p><pre>npm install -g @anthropic-ai/claude-code @openai/codex
+claude auth login &amp;&amp; codex login</pre></div></div>
+      <div class="step"><div><p>Install tandem and check the setup</p><pre>npm install -g @lyczos/tandem
+tandem doctor            <span class="k"># every line should say ok</span></pre></div></div>
+      <div class="step"><div><p>Start it in any git repository with a commit</p><pre>cd ~/code/my-project
+tandem</pre></div></div>
+    </div>
+    <p class="warn"><b>Know what it runs.</b> Claude Code works from an allow-list of commands. That is a guard rail, not a sandbox: <code>python3</code> or <code>npm</code> can run any code as your user. Only Codex is sandboxed. Use tandem on repositories you trust, ideally in a VM or container if the code is not yours.</p>
+  </section>
+
+  <footer>
+    <span>tandem · MIT · by Michał Łyczko</span>
+    <span><a href="https://github.com/lyczos/tandem">GitHub</a> · <a href="https://www.npmjs.com/package/@lyczos/tandem">npm</a> · <a href="https://github.com/lyczos/tandem/blob/main/docs/usage.md">Guide</a> · <a href="https://github.com/lyczos/tandem/blob/main/CHANGELOG.md">Changelog</a></span>
+  </footer>
+</div>
+
+<script>
+// Clipboard access can be refused (insecure context, old browsers); selecting the text still lets people copy it.
+document.getElementById("copy").addEventListener("click", function () {
+  var btn = this, cmd = document.getElementById("cmd");
+  function show(label) { btn.textContent = label; setTimeout(function () { btn.textContent = "Copy"; }, 1600); }
+  function select() {
+    var range = document.createRange(); range.selectNodeContents(cmd);
+    var sel = getSelection(); sel.removeAllRanges(); sel.addRange(range); show("Selected");
+  }
+  try { navigator.clipboard.writeText(cmd.textContent).then(function () { show("Copied"); }, select); }
+  catch (e) { select(); }
+});
+</script>
+</body>
+</html>
