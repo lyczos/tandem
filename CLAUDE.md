@@ -41,6 +41,9 @@ formatter configured.
 The npm CI job uses Node 20, tests the launcher, and installs an `npm pack` tarball into a
 temporary prefix to check `tandem --version` and `tandem --help`. Launcher tests skip when Node
 is absent, so the Python suite still runs without Node.
+`site/` is the GitHub Pages landing page, one hand-written `index.html` with no build step;
+`.github/workflows/pages.yml` publishes it from `main` and copies `docs/demo.gif` in. Keep its
+claims in step with the README.
 
 The interactive session (`cmd_interactive`, `Session`, `Console`) runs `loop()` in a worker thread
 while the main thread reads input. All output must go through `emit()`/`log()` (one `OUT_LOCK`),

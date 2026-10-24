@@ -132,6 +132,7 @@ Only one process can drive a run at a time; resume refuses a run that is still r
 
 ## More
 
+- [Website](https://lyczos.github.io/tandem/): what tandem is, on one page.
 - [Full guide](https://github.com/lyczos/tandem/blob/main/docs/usage.md): every command and
   key, run storage, campaigns, notifications, configuration, auth and costs.
 - [Changelog](CHANGELOG.md).
