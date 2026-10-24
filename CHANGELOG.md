@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.1
+
+- The README opens with a recording of a real session: a goal, a message typed during the
+  turn, both agents' cards, changing a model from the status bar, the end-of-run summary and
+  `/board`. No change to the program itself.
+- Bug reports and feature requests now go through issue forms on GitHub.
+
 ## 0.1.0
 
 - tandem tells you when a run needs you: a desktop notification (`osascript` on macOS,
