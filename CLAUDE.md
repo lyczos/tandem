@@ -167,6 +167,11 @@ user's machine — it is a guard rail, not a sandbox, and the README and `docs/u
 
 - Prose in the README, prompts and commit messages is plain, concrete and unhyped; the agents'
   structured replies are deliberately terse ("caveman style", defined in `prompts/turn.md`).
+- Commit messages in this repository follow Conventional Commits: `type(scope): subject`, with
+  type one of `feat`, `fix`, `docs`, `test`, `refactor`, `perf`, `build`, `ci` or `chore`, an
+  optional scope (`session`, `loop`, `cli`, `npm`, ...), and an imperative, lower-case subject
+  without a period. The body says what changed and why. This is for commits to tandem itself;
+  the `tandem(agent): ...` messages `commit_turn()` writes in target repositories stay as they are.
 - Comments explain *why* a rule exists (usually "an agent must not review its own work" or "the
   accounts are shared"), not what the line does. Match that density.
 - Helpers to reuse rather than reinvent: `git()` (raises `GitError` with context), `log()`,
