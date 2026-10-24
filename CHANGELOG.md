@@ -7,6 +7,7 @@
   or crashes in the session, `start` or `resume`, when a campaign ends or crashes, and once per wait when both agents
   are on usage limits. Headless `-p` notifies only with `--notify`; `--no-notify` or
   `"notify": false` in `~/.tandem/config.json` turns it off. `doctor` names the notifier.
+  Stopping a run yourself (Ctrl+C, or `/quit` during a turn) does not notify.
 
 - Every run ends with what changed and how to take it: the branch, its commits and diffstat
   over the base, the worktree, and ready-to-copy `git -C REPO diff`, `merge` and cleanup
@@ -72,9 +73,10 @@
   a short description under the prompt, and earlier lines come back with ↑ from `~/.tandem/history`.
   Log lines and the status line no longer garble what is being typed, and an empty Enter prints nothing.
 - `/models` picks Claude and Codex model and effort with the arrow keys; a running run or campaign
-  takes the choice from its next turn.
+  takes the choice from its next turn. Enter saves only what changed.
 - Add `--claude-effort`. Model and effort choices made with `/models` are saved in
-  `~/.tandem/config.json` and used when the matching flag is not given.
+  `~/.tandem/config.json` and used when the matching flag is not given. A saved or tuned value of
+  the wrong type (a number for a model, text for the cap) is ignored instead of crashing the run.
 - Add the public npm package `@lyczos/tandem`, installing the `tandem` command. The Node
   launcher has no runtime dependencies or install scripts; source execution still works.
 - Lower the supported Python floor to 3.9, including macOS Command Line Tools Python 3.9.6.

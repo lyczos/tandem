@@ -444,7 +444,8 @@ A run takes long enough that you will look away, so tandem tells you when it nee
 run ends (any outcome, including a crash) in the interactive session, `start` or `resume`; when
 a campaign ends or crashes; and once each time both agents are on usage limits and the loop
 starts waiting, with the time it resumes. Runs inside a campaign do not notify on their own, only
-the campaign's end does. Ctrl+C does not notify, since whoever pressed it is looking. The
+the campaign's end does. Ctrl+C, or leaving the session with `/quit` while a run goes, does not
+notify, since whoever did it is looking. The
 message is short, such as `status-bar: done in 5 turns, $2.83`,
 `status-bar: blocked, Codex needs you` or `campaign 20261024-0848: stopped after 3 goals, 14 turns, $9.10`.
 

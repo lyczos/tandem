@@ -566,12 +566,24 @@ def write_tuning(target, values):
     write_json(path, current)
 
 
+def valid_setting(key, value):
+    """Whether a saved or tuned value can reach a CLI flag or the cap check. These files can be
+    edited by hand, and a number where a model name goes would crash every turn; null means default."""
+    if value is None:
+        return True
+    if key == "max_cost":
+        return isinstance(value, (int, float)) and not isinstance(value, bool) and 0 < value < float("inf")
+    return isinstance(value, str) and bool(value.strip())
+
+
 def read_tuning(path):
     try:
         data = json.loads(pathlib.Path(path).read_text())
     except (OSError, ValueError):
         return {}  # missing, or caught mid-edit by hand: keep the current settings
-    return {k: v for k, v in data.items() if k in TUNING_KEYS} if isinstance(data, dict) else {}
+    if not isinstance(data, dict):
+        return {}
+    return {k: v for k, v in data.items() if k in TUNING_KEYS and valid_setting(k, v)}
 
 
 def apply_tuning(state, paths):
@@ -2223,9 +2235,10 @@ def cmd_headless(args):
                 # The saved state includes every completed turn, including after Ctrl+C.
                 state = load(run_dir)
         except KeyboardInterrupt:
+            NOTIFY["on"] = False  # whoever pressed Ctrl+C is looking
             message = "Interrupted by the owner."
             if run_dir:
-                message += f" Continue with `{prog_name()} resume {run_dir}`."
+                message += f" Continue with `{shell_path(prog_name())} resume {shell_path(run_dir)}`."
                 finish(run_dir, state, "stopped", message)
             else:
                 state.update(outcome="stopped", outcome_message=message)
@@ -2878,7 +2891,7 @@ def load_defaults():
     saved = read_config().get("defaults")
     if not isinstance(saved, dict):
         return {}
-    return {k: v for k, v in saved.items() if k in TUNABLE}
+    return {k: v for k, v in saved.items() if k in TUNABLE and valid_setting(k, v)}
 
 
 def save_defaults(values):
@@ -2987,6 +3000,10 @@ EFFORT_NOTES = {"low": "quick, light reasoning", "medium": "balanced speed and d
 PICKER_HINT = "↑↓ move · ←→ change · Tab next · Enter save · Esc cancel"
 
 
+def text_or(value, fallback):
+    return value if isinstance(value, str) and value else fallback
+
+
 def codex_models():
     """[(slug, description, [(effort, description), ...])] from Codex's cache; [] when it is unreadable."""
     try:
@@ -2999,10 +3016,11 @@ def codex_models():
         if not isinstance(m, dict) or not isinstance(m.get("slug"), str) or m.get("visibility", "list") != "list":
             continue
         levels = m.get("supported_reasoning_levels")
-        levels = [(lv["effort"], lv.get("description") or EFFORT_NOTES.get(lv["effort"], ""))
+        # The cache is Codex's, not ours: a description that is not text is left out, never printed.
+        levels = [(lv["effort"], text_or(lv.get("description"), EFFORT_NOTES.get(lv["effort"], "")))
                   for lv in (levels if isinstance(levels, list) else [])
                   if isinstance(lv, dict) and isinstance(lv.get("effort"), str)]
-        found.append((m["slug"], m.get("description") or "", levels))
+        found.append((m["slug"], text_or(m.get("description"), ""), levels))
     return found
 
 
@@ -4077,10 +4095,13 @@ class Session:
             return
         with self.console.hold():
             choice = run_picker(model_choices(current))
-        if choice is None:
+        # Only what the owner changed, as the bar's edit mode saves: the rows also show the run's own
+        # values, which must not become everyone's defaults just because Enter was pressed.
+        changed = {k: v for k, v in (choice or {}).items() if v != current.get(k)}
+        if not changed:
             emit("models unchanged")
             return
-        self.save_models(choice, choice)
+        self.save_models(changed, choice)
 
     def save_models(self, changed, values):
         """Save changed as the default and hand it to the current run or campaign; values is the
@@ -4355,6 +4376,8 @@ def cmd_interactive(args):
         pressed = []
         signal.signal(signal.SIGINT, lambda signum, frame: pressed.append(signum))
         session.quitting = True
+        # The run this ends as stopped was stopped by the owner, who is looking: no notification.
+        NOTIFY["on"] = False
         stopped_turn = by_ctrl_c and session.busy() and bool(PROGRESS.get("since"))  # a turn, not the check
         # A detached agent left running would keep editing the worktree, and a later resume could
         # start a second agent there. Event waits also avoid interrupting Thread.join on 3.9.

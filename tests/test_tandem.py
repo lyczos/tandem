@@ -30,13 +30,19 @@ def setUpModule():
     patch = mock.patch.object(tandem, "notify", lambda title, body: None)
     patch.start()
     unittest.addModuleCleanup(patch.stop)
+    # Nor read the owner's saved models, consent or history: ~ is a throwaway directory for every test.
+    home = tempfile.TemporaryDirectory()
+    unittest.addModuleCleanup(home.cleanup)
+    patch = mock.patch.dict(os.environ, {"HOME": home.name})
+    patch.start()
+    unittest.addModuleCleanup(patch.stop)
 
 
 class RunsDirectory(unittest.TestCase):
     def setUp(self):
-        temp = tempfile.TemporaryDirectory(dir=ROOT)
+        temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
-        self.base = pathlib.Path(temp.name)
+        self.base = pathlib.Path(temp.name).resolve()  # macOS: /var is a link to /private/var, and git reports the real path
         self.root = self.base / "renamed-checkout"
         self.root.mkdir()
         for patch in (mock.patch.object(tandem, "ROOT", self.root),
@@ -192,9 +198,9 @@ class Git(unittest.TestCase):
 @unittest.skipUnless(shutil.which("node") and os.name == "posix", "launcher checks need Node and POSIX")
 class NpmLauncher(unittest.TestCase):
     def setUp(self):
-        temp = tempfile.TemporaryDirectory(dir=ROOT)
+        temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
-        self.temp = pathlib.Path(temp.name)
+        self.temp = pathlib.Path(temp.name).resolve()  # macOS: /var is a link to /private/var, and git reports the real path
         self.node = shutil.which("node")
         self.env = dict(os.environ, PATH=str(self.temp), TANDEM_PYTHON="")
 
@@ -388,7 +394,7 @@ class RequireRepo(unittest.TestCase):
     def setUp(self):
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
-        self.dir = pathlib.Path(temp.name)
+        self.dir = pathlib.Path(temp.name).resolve()  # macOS: /var is a link to /private/var, and git reports the real path
 
     def test_not_a_repo_and_no_commits_fail_with_fix(self):
         with self.assertRaises(SystemExit) as cm:
@@ -421,7 +427,7 @@ class DoctorRepoAndVersions(unittest.TestCase):
     def setUp(self):
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
-        self.dir = pathlib.Path(temp.name)
+        self.dir = pathlib.Path(temp.name).resolve()  # macOS: /var is a link to /private/var, and git reports the real path
 
     def test_cwd_repo_status_steps(self):
         ok, detail = tandem.cwd_repo_status(self.dir)
@@ -491,9 +497,9 @@ class ListRuns(unittest.TestCase):
 
 class Headless(unittest.TestCase):
     def setUp(self):
-        temp = tempfile.TemporaryDirectory(dir=ROOT)
+        temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
-        self.base = pathlib.Path(temp.name)
+        self.base = pathlib.Path(temp.name).resolve()  # macOS: /var is a link to /private/var, and git reports the real path
         self.repo = self.base / "repo"
         self.repo.mkdir()
         self.runs = self.base / "runs"
@@ -929,6 +935,21 @@ class Tuning(unittest.TestCase):
         (d / "tuning.json").write_text("{")
         self.assertEqual(tandem.apply_tuning(state, [d / "tuning.json", d / "missing.json"]), [])
 
+    def test_hand_edited_values_of_the_wrong_type_are_ignored(self):
+        d = self.base / "t"
+        d.mkdir()
+        (d / "tuning.json").write_text(json.dumps({"claude_model": 5, "codex_model": "", "codex_effort": "high",
+                                                   "max_cost": "5", "claude_effort": None}))
+        self.assertEqual(tandem.read_tuning(d / "tuning.json"), {"codex_effort": "high", "claude_effort": None})
+        for cap, kept in ((5, True), (2.5, True), (True, False), (0, False), (-1, False), (float("nan"), False)):
+            self.assertEqual(tandem.valid_setting("max_cost", cap), kept, cap)
+        home = self.base / "home"
+        with mock.patch.dict(os.environ, {"HOME": str(home)}):
+            tandem.config_path().parent.mkdir(parents=True)
+            tandem.config_path().write_text(json.dumps({"defaults": {"claude_model": 5, "codex_model": "o3",
+                                                                     "codex_effort": ["high"]}}))
+            self.assertEqual(tandem.load_defaults(), {"codex_model": "o3"})
+
     def test_later_file_wins(self):
         a, b = self.base / "a", self.base / "b"
         for d, model in ((a, "one"), (b, "two")):
@@ -1362,6 +1383,14 @@ class Notify(unittest.TestCase):
         notify.assert_called_once_with("tandem", "bar: out of turns in 2 turns, $1.00")
         self.assertFalse(tandem.NOTIFY["on"])  # main() leaves no switch on for whatever runs next
 
+    def test_ctrl_c_in_headless_does_not_notify(self):
+        self.home()
+        with mock.patch.object(tandem, "notify") as notify, \
+                mock.patch.object(tandem, "call_agent", side_effect=KeyboardInterrupt):
+            code, out, err = self.invoke("-p", "Work", "--notify", "--name", "nb", "--output-format", "json")
+        self.assertEqual((code, json.loads(out)["outcome"]), (4, "stopped"))
+        notify.assert_not_called()
+
     def test_blocked_names_who_needs_the_owner(self):
         self.home()
         reply = {"status": "blocked", "summary": "s", "handoff": "Need answer"}
@@ -1657,7 +1686,7 @@ class StatusBar(unittest.TestCase):
     def setUp(self):
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
-        self.dir = pathlib.Path(temp.name)
+        self.dir = pathlib.Path(temp.name).resolve()  # macOS: /var is a link to /private/var, and git reports the real path
         patcher = mock.patch.object(tandem, "AVAILABILITY", self.dir / "availability.json")
         patcher.start()
         self.addCleanup(patcher.stop)
@@ -2470,6 +2499,16 @@ class Picker(unittest.TestCase):
                 self.assertEqual(rows[3]["values"], ["default", *tandem.EFFORTS])
                 self.assertIn("Codex model", tandem.render_picker(rows, 2, 80))
 
+    def test_descriptions_that_are_not_text_are_left_out(self):
+        self.cache.write_text(json.dumps({"models": [{"slug": "m1", "description": {"en": "x"},
+                                                      "supported_reasoning_levels": [{"effort": "low", "description": 7}]}]}))
+        rows = tandem.model_choices({})
+        self.assertEqual(rows[2]["notes"]["m1"], "")
+        self.assertEqual(rows[3]["notes"]["low"], tandem.EFFORT_NOTES["low"])
+        rows = tandem.model_choices({"codex_model": "m1", "codex_effort": "low"})
+        for focus in range(4):
+            self.assertIn("\u2039 m1 \u203a", tandem.render_picker(rows, focus, 80))  # no TypeError while drawing
+
     def test_saved_value_missing_from_the_list_is_kept(self):
         rows = tandem.model_choices({"codex_model": "old-model", "claude_model": None, "claude_effort": "max"})
         self.assertEqual(rows[2]["values"][:2], ["default", "old-model"])
@@ -2600,6 +2639,25 @@ class Picker(unittest.TestCase):
             cancel.assert_called_once()
             self.assertEqual(tandem.load_defaults()["claude_model"], "opus")  # cancel saves nothing
 
+    def test_enter_saves_only_what_changed(self):
+        # The picker shows the run's own values; saving them as defaults would change every later run.
+        with tempfile.TemporaryDirectory() as d:
+            run = pathlib.Path(d)
+            tandem.save(run, {"config": {"claude_model": "sonnet", "claude_effort": None,
+                                         "codex_model": None, "codex_effort": "low"}})
+            session = tandem.Session(argparse.Namespace(), tandem.Console(fancy=True))
+            same = {"claude_model": "sonnet", "claude_effort": None, "codex_model": None, "codex_effort": "low"}
+            with mock.patch.dict(tandem.CURRENT, {"target": run}, clear=True), \
+                    mock.patch.object(tandem, "emit") as emit:
+                with mock.patch.object(tandem, "run_picker", return_value=dict(same)):
+                    session.handle("models", "")
+                emit.assert_called_with("models unchanged")
+                self.assertEqual(tandem.load_defaults(), {})
+                with mock.patch.object(tandem, "run_picker", return_value=dict(same, codex_model="gpt-big")):
+                    session.handle("models", "")
+            self.assertEqual(tandem.load_defaults(), {"codex_model": "gpt-big"})
+            self.assertEqual(tandem.read_tuning(run / "tuning.json"), {"codex_model": "gpt-big"})
+
 
 SCREEN_TOKEN = re.compile(r"\x1b\[\??[0-9;]*[A-Za-z~]|\x1b.|.", re.S)
 
@@ -2661,7 +2719,7 @@ class BarModels(unittest.TestCase):
     def setUp(self):
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
-        self.dir = pathlib.Path(temp.name)
+        self.dir = pathlib.Path(temp.name).resolve()  # macOS: /var is a link to /private/var, and git reports the real path
         cache = self.dir / "models_cache.json"
         cache.write_text(json.dumps(CODEX_CACHE))
         for patch in (mock.patch.object(tandem, "CODEX_MODELS_CACHE", cache),
@@ -3471,9 +3529,9 @@ class Images(unittest.TestCase):
 
 class Children(unittest.TestCase):
     def setUp(self):
-        temp = tempfile.TemporaryDirectory(dir=ROOT)
+        temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
-        self.dir = pathlib.Path(temp.name)
+        self.dir = pathlib.Path(temp.name).resolve()  # macOS: /var is a link to /private/var, and git reports the real path
 
     def wait_gone(self, pid):
         deadline = time.monotonic() + 5
@@ -3600,7 +3658,7 @@ class SessionProcess(unittest.TestCase):
     """tandem.py as a user runs it, on a pseudo-terminal, with stub agents on PATH."""
 
     def setUp(self):
-        temp = tempfile.TemporaryDirectory(dir=ROOT)
+        temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
         self.base = pathlib.Path(temp.name).resolve()
         self.repo, self.runs, home, bin_dir = (self.base / n for n in ("repo", "runs", "home", "bin"))
@@ -3795,7 +3853,7 @@ class SessionProcess(unittest.TestCase):
 
     def test_repeated_ctrl_c_while_quitting_exits_cleanly(self):
         # Owner report: a second Ctrl+C while /quit waited killed tandem by SIGINT.
-        agent = self.start_slow_turn(STUB_TERM_DELAY="1")
+        agent = self.start_slow_turn(STUB_TERM_DELAY="1", TERM_PROGRAM="iTerm.app")  # notifies on the terminal
         self.type("/quit")
         self.wait_for(lambda: "waiting for the current turn" in self.text(), "the quit wait")
         # The first press, then the message, before any more: each ^C makes the terminal flush output
@@ -3815,6 +3873,7 @@ class SessionProcess(unittest.TestCase):
         self.assertNotIn("continue with resume", text)  # main's own KeyboardInterrupt message
         self.assertFalse(self.alive(agent))
         self.assertEqual(text.count("stopping the agent"), 1)  # later presses never repeat it
+        self.assertNotIn("\x1b]9;", text)  # the owner stopped it and is looking: no notification
 
     def run_dirs(self):
         return [d for d in self.runs.iterdir() if d.is_dir()] if self.runs.exists() else []
@@ -4164,7 +4223,7 @@ class Activity(unittest.TestCase):
     def setUp(self):
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
-        self.dir = pathlib.Path(temp.name)
+        self.dir = pathlib.Path(temp.name).resolve()  # macOS: /var is a link to /private/var, and git reports the real path
         self.work = self.dir / "work"
 
     def test_claude_events_become_short_lines(self):
