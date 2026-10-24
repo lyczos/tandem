@@ -3,7 +3,7 @@ name: todo-cli
 first: claude
 check: python3 -m unittest discover -s tests
 ---
-Add a small command-line todo list to this repository, in Python 3.10+ with the standard library
+Add a small command-line todo list to this repository, in Python 3.9+ with the standard library
 only.
 
 `todo.py add "buy milk"` adds an item, `todo.py list` prints the open items numbered from 1,

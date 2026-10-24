@@ -70,7 +70,7 @@ errors exit 1 so they cannot be confused with the turn limit. `--output-format j
 result object on stdout and sends logs to stderr; `--quiet` hides progress, not the result.
 
 Exercising the real loop costs money and needs both CLIs logged in. To try out a change to the loop
-itself, use a throwaway git repo as `--repo` (see README "First run on a throwaway repo"). Running
+itself, use a throwaway git repo as `--repo` (see "First run on a throwaway repo" in `docs/usage.md`). Running
 tandem on this repository with a real goal is fine: the agents work
 in their own worktree and branch, while the orchestrator keeps running from this checkout.
 
@@ -161,7 +161,7 @@ list in the prompt's "Fields" section, and the code that reads it (`loop`'s `ent
 
 The read-only path matters: planners and reviewers get `CLAUDE_READ` / Codex's `read-only` sandbox
 via the `readonly` argument. Widening `CLAUDE_ALLOWED` widens what unsandboxed agents can run on the
-user's machine — it is a guard rail, not a sandbox, and the README says so.
+user's machine — it is a guard rail, not a sandbox, and the README and `docs/usage.md` say so.
 
 ## Conventions
 
